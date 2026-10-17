@@ -140,6 +140,24 @@ Per-test fuzz runs: `/// forge-config: default.fuzz.runs = 10` above the functio
 
 `plain foo args...` runs `plain-foo args...` from `PATH`, with `PLAIN_ROOT` and `PLAIN_ARTIFACTS` in its environment. Any language works.
 
+## Benchmarks
+
+The numbers below are median wall times from hyperfine on an M1 Max (10 cores), using the same harness for every tool. Tool versions are forge 1.7.1, Hardhat 3.20.0 and solc as pinned by each project. The machine was under unrelated background load, which affected all three tools alike. All tests pass under `plain`: 303 in veydrift, 598 in v4-core and 568 in solmate.
+
+| | veydrift (via-IR, 141 files) | Uniswap v4-core (via-IR) | solmate |
+|---|---|---|---|
+| cold build: Foundry / Hardhat / **plain** | 117s / 120s / **65s** | 155s / 145s / **29s** | 5.6s / 8.7s / **1.4s** |
+| no-op build | 0.19s / 0.25s / **0.02s** | 0.24s / 0.27s / **0.02s** | 0.15s / 0.76s / **0.01s** |
+| test, warm | 0.26s / 0.42s / **0.10s** | 4.45s / 6.16s / **2.91s** | 4.05s / 3.46s / **3.43s**¹ |
+
+¹ forge 1.x and Hardhat 3 dropped `testFail*`, so their solmate timings exclude those tests (290 tests). `plain` runs all 568, including the legacy `testFail*` ones.
+
+Where the speed comes from:
+- **Cold builds:** sources are split into one solc job per core, balanced by import-closure size. Foundry and Hardhat run one solc process at a time.
+- **No-op builds:** only content hashes are checked, with no other work.
+- **Tests:** tests and individual fuzz/invariant runs execute in parallel on a single in-process revm.
+- **Startup:** one native binary with no JS runtime.
+
 ## Not included (on purpose)
 
 Gas snapshot files, coverage, formatting, Etherscan verification, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), and the `vm.deployCode` cheatcode (use `vm.getCode` + `create`). Library linking only works for libraries under `src/`/`test/`/`script/`.
