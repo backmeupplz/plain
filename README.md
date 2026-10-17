@@ -8,7 +8,7 @@ plain test                 # compile + run every test
 plain deploy Counter --network base-sepolia --broadcast
 ```
 
-- **Compile:** finds `src/` (or `contracts/`), `test/` and `script/`, picks and downloads the right `solc` from your pragmas (it reuses Foundry's solc cache if present), and compiles in parallel jobs. Results are cached per file, keyed by content hash.
+- **Compile:** finds `src/` (or `contracts/`), `test/` and `script/`, picks and downloads the right `solc` from your pragmas (it reuses Foundry's solc cache if present), and compiles in parallel jobs. Results are cached by content hash, per project and in `~/.plain/cache`, which every checkout shares (git worktrees, fresh clones).
 - **Test:** runs Solidity tests in the forge-std style (`*.t.sol`, `setUp`, `test*`, fuzzing, invariants, cheatcodes) on revm, in parallel. It also runs `test/**/*.test.ts` files against a fresh in-process chain per file.
 - **Deploy:** runs Solidity scripts (`vm.startBroadcast`) or a single contract. It always simulates first, against a fork of the target network, then signs and sends when you add `--broadcast`.
 - **Zero setup:** `forge-std` is built into the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. `lib/` dependencies, `remappings.txt` and `node_modules` (`@openzeppelin/...`) resolve automatically.
@@ -152,12 +152,17 @@ The numbers below are median wall times from hyperfine on an M1 Max (10 cores), 
 
 ¹ forge 1.x and Hardhat 3 dropped `testFail*`, so their solmate timings exclude those tests (290 tests). `plain` runs all 568, including the legacy `testFail*` ones.
 
-Where the speed comes from:
-- **Cold builds:** sources are split into one solc job per core, balanced by import-closure size. Foundry and Hardhat run one solc process at a time.
-- **No-op builds:** only content hashes are checked, with no other work.
-- **Tests:** tests and individual fuzz/invariant runs execute in parallel on a single in-process revm.
+Where the speed comes from (solc itself is unchanged: what gets deployed is byte-for-byte what solc produces):
+- **Tests don't embed the contracts they deploy.** In a test contract, `new Vault(args)` would make solc compile and optimize `Vault` again inside the test, once per test file (via-IR makes that the bulk of a build). plain compiles test files with each `new X(...)` replaced by a deploy of X's compiled artifact: the same init code, deployer, nonce and address. The arguments are still type-checked against X's constructor (through `abi.encodeCall` on a generated contract), so a wrong argument is the same compile error as before. If a rewritten file fails to compile, plain compiles the original and reports its errors.
+- **Big test files compile in parallel.** A test file with many tests compiles as several shards at once. Each shard keeps a share of the tests public and turns the rest `internal`, so solc drops them.
+- **Editing src/ doesn't recompile tests.** Since tests no longer contain src bytecode, a test file is cached by its own source plus the *interfaces* of what it imports (function bodies left out). Editing a function body recompiles that one file.
+- **Scheduling:** solc jobs run on a work queue, biggest first, sized from the last build's timings (or, cold, from a model of how much code each file compiles). Foundry and Hardhat run one solc process at a time.
+- **Shared cache:** a new worktree or clone reuses artifacts any checkout already compiled.
+- **Tests:** suites, tests and individual fuzz/invariant runs execute in parallel on an in-process revm. Each run starts from a copy-on-write view of the post-`setUp` state.
 - **Startup:** one native binary with no JS runtime.
 
 ## Not included (on purpose)
 
 Gas snapshot files, coverage, formatting, Etherscan verification, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), and the `vm.deployCode` cheatcode (use `vm.getCode` + `create`). Library linking only works for libraries under `src/`/`test/`/`script/`.
+
+Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs. Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test contracts aren't written there).

@@ -103,8 +103,14 @@ pub fn run(p: &Project, arts: Vec<Artifact>, o: Opts) {
     cheats.track_creates = true;
     let is_script = art.file.ends_with(".s.sol") || (p.dirs.get(2).is_some_and(|d| art.file.starts_with(&format!("{d}/"))) && has_run(&art));
 
-    let txs: Vec<BroadcastTx> = if is_script {
-        let mut libs = HashMap::new();
+    // libraries go on chain first, deployed by the broadcaster (like forge script)
+    let from = me.unwrap_or(SENDER);
+    let mut libs = HashMap::new();
+    let mut txs: Vec<BroadcastTx> = vec![];
+    let db = crate::test::deploy_libs(db, &mut env, &mut cheats, &arts, &art, &mut libs, from, &mut Some(&mut txs));
+    cheats.libs = libs.clone();
+    if is_script {
+        // the script contract itself only runs locally
         let (db, r) = crate::test::deploy(db, &mut env, &mut cheats, &arts, &art, &[], &mut libs);
         let addr = r.address.filter(|_| r.ok).unwrap_or_else(|| die(&format!("script constructor reverted: {}", decode::reason(&r.output))));
         let (_, r) = evm::transact(db, &mut env, &mut cheats, SENDER, TxKind::Call(addr), Bytes::from_static(&[0xc0, 0x40, 0x62, 0x26]), U256::ZERO, true);
@@ -114,11 +120,8 @@ pub fn run(p: &Project, arts: Vec<Artifact>, o: Opts) {
         if !r.ok {
             die(&format!("{}.run() reverted: {}", art.name, decode::reason(&r.output)));
         }
-        std::mem::take(&mut cheats.broadcasts)
+        txs.append(&mut cheats.broadcasts);
     } else {
-        if art.links.is_object() {
-            die("contracts that need library linking must be deployed from a script");
-        }
         let abi: JsonAbi = serde_json::from_value(art.abi.clone()).unwrap();
         let inputs = abi.constructor().map(|c| c.inputs.clone()).unwrap_or_default();
         if inputs.len() != o.args.len() {
@@ -132,9 +135,8 @@ pub fn run(p: &Project, arts: Vec<Artifact>, o: Opts) {
                 ty.coerce_str(a).unwrap_or_else(|e| die(&format!("arg {:?} as {}: {e}", a, i.ty)))
             })
             .collect();
-        let mut data = hex::decode(&art.bytecode).unwrap();
+        let mut data = evm::link_code(&art.bytecode, &art.links, &libs).unwrap_or_else(|e| die(&format!("{}: {e}", art.name)));
         data.extend(alloy_dyn_abi::DynSolValue::Tuple(vals).abi_encode_params());
-        let from = me.unwrap_or(SENDER);
         let (_, r) = evm::transact(db, &mut env, &mut cheats, from, TxKind::Create, data.clone().into(), U256::ZERO, false);
         if let Some(a) = r.address {
             cheats.names.insert(a, art.name.clone());
@@ -142,8 +144,8 @@ pub fn run(p: &Project, arts: Vec<Artifact>, o: Opts) {
         if !r.ok {
             die(&format!("{} constructor reverted: {}", art.name, decode::reason(&r.output)));
         }
-        vec![BroadcastTx { from, to: None, value: U256::ZERO, data: data.into(), created: r.address }]
-    };
+        txs.push(BroadcastTx { from, to: None, value: U256::ZERO, data: data.into(), created: r.address });
+    }
 
     if txs.is_empty() {
         println!("nothing to broadcast (did the script call vm.startBroadcast?)");
@@ -151,6 +153,9 @@ pub fn run(p: &Project, arts: Vec<Artifact>, o: Opts) {
     }
     for (i, tx) in txs.iter().enumerate() {
         println!("{}. {} (from {})", i + 1, describe(tx, &cheats.names), tx.from);
+        if std::env::var_os("PLAIN_DEBUG").is_some() {
+            println!("   to {:?} value {} data {} bytes keccak {}", tx.to, tx.value, tx.data.len(), alloy_primitives::keccak256(&tx.data));
+        }
     }
     if !o.broadcast {
         println!("simulated {} transaction(s){}; add --broadcast to send", txs.len(), o.network.as_ref().map(|n| format!(" against {n}")).unwrap_or_default());

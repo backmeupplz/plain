@@ -48,14 +48,17 @@ struct Suite {
 
 /// Deploy `art` (linking libraries first) from SENDER; returns the CREATE result.
 pub fn deploy(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, args: &[u8], libs: &mut HashMap<String, Address>) -> (Db, Exec) {
-    let (db, code) = link(db, env, cheats, arts, art, libs);
-    let mut data = code;
+    let db = deploy_libs(db, env, cheats, arts, art, libs, SENDER, &mut None);
+    let mut data = evm::link_code(&art.bytecode, &art.links, libs).unwrap_or_else(|e| crate::die(&format!("{}: {e}", art.name)));
     data.extend_from_slice(args);
     evm::transact(db, env, cheats, SENDER, TxKind::Create, data.into(), U256::ZERO, true)
 }
 
-fn link(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, libs: &mut HashMap<String, Address>) -> (Db, Vec<u8>) {
-    // libraries of contracts the test deploys from artifacts too, in the order embedding them would give
+/// Deploy from `from` every library that `art`, and the contracts it deploys from artifacts, link against
+/// (each library's own libraries first), adding them to `libs`. With `record`, the deployments are also
+/// transactions to broadcast (`plain deploy`).
+pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, libs: &mut HashMap<String, Address>, from: Address, record: &mut Option<&mut Vec<evm::BroadcastTx>>) -> Db {
+    // libraries of contracts deployed from artifacts too, in the order embedding them would give
     // (transitively: a script the test deploys can deploy contracts from artifacts in turn)
     let mut needed: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
     let mut todo = vec![art];
@@ -78,13 +81,18 @@ fn link(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: 
         let Some(lib) = arts.iter().find(|a| a.file == file && a.name == name) else {
             crate::die(&format!("library {key} has no bytecode (is it outside src/test/script?)"));
         };
-        let (d, r) = deploy(db, env, cheats, arts, lib, &[], libs);
-        db = d;
-        let a = r.address.unwrap_or_else(|| crate::die(&format!("deploying library {key} failed: {}", decode::reason(&r.output))));
+        db = deploy_libs(db, env, cheats, arts, lib, libs, from, record);
+        let code = evm::link_code(&lib.bytecode, &lib.links, libs).unwrap_or_else(|e| crate::die(&format!("{key}: {e}")));
+        let r;
+        (db, r) = evm::transact(db, env, cheats, from, TxKind::Create, code.clone().into(), U256::ZERO, true);
+        let a = r.address.filter(|_| r.ok).unwrap_or_else(|| crate::die(&format!("deploying library {key} failed: {}", decode::reason(&r.output))));
+        if let Some(rec) = record {
+            rec.push(evm::BroadcastTx { from, to: None, value: U256::ZERO, data: code.into(), created: Some(a) });
+        }
+        cheats.names.insert(a, name);
         libs.insert(key, a);
     }
-    let code = evm::link_code(&art.bytecode, &art.links, libs).unwrap_or_else(|e| crate::die(&format!("{}: {e}", art.name)));
-    (db, code)
+    db
 }
 
 pub fn is_test_contract(a: &Artifact) -> bool {

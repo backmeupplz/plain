@@ -23,6 +23,9 @@ pub struct Artifact {
     /// artifacts this test contract deploys via the getCode cheatcode (see rewrite.rs)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deploys: Vec<String>,
+    /// a test or script contract compiled from rewritten sources (not solc's output for the file as written)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rewritten: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -45,9 +48,6 @@ struct CacheEntry {
     /// solc CPU time last build (ms), to schedule and shard the next one
     #[serde(default)]
     ms: u64,
-    /// a script compiled with test rewrites (`plain test`); `plain build`/`deploy` recompile it
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    test_only: bool,
     /// compiled from rewritten test sources, which embed no other contract's code: `hash` covers the
     /// full sources of `code` (the file, what it inherits or embeds) and only the interfaces of the
     /// rest of its imports, so editing a function body in src/ doesn't recompile the tests
@@ -62,10 +62,11 @@ impl CacheEntry {
     }
 }
 
-/// Files compiled from rewritten sources: test files, and for `plain test` also scripts (tests deploy
-/// them; `plain build`/`deploy` recompile them as written).
-fn rewritten(p: &Project, scope: &Scope, f: &str) -> bool {
-    f.starts_with(&format!("{}/", p.dirs[1])) || f.ends_with(".t.sol") || (*scope == Scope::Tests && f.starts_with(&format!("{}/", p.dirs[2])))
+/// Files compiled from rewritten sources: tests and scripts. A script's own bytecode never goes on
+/// chain, only the transactions it broadcasts, and deploying from artifacts sends the same ones
+/// (veydrift's Deploy.s.sol: 40 byte-identical transactions).
+fn rewritten(p: &Project, f: &str) -> bool {
+    f.starts_with(&format!("{}/", p.dirs[1])) || f.ends_with(".t.sol") || f.starts_with(&format!("{}/", p.dirs[2]))
 }
 
 /// Artifacts shared by every checkout of the same sources (git worktrees, fresh clones), by content
@@ -76,21 +77,21 @@ impl Store {
     fn new(key: &str) -> Store {
         Store(home().join("cache").join(&key[..16]))
     }
-    fn path(&self, hash: &str, test: bool) -> PathBuf {
-        self.0.join(format!("{hash}{}.json", if test { ".t" } else { "" }))
+    fn path(&self, hash: &str) -> PathBuf {
+        self.0.join(format!("{hash}.json"))
     }
-    fn get(&self, hash: &str, test: bool) -> Option<CacheEntry> {
-        let path = self.path(hash, test);
+    fn get(&self, hash: &str) -> Option<CacheEntry> {
+        let path = self.path(hash);
         let e = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
         // recently used entries survive gc
         std::fs::File::options().append(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now())).ok();
         Some(e)
     }
-    fn put(&self, hash: &str, test: bool, e: &CacheEntry) {
+    fn put(&self, hash: &str, e: &CacheEntry) {
         std::fs::create_dir_all(&self.0).ok();
         let tmp = self.0.join(format!(".{hash}.{}", std::process::id()));
         if std::fs::write(&tmp, serde_json::to_vec(e).unwrap()).is_ok() {
-            std::fs::rename(&tmp, self.path(hash, test)).ok();
+            std::fs::rename(&tmp, self.path(hash)).ok();
         }
         // once a day, drop entries unused for two weeks
         let mark = home().join("cache/.gc");
@@ -272,7 +273,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let key = {
         use sha2::Digest;
         // bump the suffix when rewrites change what gets compiled
-        hex::encode(sha2::Sha256::digest(format!("{version}{settings}{:?}rw2", p.dirs).as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{version}{settings}{:?}rw3", p.dirs).as_bytes()))
     };
     let cache_path = p.root.join(".plain/cache.json");
     let mut cache: Cache = std::fs::read(&cache_path)
@@ -302,17 +303,17 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
         .filter(|f| {
             force
                 || cache.files.get(*f).is_none_or(|e| {
-                    (e.test_only && scope == Scope::All)
-                        || if e.code.is_empty() { e.hash != full[*f] } else { !e.code.iter().all(|c| own.contains_key(c)) || e.hash != dep_hash(&g, f, &e.code, &own, &mut iface) }
+                    if e.code.is_empty() { e.hash != full[*f] } else { !e.code.iter().all(|c| own.contains_key(c)) || e.hash != dep_hash(&g, f, &e.code, &own, &mut iface) }
                 })
         })
         .collect();
 
     let store = Store::new(&cache.key);
     let out_dir = p.root.join(".plain/out");
+    // .plain/out holds solc's output as written: test and script contracts (rewritten) stay out
     let export = |arts: &[Artifact]| {
         std::fs::create_dir_all(&out_dir).unwrap();
-        for a in arts.iter().filter(|a| a.shard == 0) {
+        for a in arts.iter().filter(|a| a.shard == 0 && !a.rewritten) {
             if !a.bytecode.is_empty() || a.abi.as_array().is_some_and(|x| !x.is_empty()) {
                 let j = json!({"contractName": a.name, "sourceName": a.file, "abi": a.abi, "bytecode": format!("0x{}", a.bytecode), "deployedBytecode": format!("0x{}", a.deployed)});
                 std::fs::write(out_dir.join(format!("{}.json", a.name)), j.to_string()).ok();
@@ -323,11 +324,9 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let dirty: Vec<&String> = dirty
         .into_iter()
         .filter(|f| {
-            let hit = (!force).then(|| store.get(&full[*f], rewritten(p, &scope, f))).flatten().filter(|e| e.code.iter().all(|c| own.contains_key(c)));
+            let hit = (!force).then(|| store.get(&full[*f])).flatten().filter(|e| e.code.iter().all(|c| own.contains_key(c)));
             let Some(e) = hit else { return true };
-            if !e.test_only {
-                export(&e.contracts);
-            }
+            export(&e.contracts);
             cache.files.insert(f.to_string(), e);
             false
         })
@@ -337,7 +336,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     if !dirty.is_empty() {
         let solc = ensure(&version);
         let v: semver::Version = version.parse().unwrap_or(semver::Version::new(0, 8, 0));
-        let plan = Plan::new(p, &g, &files, &dirty, &v, &cache, &scope);
+        let plan = Plan::new(p, &g, &files, &dirty, &v, &cache);
         let mut results = run_jobs(&solc, &g, &plan.jobs, &settings, p, &plan.sources, &plan.gen_deps);
         // a rewrite that broke a test file: compile it again from the original sources (also reports real errors)
         let broken: Vec<String> = {
@@ -356,15 +355,14 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
         }
         let mut warnings = std::collections::BTreeSet::new();
         let mut errors = Vec::new();
-        // (artifacts, ms, test_only, compiled from rewritten sources)
-        let mut fresh: HashMap<String, (Vec<Artifact>, u64, bool, bool)> = dirty.iter().map(|f| (f.to_string(), (vec![], 0, false, false))).collect();
+        // (artifacts, ms, compiled from rewritten sources)
+        let mut fresh: HashMap<String, (Vec<Artifact>, u64, bool)> = dirty.iter().map(|f| (f.to_string(), (vec![], 0, false))).collect();
         for (job, r, ms) in results {
             let total: u64 = job.files.iter().map(|f| plan.est.get(f).copied().unwrap_or(1)).sum::<u64>().max(1);
             for f in &job.files {
                 if let Some(e) = fresh.get_mut(f) {
                     e.1 += ms * plan.est.get(f).copied().unwrap_or(1) / total;
-                    e.2 = job.test && f.starts_with(&script);
-                    e.3 = job.test;
+                    e.2 = job.test;
                 }
             }
             match r {
@@ -373,6 +371,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                     for mut a in arts {
                         if job.test {
                             a.deploys = plan.deploys.get(&(a.file.clone(), a.name.clone())).cloned().unwrap_or_default();
+                            a.rewritten = plan.rewritten.contains(&(a.file.clone(), a.name.clone()));
                         }
                         if let Some((k, _)) = job.shard {
                             // shards differ only in which tests are public: keep shard 0 whole, other shards' test contracts
@@ -401,17 +400,15 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
             }
             crate::die("compilation failed");
         }
-        for (f, (mut contracts, ms, test_only, test)) in fresh {
+        for (f, (mut contracts, ms, test)) in fresh {
             contracts.sort_by_key(|a| a.shard);
-            if !test_only {
-                export(&contracts);
-            }
+            export(&contracts);
             let (hash, code) = match plan.code.get(&f).filter(|_| test) {
                 Some(code) => (dep_hash(&g, &f, code, &own, &mut iface), code.clone()),
                 None => (full[&f].clone(), vec![]),
             };
-            let e = CacheEntry { hash, contracts, ms, test_only, code };
-            store.put(&full[&f], rewritten(p, &scope, &f), &e);
+            let e = CacheEntry { hash, contracts, ms, code };
+            store.put(&full[&f], &e);
             cache.files.insert(f.clone(), e);
         }
     }
@@ -451,13 +448,15 @@ struct Plan {
     gen_deps: HashMap<String, Vec<String>>,
     /// test-job file -> files whose code compiles into it (itself, bases, embedded contracts)
     code: HashMap<String, Vec<String>>,
+    /// (file, contract) of test and script contracts, compiled from rewritten sources
+    rewritten: std::collections::HashSet<(String, String)>,
 }
 
 impl Plan {
-    fn new(p: &Project, g: &Graph, files: &[String], dirty: &[&String], v: &semver::Version, cache: &Cache, scope: &Scope) -> Plan {
+    fn new(p: &Project, g: &Graph, files: &[String], dirty: &[&String], v: &semver::Version, cache: &Cache) -> Plan {
         use crate::rewrite::{self, Unit};
         let workers = std::env::var("PLAIN_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
-        let is_test = |f: &str| rewritten(p, scope, f);
+        let is_test = |f: &str| rewritten(p, f);
         let units: HashMap<&str, Unit> = g.files.par_iter().filter_map(|(f, n)| Some((f.as_str(), Unit::parse(&n.content)?))).collect();
         let mut defs: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
         for (f, u) in &units {
@@ -688,7 +687,8 @@ impl Plan {
             out.sort();
             code.insert(f.to_string(), out);
         }
-        Plan { jobs, sources, est, deploys, gen_deps, code }
+        let rewritten = testish.iter().filter(|(_, t)| **t).map(|((f, ci), _)| (f.to_string(), units[*f].contracts[*ci].name.clone())).collect();
+        Plan { jobs, sources, est, deploys, gen_deps, code, rewritten }
     }
 }
 
@@ -910,6 +910,7 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
                 links: if links.as_object().is_some_and(|o| !o.is_empty()) { links.clone() } else { Value::Null },
                 shard: 0,
                 deploys: vec![],
+                rewritten: false,
             });
         }
     }
