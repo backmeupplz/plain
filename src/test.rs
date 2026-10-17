@@ -96,7 +96,7 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     let t0 = Instant::now();
     decode::init(&arts);
     let arts = Arc::new(arts);
-    let remote = evm::Remote(opts.fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))));
+    let remote = evm::Remote(opts.fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))), None);
     let suites: Vec<&Artifact> = arts.iter().filter(|a| is_test_contract(a)).collect();
     // a sharded test contract has one artifact per shard; each test runs on the first shard that has it
     let selectors = |a: &Artifact| -> Vec<[u8; 4]> {
@@ -226,9 +226,21 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     cheats.console.clear();
     cheats.track_creates = false;
     cheats.names.insert(addr, art.name.clone());
+    // the post-setUp state, shared read-only: each test/run executes on an overlay of it
+    let db = Arc::new(db);
     let inline = inline_runs(&root.join(&art.file));
     let (invariants, tests): (Vec<&Function>, Vec<&Function>) = tests.into_iter().partition(|f| f.name.starts_with("invariant"));
-    let mut results: Vec<TestResult> = tests.par_iter().map(|f| invert_fail(run_test(f, addr, &db, &env, &cheats, inline.get(&f.name).copied().unwrap_or(opts.fuzz_runs), opts), f)).collect();
+    let mut results: Vec<TestResult> = tests
+        .par_iter()
+        .map(|f| {
+            let t = Instant::now();
+            let r = invert_fail(run_test(f, addr, &db, &env, &cheats, inline.get(&f.name).copied().unwrap_or(opts.fuzz_runs), opts), f);
+            if std::env::var_os("PLAIN_DEBUG").is_some() {
+                eprintln!("test {:.0?} {}:{}", t.elapsed(), id, r.name);
+            }
+            r
+        })
+        .collect();
     if !invariants.is_empty() {
         results.extend(run_invariants(&invariants, addr, &db, &env, &cheats, opts));
         results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -271,10 +283,10 @@ fn failed_slot(db: &Db) -> bool {
 }
 
 /// One call of the test function on a fresh copy of the post-setUp state.
-fn exec_once(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Exec, Cheats, Option<String>) {
+fn exec_once(data: Bytes, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats) -> (Exec, Cheats, Option<String>) {
     let mut c = cheats.clone();
     let mut e = env.clone();
-    let (db, r) = evm::transact(db.clone(), &mut e, &mut c, SENDER, TxKind::Call(addr), data, U256::ZERO, true);
+    let (db, r) = evm::transact(evm::overlay(db), &mut e, &mut c, SENDER, TxKind::Call(addr), data, U256::ZERO, true);
     let mut why = None;
     if !r.ok {
         why = Some(decode::reason(&r.output));
@@ -286,7 +298,7 @@ fn exec_once(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) ->
     (r, c, why)
 }
 
-fn run_test(f: &Function, addr: Address, db: &Db, env: &Env, cheats: &Cheats, fuzz_runs: u32, opts: &Opts) -> TestResult {
+fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, fuzz_runs: u32, opts: &Opts) -> TestResult {
     let name = sig(f);
     let mut res = TestResult { name, status: Status::Pass, gas: 0, runs: None, logs: vec![], args: None, trace: vec![] };
     let sel = f.selector();
@@ -460,12 +472,12 @@ fn fuzz_value(ty: &DynSolType, r: &mut Rng) -> DynSolValue {
 }
 
 /// Re-run a failing call with tracing; keep the test's direct calls plus the path to each failure.
-fn trace(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Vec<String>, Option<String>) {
+fn trace(data: Bytes, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats) -> (Vec<String>, Option<String>) {
     let mut c = cheats.clone();
     c.trace = Some(vec![]);
     c.track_creates = true;
     let mut e = env.clone();
-    let _ = evm::transact(db.clone(), &mut e, &mut c, SENDER, TxKind::Call(addr), data, U256::ZERO, false);
+    let _ = evm::transact(evm::overlay(db), &mut e, &mut c, SENDER, TxKind::Call(addr), data, U256::ZERO, false);
     let nodes = c.trace.take().unwrap_or_default();
     let failed = |n: &evm::TraceNode| n.result.as_ref().is_some_and(|(r, _)| !r.is_ok());
     let mut parent = vec![None; nodes.len()];
@@ -549,11 +561,11 @@ fn trace(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Ve
 }
 
 /// Static call on the test contract returning decoded addresses/selectors from StdInvariant getters.
-fn view(addr: Address, db: &Db, env: &Env, cheats: &Cheats, sig: &str, ty: &str) -> Vec<DynSolValue> {
+fn view(addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, sig: &str, ty: &str) -> Vec<DynSolValue> {
     let mut c = cheats.clone();
     let mut e = env.clone();
     let sel = alloy_primitives::keccak256(sig.as_bytes());
-    let (_, r) = evm::transact(db.clone(), &mut e, &mut c, SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&sel[..4]), U256::ZERO, false);
+    let (_, r) = evm::transact(evm::overlay(db), &mut e, &mut c, SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&sel[..4]), U256::ZERO, false);
     if !r.ok {
         return vec![];
     }
@@ -564,7 +576,7 @@ fn view(addr: Address, db: &Db, env: &Env, cheats: &Cheats, sig: &str, ty: &str)
 }
 
 /// forge-style invariant testing: random call sequences against targets, invariants checked after every call.
-fn run_invariants(invs: &[&Function], addr: Address, db: &Db, env: &Env, cheats: &Cheats, opts: &Opts) -> Vec<TestResult> {
+fn run_invariants(invs: &[&Function], addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts) -> Vec<TestResult> {
     let (runs, depth, fail_on_revert) = opts.invariant;
     let abi_of = |a: &Address| -> Option<JsonAbi> {
         let name = cheats.names.get(a)?;
@@ -605,18 +617,29 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Db, env: &Env, cheats:
     }
     let types: Vec<Vec<DynSolType>> = calls.iter().map(|(_, f)| f.inputs.iter().filter_map(|p| p.resolve().ok()).collect()).collect();
     let stop = std::sync::atomic::AtomicBool::new(false);
-    // each run: Some((invariant index, reason, call sequence)) on failure
-    let failures: Vec<(u32, usize, String, Vec<String>)> = (0..runs)
+    // each run: Some((invariant index, reason, calls made, the last calls)) on failure
+    let failures: Vec<(u32, usize, String, usize, Vec<String>)> = (0..runs)
         .into_par_iter()
         .filter_map(|run| {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             let mut rng = Rng((opts.seed ^ (run as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)) | 1);
-            let mut db = db.clone();
-            let mut e = env.clone();
             let mut c = cheats.clone();
-            let mut seq = vec![];
+            let mut vm = evm::Vm::new(evm::overlay(db), env, &mut c);
+            // (call index, args, sender, ok): formatted only if the run fails
+            let mut seq: Vec<(usize, Vec<DynSolValue>, Address, bool)> = vec![];
+            let tail = |seq: &[(usize, Vec<DynSolValue>, Address, bool)], c: &Cheats| -> (usize, Vec<String>) {
+                let lines = seq[seq.len().saturating_sub(10)..]
+                    .iter()
+                    .map(|(i, vals, sender, ok)| {
+                        let (target, f) = &calls[*i];
+                        let name = c.names.get(target).cloned().unwrap_or_else(|| target.to_string());
+                        format!("{name}.{}({}) from {sender}{}", f.name, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), if *ok { "" } else { " (reverted)" })
+                    })
+                    .collect();
+                (seq.len(), lines)
+            };
             for _ in 0..depth {
                 let i = (rng.next() % calls.len() as u64) as usize;
                 let (target, f) = &calls[i];
@@ -631,23 +654,22 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Db, env: &Env, cheats:
                 } else {
                     senders[(rng.next() % senders.len() as u64) as usize]
                 };
-                let r;
-                (db, r) = evm::transact(db, &mut e, &mut c, sender, TxKind::Call(*target), data.into(), U256::ZERO, true);
-                c.finish();
-                let name = c.names.get(target).cloned().unwrap_or_else(|| target.to_string());
-                seq.push(format!("{name}.{}({}) from {sender}{}", f.name, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), if r.ok { "" } else { " (reverted)" }));
+                let r = vm.call(sender, TxKind::Call(*target), data.into(), U256::ZERO, true);
+                vm.cheats().finish();
+                seq.push((i, vals, sender, r.ok));
                 if fail_on_revert && !r.ok && r.output.as_ref() != ASSUME_MAGIC {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Some((run, usize::MAX, format!("call reverted: {}", decode::reason(&r.output)), seq));
+                    let (n, lines) = tail(&seq, vm.cheats());
+                    return Some((run, usize::MAX, format!("call reverted: {}", decode::reason(&r.output)), n, lines));
                 }
                 for (k, inv) in invs.iter().enumerate() {
-                    c.failed = false;
-                    let r;
-                    (db, r) = evm::transact(db, &mut e, &mut c, SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&inv.selector()[..]), U256::ZERO, false);
-                    if !r.ok || c.failed {
+                    vm.cheats().failed = false;
+                    let r = vm.call(SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&inv.selector()[..]), U256::ZERO, false);
+                    if !r.ok || vm.cheats().failed {
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         let why = if r.ok { "assertion failed".into() } else { decode::reason(&r.output) };
-                        return Some((run, k, why, seq));
+                        let (n, lines) = tail(&seq, vm.cheats());
+                        return Some((run, k, why, n, lines));
                     }
                 }
             }
@@ -659,11 +681,10 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Db, env: &Env, cheats:
         .enumerate()
         .map(|(k, f)| {
             let mut r = TestResult { name: sig(f), status: Status::Pass, gas: 0, runs: Some(runs), logs: vec![], args: None, trace: vec![] };
-            if let Some((_, fk, why, seq)) = &first {
+            if let Some((_, fk, why, n, tail)) = &first {
                 if *fk == k || *fk == usize::MAX {
                     r.status = Status::Fail(format!("invariant broken: {why}"));
-                    let tail = &seq[seq.len().saturating_sub(10)..];
-                    r.trace = std::iter::once(format!("after {} calls (last {} shown):", seq.len(), tail.len())).chain(tail.iter().cloned()).collect();
+                    r.trace = std::iter::once(format!("after {n} calls (last {} shown):", tail.len())).chain(tail.iter().cloned()).collect();
                 } else {
                     r.status = Status::Skip("not checked to completion (another invariant broke)".into());
                 }

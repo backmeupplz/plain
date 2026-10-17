@@ -37,9 +37,15 @@ impl std::fmt::Display for DbErr {
 impl std::error::Error for DbErr {}
 impl DBErrorMarker for DbErr {}
 
-/// Read-through backend: empty, or a remote chain at a fixed block (results memoized across clones).
+/// Read-through backend: a frozen parent state (see `overlay`), else a remote chain at a fixed block
+/// (results memoized across clones), else empty.
 #[derive(Clone, Default)]
-pub struct Remote(pub Option<Arc<Fork>>);
+pub struct Remote(pub Option<Arc<Fork>>, pub Option<Arc<Db>>);
+
+/// An empty, writable state on top of `base`: what a test run needs, without copying `base`.
+pub fn overlay(base: &Arc<Db>) -> Db {
+    Db::new(Remote(None, Some(base.clone())))
+}
 
 pub struct Fork {
     pub url: String,
@@ -68,6 +74,9 @@ fn hexu(v: &serde_json::Value) -> U256 {
 impl DatabaseRef for Remote {
     type Error = DbErr;
     fn basic_ref(&self, a: Address) -> Result<Option<AccountInfo>, DbErr> {
+        if let Some(p) = &self.1 {
+            return p.basic_ref(a);
+        }
         let Some(f) = &self.0 else { return Ok(None) };
         if let Some(i) = f.accounts.lock().unwrap().get(&a) {
             return Ok(Some(i.clone()));
@@ -82,10 +91,16 @@ impl DatabaseRef for Remote {
         f.accounts.lock().unwrap().insert(a, info.clone());
         Ok(Some(info))
     }
-    fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, DbErr> {
-        Ok(Bytecode::default()) // code always arrives with basic_ref
+    fn code_by_hash_ref(&self, h: B256) -> Result<Bytecode, DbErr> {
+        match &self.1 {
+            Some(p) => p.code_by_hash_ref(h),
+            None => Ok(Bytecode::default()), // forked code always arrives with basic_ref
+        }
     }
     fn storage_ref(&self, a: Address, k: U256) -> Result<U256, DbErr> {
+        if let Some(p) = &self.1 {
+            return p.storage_ref(a, k);
+        }
         let Some(f) = &self.0 else { return Ok(U256::ZERO) };
         if let Some(v) = f.slots.lock().unwrap().get(&(a, k)) {
             return Ok(*v);
@@ -95,7 +110,10 @@ impl DatabaseRef for Remote {
         Ok(v)
     }
     fn block_hash_ref(&self, n: u64) -> Result<B256, DbErr> {
-        Ok(keccak256(n.to_be_bytes()))
+        match &self.1 {
+            Some(p) => p.block_hash_ref(n),
+            None => Ok(keccak256(n.to_be_bytes())),
+        }
     }
 }
 
@@ -147,50 +165,74 @@ pub enum Commit {
 
 /// Run one transaction through the cheatcode inspector, committing state into `db` per `commit`.
 pub fn transact(db: Db, env: &mut Env, cheats: &mut Cheats, from: Address, to: TxKind, data: Bytes, value: U256, commit: impl Into<Commit>) -> (Db, Exec) {
-    let commit = commit.into();
-    let mut ctx: Ctx = Context::new(db, SpecId::OSAKA);
-    ctx.block = env.block.clone();
-    ctx.cfg.chain_id = env.chain_id;
-    ctx.cfg.disable_nonce_check = true;
-    ctx.cfg.disable_block_gas_limit = true;
-    ctx.cfg.disable_base_fee = true;
-    ctx.cfg.tx_gas_limit_cap = Some(u64::MAX);
-    ctx.cfg.limit_contract_code_size = Some(usize::MAX);
-    ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
-    ctx.cfg.disable_eip3607 = true; // pranked/broadcast senders may be contracts
-    let mut tx = TxEnv::default();
-    tx.caller = from;
-    tx.gas_limit = GAS_LIMIT;
-    tx.gas_price = env.gas_price;
-    tx.kind = to;
-    tx.data = data;
-    tx.value = value;
-    tx.chain_id = Some(env.chain_id);
-    let mut evm = ctx.build_mainnet_with_inspector(&mut *cheats);
-    let res = evm.inspect_tx(tx).map_err(|e| e.to_string()).map(|r| {
-        if commit == Commit::Always || (commit == Commit::OnSuccess && r.result.is_success()) {
-            evm.ctx.journaled_state.database.commit(r.state);
+    let mut vm = Vm::new(db, env, cheats);
+    let r = vm.call(from, to, data, value, commit);
+    (vm.finish(env), r)
+}
+
+/// One EVM for a sequence of transactions (e.g. an invariant run): its frames and buffers are reused.
+pub struct Vm<'c> {
+    evm: revm::MainnetEvm<Ctx, &'c mut Cheats>,
+    gas_price: u128,
+}
+
+impl<'c> Vm<'c> {
+    pub fn new(db: Db, env: &Env, cheats: &'c mut Cheats) -> Vm<'c> {
+        let mut ctx: Ctx = Context::new(db, SpecId::OSAKA);
+        ctx.block = env.block.clone();
+        ctx.cfg.chain_id = env.chain_id;
+        ctx.cfg.disable_nonce_check = true;
+        ctx.cfg.disable_block_gas_limit = true;
+        ctx.cfg.disable_base_fee = true;
+        ctx.cfg.tx_gas_limit_cap = Some(u64::MAX);
+        ctx.cfg.limit_contract_code_size = Some(usize::MAX);
+        ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
+        ctx.cfg.disable_eip3607 = true; // pranked/broadcast senders may be contracts
+        Vm { evm: ctx.build_mainnet_with_inspector(cheats), gas_price: env.gas_price }
+    }
+
+    pub fn call(&mut self, from: Address, to: TxKind, data: Bytes, value: U256, commit: impl Into<Commit>) -> Exec {
+        let commit = commit.into();
+        let mut tx = TxEnv::default();
+        tx.caller = from;
+        tx.gas_limit = GAS_LIMIT;
+        tx.gas_price = self.gas_price;
+        tx.kind = to;
+        tx.data = data;
+        tx.value = value;
+        tx.chain_id = Some(self.evm.ctx.cfg.chain_id);
+        let res = self.evm.inspect_tx(tx).map_err(|e| e.to_string()).map(|r| {
+            if commit == Commit::Always || (commit == Commit::OnSuccess && r.result.is_success()) {
+                self.evm.ctx.journaled_state.database.commit(r.state);
+            }
+            r.result
+        });
+        match res {
+            Ok(ExecutionResult::Success { gas, logs, output, .. }) => {
+                let (output, address) = match output {
+                    Output::Call(o) => (o, None),
+                    Output::Create(o, a) => (o, a),
+                };
+                Exec { ok: true, output, gas: gas.tx_gas_used(), logs, address }
+            }
+            Ok(ExecutionResult::Revert { gas, logs, output }) => Exec { ok: false, output, gas: gas.tx_gas_used(), logs, address: None },
+            Ok(ExecutionResult::Halt { reason, gas, logs }) => {
+                Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {reason:?}")), gas: gas.tx_gas_used(), logs, address: None }
+            }
+            Err(e) => Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {e}")), gas: 0, logs: vec![], address: None },
         }
-        r.result
-    });
-    env.block = evm.ctx.block.clone();
-    env.chain_id = evm.ctx.cfg.chain_id;
-    let db = evm.ctx.journaled_state.database;
-    let exec = match res {
-        Ok(ExecutionResult::Success { gas, logs, output, .. }) => {
-            let (output, address) = match output {
-                Output::Call(o) => (o, None),
-                Output::Create(o, a) => (o, a),
-            };
-            Exec { ok: true, output, gas: gas.tx_gas_used(), logs, address }
-        }
-        Ok(ExecutionResult::Revert { gas, logs, output }) => Exec { ok: false, output, gas: gas.tx_gas_used(), logs, address: None },
-        Ok(ExecutionResult::Halt { reason, gas, logs }) => {
-            Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {reason:?}")), gas: gas.tx_gas_used(), logs, address: None }
-        }
-        Err(e) => Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {e}")), gas: 0, logs: vec![], address: None },
-    };
-    (db, exec)
+    }
+
+    pub fn cheats(&mut self) -> &mut Cheats {
+        self.evm.inspector
+    }
+
+    /// The state, with block/chain changes made by cheatcodes copied back into `env`.
+    pub fn finish(self, env: &mut Env) -> Db {
+        env.block = self.evm.ctx.block.clone();
+        env.chain_id = self.evm.ctx.cfg.chain_id;
+        self.evm.ctx.journaled_state.database
+    }
 }
 
 impl From<bool> for Commit {

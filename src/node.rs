@@ -88,7 +88,7 @@ fn revert_err(out: &[u8]) -> Value {
 
 impl Chain {
     pub fn new(fork: Option<String>) -> Chain {
-        let remote = evm::Remote(fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))));
+        let remote = evm::Remote(fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))), None);
         let mut db = evm::base_db(remote);
         let accounts: Vec<Address> = KEYS.iter().map(|k| evm::pk_to_addr(U256::from_str_radix(k, 16).unwrap()).unwrap()).collect();
         for a in &accounts {

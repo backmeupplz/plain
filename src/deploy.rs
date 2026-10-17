@@ -84,7 +84,7 @@ pub fn run(p: &Project, arts: Vec<Artifact>, o: Opts) {
     }
 
     let arts = Arc::new(arts);
-    let remote = evm::Remote(url.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))));
+    let remote = evm::Remote(url.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))), None);
     let mut env = Env::new(31337);
     if let Some(u) = &url {
         env.chain_id = hexnum(&rpc::call(u, "eth_chainId", json!([])).unwrap_or_else(|e| die(&e))) as u64;
