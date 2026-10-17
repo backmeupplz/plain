@@ -55,6 +55,13 @@ struct CacheEntry {
     code: Vec<String>,
 }
 
+impl CacheEntry {
+    /// shards the file was compiled as last time (1 if not sharded)
+    fn shards(&self) -> u32 {
+        self.contracts.iter().map(|a| a.shard + 1).max().unwrap_or(1)
+    }
+}
+
 /// Files compiled from rewritten sources: test files, and for `plain test` also scripts (tests deploy
 /// them; `plain build`/`deploy` recompile them as written).
 fn rewritten(p: &Project, scope: &Scope, f: &str) -> bool {
@@ -580,7 +587,9 @@ impl Plan {
                 let e = if hist > 0 { hist } else { (code as f64 * per_byte) as u64 };
                 let tests: u64 = model.units.get(f.as_str()).map_or(0, |(u, _)| u.funcs.iter().filter(|x| x.name.starts_with("test") || x.name.starts_with("invariant")).map(|x| x.size as u64).sum());
                 let weighted = if test_file(f) { tests * 3 } else { tests };
-                (f.to_string(), (e.max(1), (weighted as f64 / code as f64).min(1.0), if hist > 0 { 0 } else { tests as usize }))
+                // timings of a sharded build are mostly test functions already
+                let own = if hist > 0 && cache.files.get(*f).is_some_and(|e| e.shards() > 1) { 0.95 } else { (weighted as f64 / code as f64).min(1.0) };
+                (f.to_string(), (e.max(1), own, if hist > 0 { 0 } else { tests as usize }))
             })
             .collect();
         let est: HashMap<String, u64> = est_own.iter().map(|(f, (e, ..))| (f.clone(), *e)).collect();
@@ -599,14 +608,16 @@ impl Plan {
             // a file whose own code is over half a core's share is split into shards by test function;
             // every shard still compiles what the file embeds, so only the own share counts
             let split = (e as f64 * own) as u64;
-            // via-IR: also cap a shard at ~24 KB of test code (a few seconds of solc), which history can't tell a cold build
-            let floor = if p.via_ir { 24 * 1024 } else { usize::MAX };
-            if test && (split > slot / 2 || test_bytes > 2 * floor) && workers > 1 {
+            // via-IR: also cap a shard at ~48 KB of test code (several seconds of solc) when there's no history.
+            // Each shard re-pays the file's fixed cost (analysis, setUp, helpers), so shards aim at about one
+            // core's share of the build, not less.
+            let floor = if p.via_ir { 48 * 1024 } else { usize::MAX };
+            if test && (split > slot || test_bytes > 2 * floor) && workers > 1 {
                 // contract indices survive the `new` rewrite (it only edits bodies and appends a free function)
                 let in_test = |ci: usize| testish.get(&(f.as_str(), ci)).copied().unwrap_or(false);
                 let content = sources.get(*f).cloned().unwrap_or_else(|| g.files[*f].content.clone());
                 if let Some((cu, tests)) = Unit::parse(&content).and_then(|cu| Some((rewrite::test_funcs(&content, &cu, &in_test)?, cu)).map(|(t, cu)| (cu, t))) {
-                    let k = ((split * 2).div_ceil(slot) as usize).max(test_bytes.div_ceil(floor)).min(workers).min(tests.len() / 2);
+                    let k = (split.div_ceil(slot) as usize).max(test_bytes.div_ceil(floor)).min(workers).min(tests.len() / 2);
                     if k >= 2 {
                         let a = rewrite::assign(&tests, k);
                         for s in 0..k {
@@ -718,6 +729,8 @@ impl<'a> Cost<'a> {
         }
         let mut total = 0;
         let mut created = vec![];
+        // identifiers the contract's code uses: they pick the library functions compiled into it
+        let mut idents: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
         for (bf, bci) in parts {
             let Some((u, src)) = self.units.get(bf).copied() else { continue };
             let c = &u.contracts[bci];
@@ -726,10 +739,41 @@ impl<'a> Cost<'a> {
             }
             total += (u.toks[c.body.1].e - u.toks[c.body.0].s) as u64 * if (self.is_test)(bf) { 3 } else { 1 };
             for i in c.body.0..c.body.1 {
-                if &src[u.toks[i].s..u.toks[i].e] == "new" && u.toks.get(i + 1).is_some_and(|t| t.k == crate::rewrite::K::Ident) {
-                    let n = &src[u.toks[i + 1].s..u.toks[i + 1].e];
+                if u.toks[i].k != crate::rewrite::K::Ident {
+                    continue;
+                }
+                let n = &src[u.toks[i].s..u.toks[i].e];
+                if i > 0 && &src[u.toks[i - 1].s..u.toks[i - 1].e] == "new" {
                     created.extend(self.defs.get(n).into_iter().flatten().copied());
                 }
+                idents.insert(n);
+            }
+        }
+        // library functions called (by name, transitively through their own bodies); not test framework code
+        let mut libs: Vec<(&'a str, usize)> = vec![];
+        let mut counted: std::collections::HashSet<(&'a str, usize)> = std::collections::HashSet::new();
+        loop {
+            let before = (libs.len(), counted.len());
+            for n in idents.iter() {
+                for &(lf, lci) in self.defs.get(n).into_iter().flatten() {
+                    if !libs.contains(&(lf, lci)) && !lf.contains("forge-std/") && self.units.get(lf).is_some_and(|(u, _)| u.contracts[lci].kind == "library") {
+                        libs.push((lf, lci));
+                    }
+                }
+            }
+            let mut found = vec![];
+            for &(lf, lci) in &libs {
+                let Some((u, src)) = self.units.get(lf).copied() else { continue };
+                for (fi, f) in u.funcs.iter().enumerate() {
+                    if f.contract == lci && idents.contains(f.name.as_str()) && counted.insert((lf, fi)) {
+                        total += f.size as u64;
+                        found.extend(u.toks[f.toks.0..f.toks.1].iter().filter(|t| t.k == crate::rewrite::K::Ident).map(|t| &src[t.s..t.e]));
+                    }
+                }
+            }
+            idents.extend(found);
+            if (libs.len(), counted.len()) == before {
+                break;
             }
         }
         created.sort();

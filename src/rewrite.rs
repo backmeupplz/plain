@@ -97,6 +97,8 @@ pub struct Func {
     pub overrides: bool,
     /// source bytes of the whole definition (shard balancing)
     pub size: usize,
+    /// tokens of the whole definition
+    pub toks: (usize, usize),
 }
 
 /// What the rewrites need to know about one file.
@@ -193,7 +195,7 @@ impl Unit {
                             }
                             k = h;
                         } else if t(k) == "function" && toks[k + 1].k == K::Ident && t(k + 2) == "(" {
-                            let mut f = Func { name: t(k + 1).to_string(), contract: ci, vis: None, payable: None, overrides: false, size: 0 };
+                            let mut f = Func { name: t(k + 1).to_string(), contract: ci, vis: None, payable: None, overrides: false, size: 0, toks: (k, k) };
                             let mut h = u.pair[k + 2] + 1;
                             let mut pure = false;
                             while h < end && t(h) != "{" && t(h) != ";" {
@@ -214,6 +216,7 @@ impl Unit {
                                 }
                             }
                             f.size = toks[last.min(n - 1)].e - toks[k].s;
+                            f.toks = (k, last.min(n - 1));
                             if kind == "library" && f.vis.is_some_and(|v| matches!(t(v), "public" | "external")) {
                                 u.ext_lib = true;
                             }
