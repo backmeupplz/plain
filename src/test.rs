@@ -236,7 +236,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
             let t = Instant::now();
             let r = invert_fail(run_test(f, addr, &db, &env, &cheats, inline.get(&f.name).copied().unwrap_or(opts.fuzz_runs), opts), f);
             if std::env::var_os("PLAIN_DEBUG").is_some() {
-                eprintln!("test {:.0?} {}:{}", t.elapsed(), id, r.name);
+                eprintln!("test {:.1?} {}:{}", t.elapsed(), id, r.name);
             }
             r
         })
