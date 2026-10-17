@@ -19,7 +19,7 @@ plain deploy Counter --network base-sepolia --broadcast   # deploy, then verify 
 
 ```
 plain build [--force]
-plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--force]
+plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--rerun] [--force]
 plain deploy <Contract|path/Script.s.sol> [constructor args...] [--network <name|id|url>] [--broadcast] [--no-verify]
 plain verify [--network <name|id|url>] [name|address...]
 plain node [--port 8545] [--fork <network|url>]
@@ -29,7 +29,7 @@ plain <anything>            # runs `plain-<anything>` from PATH (plugins)
 
 `filter` matches suite paths (`test/Vault.t.sol:VaultTest`) and test names, and only the test files it can match get compiled. Exit code is non-zero on any failure.
 
-Test results are cached: a suite reruns only when its compiled bytecode, the test settings, the plain binary, or something it read (contracts it deployed with `getCode`, files, env vars) changed. Cached suites print `(cached)`. Suites that call `ffi`, `writeFile`, `unixTime` or `setEnv`, and every `--fork` run, always rerun. `--force` recompiles and reruns everything.
+Test results are cached: a suite reruns only when its compiled bytecode, the test settings, the plain binary, or something it read (contracts it deployed with `getCode`, files, env vars) changed. Cached suites print `(cached)`. Suites that call `ffi`, `writeFile`, `unixTime` or `setEnv`, and every `--fork` run, always rerun. `--rerun` runs every test again, and `--force` also recompiles.
 
 ## Writing tests (agents: read this)
 

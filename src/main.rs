@@ -35,8 +35,9 @@ const USAGE: &str = "plain: compile, test and deploy EVM contracts
 
 usage:
   plain build [--force]                      compile src/, test/, script/ (solc auto-selected from pragmas)
-  plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts
-             [--fuzz-runs N] [--seed N]
+  plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts;
+             [--fuzz-runs N] [--seed N]      unchanged suites reuse their results (--rerun: run them anyway,
+             [--rerun] [--force]             --force: also recompile)
   plain deploy <Contract|script.s.sol> [args] [--network name|id|url] [--broadcast] [--no-verify]
                                              simulate, then send with --broadcast (key: $PRIVATE_KEY) and
                                              verify on Sourcify, Etherscan ($ETHERSCAN_API_KEY), Blockscout
@@ -82,6 +83,7 @@ fn main() {
             let p = project::Project::load();
             let verbose = switch(&mut args, &["-v", "--verbose"]);
             let force = switch(&mut args, &["--force"]);
+            let rerun = switch(&mut args, &["--rerun"]);
             let fork = flag(&mut args, "--fork").map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
             let seed = flag(&mut args, "--seed").map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
@@ -96,7 +98,7 @@ fn main() {
             let has_sol = out.artifacts.iter().any(test::is_test_contract);
             let mut ok = true;
             if has_sol || ts_files.is_empty() {
-                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && fork.is_none() };
+                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none() };
                 ok &= test::run(out.artifacts, &p.root, &opts);
             }
             if !ts_files.is_empty() {
