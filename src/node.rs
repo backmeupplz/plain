@@ -385,7 +385,12 @@ impl Chain {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req["method"].as_str().unwrap_or_default();
         let params: Vec<Value> = req["params"].as_array().cloned().unwrap_or_default();
-        match self.handle(method, &params) {
+        let t = std::time::Instant::now();
+        let r = self.handle(method, &params);
+        if std::env::var_os("PLAIN_DEBUG").is_some() {
+            eprintln!("rpc-server {method} {}us", t.elapsed().as_micros());
+        }
+        match r {
             Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
             Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
         }
@@ -396,6 +401,10 @@ impl Chain {
 pub fn serve(listener: TcpListener, chain: Arc<Mutex<Chain>>) {
     for stream in listener.incoming().flatten() {
         let chain = chain.clone();
+        stream.set_nodelay(true).ok();
+        if std::env::var_os("PLAIN_DEBUG").is_some() {
+            eprintln!("rpc-server connection");
+        }
         std::thread::spawn(move || {
             let mut r = BufReader::new(&stream);
             loop {
@@ -436,7 +445,7 @@ pub fn serve(listener: TcpListener, chain: Arc<Mutex<Chain>>) {
                     out.len()
                 );
                 let mut w = &stream;
-                if w.write_all(head.as_bytes()).and_then(|_| w.write_all(out.as_bytes())).is_err() {
+                if w.write_all(format!("{head}{out}").as_bytes()).is_err() {
                     return;
                 }
             }
