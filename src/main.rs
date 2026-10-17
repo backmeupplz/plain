@@ -3,6 +3,7 @@ mod deploy;
 mod evm;
 mod node;
 mod project;
+mod rewrite;
 mod rpc;
 mod solc;
 mod stdlib;
@@ -70,7 +71,7 @@ fn main() {
     match cmd.as_str() {
         "build" => {
             let p = project::Project::load();
-            let out = solc::build(&p, switch(&mut args, &["--force"]));
+            let out = solc::build(&p, switch(&mut args, &["--force"]), solc::Scope::All);
             eprintln!("compiled {} files with solc {} in {:.2?} ({} contracts)", out.compiled, out.solc, t.elapsed(), out.artifacts.len());
         }
         "test" => {
@@ -80,7 +81,7 @@ fn main() {
             let fork = flag(&mut args, "--fork").map(|f| rpc::network_url(&p, &f).unwrap_or_else(|| die(&format!("unknown network {f}"))));
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
             let seed = flag(&mut args, "--seed").map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
-            let out = solc::build(&p, force);
+            let out = solc::build(&p, force, solc::Scope::Tests);
             if out.compiled > 0 {
                 eprintln!("compiled {} files in {:.2?}", out.compiled, t.elapsed());
             }
@@ -106,7 +107,7 @@ fn main() {
             if args.is_empty() {
                 die("usage: plain deploy <Contract|script.s.sol> [constructor args...] [--network name|url] [--broadcast]");
             }
-            let out = solc::build(&p, false);
+            let out = solc::build(&p, false, solc::Scope::All);
             let target = args.remove(0);
             deploy::run(&p, out.artifacts, deploy::Opts { target, args, network, broadcast });
         }

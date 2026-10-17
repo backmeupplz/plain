@@ -21,7 +21,7 @@ pub fn init(arts: &[Artifact]) {
         let mut t = Tables { contracts: vec![], errors: HashMap::new(), functions: HashMap::new(), events: HashMap::new() };
         for a in arts {
             let Ok(abi) = serde_json::from_value::<JsonAbi>(a.abi.clone()) else { continue };
-            if !a.deployed.is_empty() {
+            if !a.deployed.is_empty() && a.shard == 0 {
                 let mut sels: Vec<[u8; 4]> = abi.functions().map(|f| f.selector().0).collect();
                 sels.sort();
                 t.contracts.push((a.name.clone(), sels, hex::decode(&a.bytecode).unwrap_or_default()));
@@ -69,8 +69,8 @@ pub fn contract_name(init: &[u8], runtime: &[u8]) -> Option<String> {
     let hits: Vec<_> = t.contracts.iter().filter(|(_, sels, _)| !sels.is_empty() && sels.iter().all(|s| pushed.contains(s))).collect();
     let best = hits.iter().map(|(_, s, _)| s.len()).max()?;
     let top: Vec<_> = hits.iter().filter(|(_, s, _)| s.len() == best).collect();
-    // identical ABIs are ambiguous: no name beats a wrong one
-    (top.len() == 1).then(|| top[0].0.clone())
+    // identical ABIs of differently named contracts are ambiguous: no name beats a wrong one
+    top.iter().all(|t| t.0 == top[0].0).then(|| top[0].0.clone())
 }
 
 pub fn revert_msg(msg: &str) -> Bytes {

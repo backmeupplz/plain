@@ -55,31 +55,36 @@ pub fn deploy(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art
 }
 
 fn link(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, libs: &mut HashMap<String, Address>) -> (Db, Vec<u8>) {
-    let mut code = art.bytecode.clone();
-    for (file, names) in art.links.as_object().into_iter().flatten() {
-        for (name, refs) in names.as_object().into_iter().flatten() {
-            let key = format!("{file}:{name}");
-            let addr = match libs.get(&key) {
-                Some(a) => *a,
-                None => {
-                    let Some(lib) = arts.iter().find(|a| &a.file == file && &a.name == name) else {
-                        crate::die(&format!("library {key} has no bytecode (is it outside src/test/script?)"));
-                    };
-                    let (d, r) = deploy(db, env, cheats, arts, lib, &[], libs);
-                    db = d;
-                    let a = r.address.unwrap_or_else(|| crate::die(&format!("deploying library {key} failed: {}", decode::reason(&r.output))));
-                    libs.insert(key, a);
-                    a
-                }
-            };
-            let hexaddr = hex::encode(addr);
-            for r in refs.as_array().into_iter().flatten() {
-                let start = r["start"].as_u64().unwrap() as usize * 2;
-                code.replace_range(start..start + 40, &hexaddr);
+    // libraries of contracts the test deploys from artifacts too, in the order embedding them would give
+    // (transitively: a script the test deploys can deploy contracts from artifacts in turn)
+    let mut needed: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut todo = vec![art];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(a) = todo.pop() {
+        for (file, names) in a.links.as_object().into_iter().flatten() {
+            needed.extend(names.as_object().into_iter().flatten().map(|(name, _)| (file.clone(), name.clone())));
+        }
+        for id in &a.deploys {
+            if seen.insert(id) {
+                todo.extend(arts.iter().find(|x| x.shard == 0 && format!("{}:{}", x.file, x.name) == *id));
             }
         }
     }
-    (db, hex::decode(&code).unwrap_or_else(|e| crate::die(&format!("{}: bad bytecode: {e}", art.name))))
+    for (file, name) in needed {
+        let key = format!("{file}:{name}");
+        if libs.contains_key(&key) {
+            continue;
+        }
+        let Some(lib) = arts.iter().find(|a| a.file == file && a.name == name) else {
+            crate::die(&format!("library {key} has no bytecode (is it outside src/test/script?)"));
+        };
+        let (d, r) = deploy(db, env, cheats, arts, lib, &[], libs);
+        db = d;
+        let a = r.address.unwrap_or_else(|| crate::die(&format!("deploying library {key} failed: {}", decode::reason(&r.output))));
+        libs.insert(key, a);
+    }
+    let code = evm::link_code(&art.bytecode, &art.links, libs).unwrap_or_else(|e| crate::die(&format!("{}: {e}", art.name)));
+    (db, code)
 }
 
 pub fn is_test_contract(a: &Artifact) -> bool {
@@ -93,12 +98,30 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     let arts = Arc::new(arts);
     let remote = evm::Remote(opts.fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))));
     let suites: Vec<&Artifact> = arts.iter().filter(|a| is_test_contract(a)).collect();
+    // a sharded test contract has one artifact per shard; each test runs on the first shard that has it
+    let selectors = |a: &Artifact| -> Vec<[u8; 4]> {
+        serde_json::from_value::<JsonAbi>(a.abi.clone()).map(|abi| abi.functions().map(|f| f.selector().0).collect()).unwrap_or_default()
+    };
+    let skips: Vec<std::collections::HashSet<[u8; 4]>> = suites
+        .iter()
+        .map(|a| suites.iter().filter(|b| b.file == a.file && b.name == a.name && b.shard < a.shard).flat_map(|b| selectors(b)).collect())
+        .collect();
     let filter = opts.filter.as_deref();
     let mut results: Vec<Suite> = suites
         .par_iter()
-        .filter_map(|art| run_suite(art, &arts, root, opts, &remote, filter))
+        .zip(skips.par_iter())
+        .filter_map(|(art, skip)| run_suite(art, &arts, root, opts, &remote, filter, skip))
         .collect();
     results.sort_by(|a, b| a.id.cmp(&b.id));
+    results.dedup_by(|b, a| {
+        let same = a.id == b.id;
+        if same {
+            a.results.append(&mut b.results);
+            a.results.sort_by(|x, y| x.name.cmp(&y.name));
+            a.elapsed = a.elapsed.max(b.elapsed);
+        }
+        same
+    });
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
     for s in &results {
         let p = s.results.iter().filter(|r| matches!(r.status, Status::Pass)).count();
@@ -155,12 +178,13 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     fail == 0
 }
 
-fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, filter: Option<&str>) -> Option<Suite> {
+fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, filter: Option<&str>, skip: &std::collections::HashSet<[u8; 4]>) -> Option<Suite> {
     let id = format!("{}:{}", art.file, art.name);
     let abi: JsonAbi = serde_json::from_value(art.abi.clone()).ok()?;
     let mut tests: Vec<&Function> = abi
         .functions()
         .filter(|f| f.name.starts_with("test") || f.name.starts_with("invariant"))
+        .filter(|f| !skip.contains(&f.selector().0))
         .filter(|f| filter.is_none_or(|flt| id.contains(flt) || f.name.contains(flt)))
         .collect();
     if tests.is_empty() {
@@ -176,6 +200,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     let db = evm::base_db(remote.clone());
     let mut libs = HashMap::new();
     let (db, r) = deploy(db, &mut env, &mut cheats, arts, art, &[], &mut libs);
+    cheats.libs = libs;
     let fail_all = |why: String, logs: Vec<String>| Suite {
         id: id.clone(),
         results: tests.iter().map(|f| TestResult { name: sig(f), status: Status::Fail(why.clone()), gas: 0, runs: None, logs: logs.clone(), args: None, trace: vec![] }).collect(),
@@ -452,7 +477,9 @@ fn trace(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Ve
         parent[i] = stack.last().copied();
         stack.push(i);
     }
-    let mut keep: Vec<bool> = nodes.iter().map(|n| n.depth <= 1).collect();
+    // getCode calls come from rewritten `new` expressions (see rewrite.rs): noise in a trace
+    let get_code = alloy_primitives::keccak256("getCode(string)");
+    let mut keep: Vec<bool> = nodes.iter().map(|n| n.depth <= 1 && !(n.to == evm::CHEATS && n.input.starts_with(&get_code[..4]))).collect();
     for i in 0..nodes.len() {
         if failed(&nodes[i]) {
             let mut j = Some(i);

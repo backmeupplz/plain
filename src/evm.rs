@@ -286,6 +286,8 @@ pub struct Cheats {
     bc_creates: Vec<Option<usize>>,
     /// set when ds-test/forge-std `fail()` writes the global "failed" slot
     pub failed: bool,
+    /// libraries deployed for the suite ("file:Name" -> address), used to link getCode results
+    pub libs: HashMap<String, Address>,
 }
 
 fn revert_bytes(msg: &str) -> Vec<u8> {
@@ -381,6 +383,22 @@ pub fn pk_to_addr(pk: U256) -> Result<Address, String> {
     let key = k256::ecdsa::SigningKey::from_slice(&pk.to_be_bytes::<32>()).map_err(|e| format!("invalid private key: {e}"))?;
     let pt = key.verifying_key().to_encoded_point(false);
     Ok(Address::from_slice(&keccak256(&pt.as_bytes()[1..])[12..]))
+}
+
+/// Hex bytecode with library placeholders filled from `libs` ("file:Name" -> address).
+pub fn link_code(code: &str, links: &serde_json::Value, libs: &HashMap<String, Address>) -> Result<Vec<u8>, String> {
+    let mut code = code.to_string();
+    for (file, names) in links.as_object().into_iter().flatten() {
+        for (name, refs) in names.as_object().into_iter().flatten() {
+            let addr = libs.get(&format!("{file}:{name}")).ok_or(format!("library {file}:{name} is not deployed"))?;
+            let hexaddr = hex::encode(addr);
+            for r in refs.as_array().into_iter().flatten() {
+                let start = r["start"].as_u64().unwrap_or_default() as usize * 2;
+                code.replace_range(start..start + 40, &hexaddr);
+            }
+        }
+    }
+    hex::decode(&code).map_err(|e| format!("bad bytecode: {e}"))
 }
 
 fn find_artifact<'a>(arts: &'a [Artifact], what: &str) -> Option<&'a Artifact> {
@@ -724,11 +742,13 @@ impl Cheats {
             "getCode(string)" | "getDeployedCode(string)" => {
                 let what = st(&args[0]);
                 let art = find_artifact(&self.artifacts, &what).ok_or(format!("no artifact for {what:?} (only project src/test/script contracts are compiled to bytecode)"))?;
-                let code = if s.name == "getCode" { &art.bytecode } else { &art.deployed };
-                if code.contains("__$") {
-                    return Err(format!("{what} needs library linking, unsupported in getCode"));
+                if s.name == "getCode" {
+                    return Ok(enc(DynSolValue::Bytes(link_code(&art.bytecode, &art.links, &self.libs).map_err(|e| format!("getCode {what}: {e}"))?)));
                 }
-                Ok(enc(DynSolValue::Bytes(hex::decode(code).unwrap_or_default())))
+                if art.deployed.contains("__$") {
+                    return Err(format!("{what} needs library linking, unsupported in getDeployedCode"));
+                }
+                Ok(enc(DynSolValue::Bytes(hex::decode(&art.deployed).unwrap_or_default())))
             }
             "mockCall(address,bytes,bytes)" | "mockCallRevert(address,bytes,bytes)" => {
                 self.mocks.push((a(&args[0]), by(&args[1]), by(&args[2]), s.name == "mockCallRevert"));

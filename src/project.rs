@@ -340,22 +340,21 @@ impl Graph {
         seen
     }
 
-    /// sha256 over the file and its transitive imports (sorted), per file.
-    pub fn hashes(&self) -> HashMap<String, String> {
+    /// sha256 of each file's content.
+    pub fn own_hashes(&self) -> HashMap<String, String> {
         use sha2::{Digest, Sha256};
-        let own: HashMap<&str, [u8; 32]> =
-            self.files.iter().map(|(k, v)| (k.as_str(), Sha256::digest(v.content.as_bytes()).into())).collect();
-        self.files
-            .keys()
-            .map(|k| {
-                let mut h = Sha256::new();
-                for f in self.closure(k) {
-                    h.update(f.as_bytes());
-                    h.update(own.get(f.as_str()).copied().unwrap_or_default());
-                }
-                (k.clone(), hex::encode(h.finalize()))
-            })
-            .collect()
+        self.files.iter().map(|(k, v)| (k.clone(), hex::encode(Sha256::digest(v.content.as_bytes())))).collect()
+    }
+
+    /// sha256 over the file's transitive imports (sorted) and the hash `part` gives each of them.
+    pub fn closure_hash(&self, root: &str, part: &mut dyn FnMut(&str) -> String) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for f in self.closure(root) {
+            h.update(f.as_bytes());
+            h.update(part(&f).as_bytes());
+        }
+        hex::encode(h.finalize())
     }
 }
 
