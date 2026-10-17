@@ -85,12 +85,14 @@ fn main() {
             let fork = flag(&mut args, "--fork").map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
             let seed = flag(&mut args, "--seed").map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
-            let out = solc::build(&p, force, solc::Scope::Tests);
+            let filter = args.first().cloned();
+            let ts_files = ts::files(&p.root, &p.dirs[1], filter.as_deref());
+            // a filter compiles only the test files it can match; TypeScript tests need every artifact
+            let scope = solc::Scope::Tests(filter.clone().filter(|_| ts_files.is_empty()));
+            let out = solc::build(&p, force, scope);
             if out.compiled > 0 {
                 eprintln!("compiled {} files in {:.2?}", out.compiled, t.elapsed());
             }
-            let filter = args.first().cloned();
-            let ts_files = ts::files(&p.root, &p.dirs[1], filter.as_deref());
             let has_sol = out.artifacts.iter().any(test::is_test_contract);
             let mut ok = true;
             if has_sol || ts_files.is_empty() {

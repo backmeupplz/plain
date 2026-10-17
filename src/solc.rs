@@ -149,7 +149,8 @@ fn dep_hash(g: &Graph, f: &str, code: &[String], own: &HashMap<String, String>, 
 #[derive(PartialEq)]
 pub enum Scope {
     All,
-    Tests,
+    /// what `plain test [filter]` runs: with a filter, only test files with a matching suite or test
+    Tests(Option<String>),
     Deploy(String),
 }
 
@@ -328,10 +329,22 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let script = format!("{}/", p.dirs[2]);
     let wanted: Vec<&String> = match scope {
         Scope::All => files.iter().collect(),
-        Scope::Tests => {
+        Scope::Tests(filter) => {
+            // a test file matches by suite id ("file:Contract") or by the name of a test it has, its own or
+            // inherited from test files it imports
+            let tests_in = |u: &str| -> Vec<String> {
+                let src = &g.files[u].content;
+                crate::rewrite::Unit::parse(src).map(|x| x.funcs.iter().filter(|f| f.name.starts_with("test") || f.name.starts_with("invariant")).map(|f| f.name.clone()).collect()).unwrap_or_default()
+            };
+            let matches = |f: &String, flt: &str| {
+                let own = crate::rewrite::Unit::parse(&g.files[f].content).map(|u| u.contracts.iter().any(|c| format!("{f}:{}", c.name).contains(flt))).unwrap_or(true);
+                own || g.closure(f).iter().filter(|u| rewritten(p, u)).any(|u| tests_in(u).iter().any(|t| t.contains(flt)))
+            };
             let mut need: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in files.iter().filter(|f| !f.starts_with(&script)) {
-                need.extend(g.closure(f));
+                if filter.as_deref().is_none_or(|flt| rewritten(p, f) && matches(f, flt)) {
+                    need.extend(g.closure(f));
+                }
             }
             files.iter().filter(|f| need.contains(*f)).collect()
         }
