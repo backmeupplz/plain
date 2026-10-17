@@ -49,7 +49,10 @@ pub fn overlay(base: &Arc<Db>) -> Db {
 
 pub struct Fork {
     pub url: String,
-    pub block: u64,
+    /// the block read from; steps back while the RPC's nodes don't have it yet (load-balanced public RPCs
+    /// answer `latest` from the newest node and state from a lagging one), then stays put
+    block: std::sync::atomic::AtomicU64,
+    settled: std::sync::atomic::AtomicBool,
     accounts: Mutex<HashMap<Address, AccountInfo>>,
     slots: Mutex<HashMap<(Address, U256), U256>>,
 }
@@ -60,10 +63,31 @@ impl Fork {
             let b = crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).unwrap_or_else(|e| crate::die(&format!("fork {url}: {e}")));
             u64::from_str_radix(b.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
         });
-        Fork { url: url.into(), block, accounts: Default::default(), slots: Default::default() }
+        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default() }
     }
-    fn q(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, DbErr> {
-        crate::rpc::call(&self.url, method, params).map_err(DbErr)
+
+    pub fn block(&self) -> u64 {
+        self.block.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Calls with the fork's block appended to each call's params.
+    fn q(&self, calls: &[(&str, serde_json::Value)]) -> Result<Vec<serde_json::Value>, DbErr> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut steps = 0;
+        loop {
+            let b = serde_json::json!(format!("0x{:x}", self.block()));
+            let at: Vec<(&str, serde_json::Value)> = calls.iter().map(|(m, p)| (*m, p.as_array().map(|a| a.iter().cloned().chain([b.clone()]).collect()).unwrap_or_default())).collect();
+            match crate::rpc::batch(&self.url, &at) {
+                Err(e) if !self.settled.load(Relaxed) && steps < 8 && ["unknown block", "header not found"].iter().any(|t| e.to_lowercase().contains(t)) => {
+                    steps += 1;
+                    self.block.fetch_sub(1, Relaxed);
+                }
+                r => {
+                    self.settled.store(r.is_ok(), Relaxed);
+                    return r.map_err(DbErr);
+                }
+            }
+        }
     }
 }
 
@@ -81,9 +105,8 @@ impl DatabaseRef for Remote {
         if let Some(i) = f.accounts.lock().unwrap().get(&a) {
             return Ok(Some(i.clone()));
         }
-        let b = format!("0x{:x}", f.block);
-        let p = serde_json::json!([a, b]);
-        let r = crate::rpc::batch(&f.url, &[("eth_getBalance", p.clone()), ("eth_getTransactionCount", p.clone()), ("eth_getCode", p)]).map_err(DbErr)?;
+        let p = serde_json::json!([a]);
+        let r = f.q(&[("eth_getBalance", p.clone()), ("eth_getTransactionCount", p.clone()), ("eth_getCode", p)])?;
         let (bal, nonce, code) = (hexu(&r[0]), hexu(&r[1]).to::<u64>(), &r[2]);
         let code = hex::decode(code.as_str().unwrap_or("0x").trim_start_matches("0x")).unwrap_or_default();
         let bc = Bytecode::new_raw(code.into());
@@ -105,7 +128,7 @@ impl DatabaseRef for Remote {
         if let Some(v) = f.slots.lock().unwrap().get(&(a, k)) {
             return Ok(*v);
         }
-        let v = hexu(&f.q("eth_getStorageAt", serde_json::json!([a, format!("0x{k:x}"), format!("0x{:x}", f.block)]))?);
+        let v = hexu(&f.q(&[("eth_getStorageAt", serde_json::json!([a, format!("0x{k:x}")]))])?[0]);
         f.slots.lock().unwrap().insert((a, k), v);
         Ok(v)
     }
@@ -323,6 +346,8 @@ pub struct Cheats {
     /// address -> contract name for contracts created while `track_creates` is on
     pub names: HashMap<Address, String>,
     pub track_creates: bool,
+    /// every contract created while `track_creates` is on, with its init code (for verification)
+    pub creates: Vec<(Address, Bytes)>,
     pub trace: Option<Vec<TraceNode>>,
     trace_stack: Vec<usize>,
     bc_creates: Vec<Option<usize>>,
@@ -1097,6 +1122,7 @@ impl Inspector<Ctx> for Cheats {
         }
         if self.track_creates && outcome.result.result.is_ok() {
             if let Some(a) = outcome.address {
+                self.creates.push((a, inputs.init_code().clone()));
                 if let Some(n) = decode::contract_name(inputs.init_code(), &outcome.result.output) {
                     self.names.insert(a, n);
                 }

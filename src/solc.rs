@@ -124,11 +124,13 @@ fn dep_hash(g: &Graph, f: &str, code: &[String], own: &HashMap<String, String>, 
     })
 }
 
-/// What `build` compiles: everything, or what tests need (scripts only when a test imports them).
+/// What `build` compiles: everything, what tests need (scripts only when a test imports them), or what
+/// deploying one contract or script needs (with what its rewritten code deploys from artifacts).
 #[derive(PartialEq)]
 pub enum Scope {
     All,
     Tests,
+    Deploy(String),
 }
 
 pub fn home() -> PathBuf {
@@ -184,6 +186,17 @@ fn list() -> Value {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| crate::die("cannot fetch solc release list (offline?)"))
+}
+
+/// "0.8.28+commit.7893614a", as explorers want it.
+pub fn long_version(v: &str) -> String {
+    let out = Command::new(ensure(v)).arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let full = out.lines().find_map(|l| l.strip_prefix("Version: ")).unwrap_or(v);
+    // drop the platform suffix after the commit hash
+    match full.find("+commit.") {
+        Some(i) => full[..(i + 16).min(full.len())].to_string(),
+        None => full.to_string(),
+    }
 }
 
 fn ensure(v: &str) -> PathBuf {
@@ -284,7 +297,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     cache.key = key;
     let own = g.own_hashes();
     let full: HashMap<String, String> = g.files.keys().map(|f| (f.clone(), g.closure_hash(f, &mut |u| own[u].clone()))).collect();
-    cache.files.retain(|f, _| files.contains(f));
+    cache.files.retain(|f, _| g.files.contains_key(f));
     cache.iface.retain(|h, _| own.values().any(|o| o == h));
     let script = format!("{}/", p.dirs[2]);
     let wanted: Vec<&String> = match scope {
@@ -295,6 +308,40 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 need.extend(g.closure(f));
             }
             files.iter().filter(|f| need.contains(*f)).collect()
+        }
+        Scope::Deploy(t) => {
+            let units: HashMap<&String, crate::rewrite::Unit> = g.files.par_iter().filter_map(|(f, n)| Some((f, crate::rewrite::Unit::parse(&n.content)?))).collect();
+            let defines = |f: &String, name: &str| units.get(f).is_some_and(|u| u.contracts.iter().any(|c| c.name == name));
+            let (tf, tn) = t.rsplit_once(':').map_or((t.as_str(), None), |(f, n)| (f, Some(n)));
+            let mut stack: Vec<String> = files
+                .iter()
+                .filter(|f| match tn {
+                    Some(n) => *f == tf && defines(f, n),
+                    None if t.ends_with(".sol") => f.as_str() == t.as_str() || f.ends_with(&format!("/{t}")),
+                    None => defines(f, t.as_str()),
+                })
+                .cloned()
+                .collect();
+            // the target, and every contract it can create: rewritten code deploys project contracts from
+            // artifacts, and whatever goes on chain (OpenZeppelin proxies too) needs an artifact to verify
+            let mut need = std::collections::BTreeSet::new();
+            let mut roots = std::collections::BTreeSet::new();
+            while let Some(f) = stack.pop() {
+                if !roots.insert(f.clone()) {
+                    continue;
+                }
+                for u in g.closure(&f) {
+                    if need.insert(u.clone()) {
+                        let src = &g.files[&u].content;
+                        for name in units.get(&u).map(|x| x.created(src)).unwrap_or_default() {
+                            stack.extend(g.files.keys().filter(|d| defines(d, &name)).cloned());
+                        }
+                    }
+                }
+            }
+            let mut w: Vec<&String> = files.iter().filter(|f| need.contains(*f)).collect();
+            w.extend(g.files.keys().filter(|f| roots.contains(*f) && !files.contains(f)));
+            w
         }
     };
     let mut iface = std::mem::take(&mut cache.iface);
@@ -527,6 +574,11 @@ impl Plan {
                         (*df != f && !u.aliases.iter().any(|a| a == name)).then(|| targets.get(&(*df, *ci))).flatten()
                     };
                     let in_test = |ci: usize| testish.get(&(f.as_str(), ci)).copied().unwrap_or(false);
+                    // contracts a script file defines may go on chain: their bytecode (metadata hash) must be
+                    // solc's for the file as written, or explorers can't verify them
+                    if f.starts_with(&format!("{}/", p.dirs[2])) && u.contracts.iter().enumerate().any(|(ci, c)| c.kind == "contract" && !c.is_abstract && !in_test(ci)) {
+                        continue;
+                    }
                     let (edits, ids) = rewrite::link_news(&node.content, u, &f, &in_test, &target, memory_safe);
                     for (ci, t) in ids {
                         uses.entry((f.clone(), u.contracts[ci].name.clone())).or_default().insert(t.id.clone());
@@ -821,7 +873,7 @@ fn gitignore(p: &Project) {
     }
 }
 
-fn settings(p: &Project) -> Value {
+pub fn settings(p: &Project) -> Value {
     let mut s = json!({
         "remappings": p.remappings.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>(),
         "optimizer": {"enabled": p.optimizer, "runs": p.runs},

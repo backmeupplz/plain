@@ -9,6 +9,7 @@ mod solc;
 mod stdlib;
 mod test;
 mod ts;
+mod verify;
 
 use std::time::Instant;
 
@@ -36,14 +37,17 @@ usage:
   plain build [--force]                      compile src/, test/, script/ (solc auto-selected from pragmas)
   plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts
              [--fuzz-runs N] [--seed N]
-  plain deploy <Contract|script.s.sol> [args] [--network name|url] [--broadcast]
-                                             simulate, then send with --broadcast (key: $PRIVATE_KEY)
+  plain deploy <Contract|script.s.sol> [args] [--network name|id|url] [--broadcast] [--no-verify]
+                                             simulate, then send with --broadcast (key: $PRIVATE_KEY) and
+                                             verify on Sourcify, Etherscan ($ETHERSCAN_API_KEY), Blockscout
+  plain verify [--network net] [name|address...]
+                                             verify (again) what plain deployed
   plain node [--port 8545] [--fork net]      local dev chain (anvil/hardhat compatible JSON-RPC)
   plain init                                 scaffold src/Counter.sol + test/Counter.t.sol
   plain <name> [args]                        run plugin `plain-<name>` from PATH
 
-networks: mainnet sepolia base base-sepolia optimism optimism-sepolia arbitrum arbitrum-sepolia
-          polygon polygon-amoy bsc avalanche gnosis local, or any URL; add more in plain.toml [networks]
+networks: any chain on chainlist.org by name or id (base, base-sepolia, arbitrum, linea, 8453, ...),
+          local, or a URL; $<NAME>_RPC_URL or plain.toml [networks] picks the RPC
 ";
 
 fn init() {
@@ -78,7 +82,7 @@ fn main() {
             let p = project::Project::load();
             let verbose = switch(&mut args, &["-v", "--verbose"]);
             let force = switch(&mut args, &["--force"]);
-            let fork = flag(&mut args, "--fork").map(|f| rpc::network_url(&p, &f).unwrap_or_else(|| die(&format!("unknown network {f}"))));
+            let fork = flag(&mut args, "--fork").map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
             let seed = flag(&mut args, "--seed").map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
             let out = solc::build(&p, force, solc::Scope::Tests);
@@ -104,17 +108,54 @@ fn main() {
             let p = project::Project::load();
             let network = flag(&mut args, "--network");
             let broadcast = switch(&mut args, &["--broadcast"]);
+            let verify = !switch(&mut args, &["--no-verify"]);
             if args.is_empty() {
-                die("usage: plain deploy <Contract|script.s.sol> [constructor args...] [--network name|url] [--broadcast]");
+                die("usage: plain deploy <Contract|script.s.sol> [constructor args...] [--network name|id|url] [--broadcast] [--no-verify]");
             }
-            let out = solc::build(&p, false, solc::Scope::All);
             let target = args.remove(0);
-            deploy::run(&p, out.artifacts, deploy::Opts { target, args, network, broadcast });
+            // talk to the network while solc compiles
+            let (out, conn) = std::thread::scope(|s| {
+                let conn = network.as_deref().map(|n| s.spawn(|| deploy::connect(&p, n)));
+                let out = solc::build(&p, false, solc::Scope::Deploy(target.clone()));
+                (out, conn.map(|c| c.join().unwrap()))
+            });
+            if broadcast && verify {
+                // explorers for verification, from chainlist; fetched while the transactions go out
+                if let Some(c) = conn.as_ref().map(|c| c.chain) {
+                    std::thread::spawn(move || rpc::chain_info(c));
+                }
+            }
+            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify });
+        }
+        "verify" => {
+            let p = project::Project::load();
+            let chain = match flag(&mut args, "--network") {
+                Some(n) => {
+                    let net = rpc::network(&p, &n).unwrap_or_else(|e| die(&e));
+                    net.chain.unwrap_or_else(|| rpc::call(&net.url, "eth_chainId", serde_json::json!([])).ok().and_then(|v| u64::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok()).unwrap_or_else(|| die(&format!("{n}: no chain id"))))
+                }
+                None => match verify::chains(&p).as_slice() {
+                    [c] => *c,
+                    [] => die("nothing deployed from this project yet (plain deploy ... --broadcast records deploys in .plain/deploys)"),
+                    many => die(&format!("deploys on several chains ({many:?}); pick one with --network")),
+                },
+            };
+            let mut all = verify::load(&p, chain);
+            let mut recs: std::collections::BTreeMap<_, _> = all.iter().filter(|(a, r)| args.is_empty() || args.iter().any(|x| x.eq_ignore_ascii_case(&a.to_string()) || *x == r.name || *x == r.contract)).map(|(a, r)| (*a, r.clone())).collect();
+            if recs.is_empty() {
+                die(&format!("no deploy recorded on chain {chain} matches {}", args.join(" ")));
+            }
+            let ok = verify::run(&p, chain, &mut recs);
+            all.append(&mut recs);
+            verify::save(&p, chain, &all);
+            if !ok {
+                std::process::exit(1);
+            }
         }
         "node" => {
             let p = project::Project::load();
             let port = flag(&mut args, "--port").map(|v| v.parse().unwrap_or_else(|_| die("--port N"))).unwrap_or(8545);
-            let fork = flag(&mut args, "--fork").map(|f| rpc::network_url(&p, &f).unwrap_or_else(|| die(&format!("unknown network {f}"))));
+            let fork = flag(&mut args, "--fork").map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
             let (port, _chain) = node::start(fork, port, false);
             println!("plain node on http://127.0.0.1:{port} (chain 31337); accounts are anvil/hardhat defaults, e.g.");
             println!("  0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 key 0x{}", node::KEYS[0]);

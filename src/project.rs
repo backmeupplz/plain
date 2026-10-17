@@ -17,6 +17,8 @@ pub struct Project {
     pub allow_internal_revert: bool,
     pub invariant: (u32, u32, bool),
     pub networks: BTreeMap<String, String>,
+    /// foundry.toml [etherscan]: v2 keys work on every chain, so any entry's key will do
+    pub etherscan_key: Option<String>,
 }
 
 type Table = toml::Table;
@@ -53,7 +55,11 @@ impl Project {
         // foundry.toml [profile.default] first, plain.toml (same keys, top level) overrides.
         let mut cfg = Table::new();
         let mut networks = BTreeMap::new();
+        let mut etherscan_key = None;
         if let Some(f) = read_toml(&root.join("foundry.toml")) {
+            for (_, e) in f.get("etherscan").and_then(|e| e.as_table()).into_iter().flatten() {
+                etherscan_key = etherscan_key.or(e.get("key").and_then(|k| k.as_str()).map(expand_env).filter(|k| !k.is_empty()));
+            }
             if let Some(p) = f.get("profile").and_then(|p| p.get("default")).and_then(|p| p.as_table()) {
                 cfg.extend(p.clone());
             }
@@ -163,6 +169,7 @@ impl Project {
                 )
             },
             networks,
+            etherscan_key,
             root,
         }
     }

@@ -280,8 +280,16 @@ impl Unit {
     /// Names whose code compiles into this file's contracts: bases, contracts created with `new`,
     /// and `type(X).creationCode`/`runtimeCode` targets.
     pub fn code_refs(&self, src: &str) -> Vec<String> {
+        let mut out: Vec<String> = self.contracts.iter().flat_map(|c| c.bases.iter().cloned()).chain(self.created(src)).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Contracts whose creation code the unit uses: `new X`, `type(X).creationCode/runtimeCode`.
+    pub fn created(&self, src: &str) -> Vec<String> {
         let t = |i: usize| self.toks.get(i).map_or("", |x| &src[x.s..x.e]);
-        let mut out: Vec<String> = self.contracts.iter().flat_map(|c| c.bases.iter().cloned()).collect();
+        let mut out = vec![];
         for i in 0..self.toks.len() {
             if t(i) == "new" && self.toks.get(i + 1).is_some_and(|x| x.k == K::Ident) {
                 out.push(t(i + 1).to_string());
