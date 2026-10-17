@@ -131,11 +131,6 @@ pub fn reason(out: &[u8]) -> String {
     format!("custom error 0x{}", hex::encode(out))
 }
 
-/// Same as `reason`, used inside expectRevert mismatch messages.
-pub fn reason_plain(out: &[u8]) -> String {
-    reason(out)
-}
-
 pub fn describe_bytes(d: &[u8]) -> String {
     if d.len() == 4 {
         if let Some(e) = tables().and_then(|t| t.errors.get(&<[u8; 4]>::try_from(d).unwrap())) {

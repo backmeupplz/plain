@@ -213,8 +213,6 @@ struct Prank {
 struct ExpectRevert {
     data: Option<Vec<u8>>,
     partial: bool,
-    // ponytail: the expected reverter address is accepted but not checked
-    _reverter: Option<Address>,
     depth: usize,
 }
 
@@ -361,11 +359,10 @@ pub fn supported() -> &'static HashMap<[u8; 4], Sig> {
 }
 
 /// Every Vm signature from the project's forge-std Vm.sol (for assert formatting + naming unsupported cheatcodes).
-pub fn vm_sol(root: &std::path::Path) -> &'static HashMap<[u8; 4], Sig> {
+pub fn vm_sol() -> &'static HashMap<[u8; 4], Sig> {
     static T: OnceLock<HashMap<[u8; 4], Sig>> = OnceLock::new();
     T.get_or_init(|| {
         let p = crate::project::Project::load();
-        let _ = root;
         let Some(text) = p.read(&p.resolve_import("", "forge-std/Vm.sol")) else { return HashMap::new() };
         let mut out = HashMap::new();
         for chunk in text.split("function ").skip(1) {
@@ -483,7 +480,7 @@ impl Cheats {
         }
         let sel: [u8; 4] = data[..4].try_into().unwrap();
         let Some(s) = supported().get(&sel) else {
-            if let Some(s) = vm_sol(&self.root).get(&sel) {
+            if let Some(s) = vm_sol().get(&sel) {
                 if s.name.starts_with("assert") {
                     // fast path: forge-std calls some asserts unconditionally; equal static words need no decoding
                     let d = &data[4..];
@@ -628,15 +625,9 @@ impl Cheats {
             }
             "expectRevert()" | "expectRevert(bytes4)" | "expectRevert(bytes)" | "expectRevert(address)" | "expectRevert(bytes4,address)"
             | "expectRevert(bytes,address)" | "expectPartialRevert(bytes4)" | "expectPartialRevert(bytes4,address)" => {
-                let mut data = None;
-                let mut reverter = None;
-                for v in &args {
-                    match v {
-                        DynSolValue::Address(x) => reverter = Some(*x),
-                        v => data = Some(by(v)),
-                    }
-                }
-                self.expect_revert = Some(ExpectRevert { data, partial: s.name == "expectPartialRevert", _reverter: reverter, depth });
+                // ponytail: the optional reverter address is accepted but not checked
+                let data = args.iter().find(|v| !matches!(v, DynSolValue::Address(_))).map(by);
+                self.expect_revert = Some(ExpectRevert { data, partial: s.name == "expectPartialRevert", depth });
                 ok
             }
             "expectEmit()" | "expectEmit(address)" | "expectEmit(bool,bool,bool,bool)" | "expectEmit(bool,bool,bool,bool,address)" => {
@@ -849,20 +840,19 @@ fn matches_revert(exp: &ExpectRevert, out: &[u8]) -> bool {
 }
 
 impl Cheats {
-    fn check_revert(&mut self, depth: usize, result: &mut InterpreterResult, address: Option<Address>) -> bool {
+    fn check_revert(&mut self, depth: usize, result: &mut InterpreterResult) -> bool {
         let Some(armed) = self.revert_armed else { return false };
         if armed != depth {
             return false;
         }
         self.revert_armed = None;
         let exp = self.expect_revert.take().unwrap();
-        let _ = address;
         if result.result.is_ok() {
             result.result = InstructionResult::Revert;
             result.output = decode::revert_msg("call did not revert as expected");
         } else if !matches_revert(&exp, &result.output) {
             let want = exp.data.as_deref().map(|d| decode::describe_bytes(d)).unwrap_or_default();
-            result.output = decode::revert_msg(&format!("reverted with {:?}, expected {:?}", decode::reason_plain(&result.output), want));
+            result.output = decode::revert_msg(&format!("reverted with {:?}, expected {:?}", decode::reason(&result.output), want));
             result.result = InstructionResult::Revert;
         } else {
             result.result = InstructionResult::Return;
@@ -996,7 +986,7 @@ impl Inspector<Ctx> for Cheats {
             // the frame that called expectRevert reverted itself (internal call)
             self.revert_armed = Some(depth);
         }
-        self.check_revert(depth, &mut outcome.result, None);
+        self.check_revert(depth, &mut outcome.result);
         self.check_emits(depth, &mut outcome.result);
         if let (Some(i), Some(t)) = (traced, &mut self.trace) {
             t[i].result = Some((outcome.result.result, outcome.result.output.clone()));
@@ -1050,7 +1040,7 @@ impl Inspector<Ctx> for Cheats {
                 }
             }
         }
-        if self.check_revert(depth, &mut outcome.result, outcome.address) && outcome.result.result.is_ok() {
+        if self.check_revert(depth, &mut outcome.result) && outcome.result.result.is_ok() {
             outcome.address = Some(Address::with_last_byte(1));
         }
         self.check_emits(depth, &mut outcome.result);

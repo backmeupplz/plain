@@ -246,11 +246,10 @@ fn failed_slot(db: &Db) -> bool {
 }
 
 /// One call of the test function on a fresh copy of the post-setUp state.
-fn exec_once(f: &Function, data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Exec, Cheats, Option<String>) {
+fn exec_once(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Exec, Cheats, Option<String>) {
     let mut c = cheats.clone();
     let mut e = env.clone();
     let (db, r) = evm::transact(db.clone(), &mut e, &mut c, SENDER, TxKind::Call(addr), data, U256::ZERO, true);
-    let _ = f;
     let mut why = None;
     if !r.ok {
         why = Some(decode::reason(&r.output));
@@ -268,7 +267,7 @@ fn run_test(f: &Function, addr: Address, db: &Db, env: &Env, cheats: &Cheats, fu
     let sel = f.selector();
     if f.inputs.is_empty() {
         let data = Bytes::copy_from_slice(sel.as_slice());
-        let (r, c, why) = exec_once(f, data.clone(), addr, db, env, cheats);
+        let (r, c, why) = exec_once(data.clone(), addr, db, env, cheats);
         res.gas = r.gas;
         res.logs = c.console;
         res.status = match why {
@@ -306,7 +305,7 @@ fn run_test(f: &Function, addr: Address, db: &Db, env: &Env, cheats: &Cheats, fu
             loop {
                 let vals: Vec<DynSolValue> = types.iter().map(|t| fuzz_value(t, &mut rng)).collect();
                 let data = f.abi_encode_input(&vals).unwrap();
-                let (r, c, why) = exec_once(f, data.clone().into(), addr, db, env, cheats);
+                let (r, c, why) = exec_once(data.clone().into(), addr, db, env, cheats);
                 if r.output.as_ref() == ASSUME_MAGIC {
                     if rejects.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 65536 {
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -479,7 +478,7 @@ fn trace(data: Bytes, addr: Address, db: &Db, env: &Env, cheats: &Cheats) -> (Ve
             let sel: Option<[u8; 4]> = n.input.get(..4).map(|s| s.try_into().unwrap());
             let fname = sel.and_then(|s| {
                 if n.to == evm::CHEATS {
-                    let sig = evm::supported().get(&s).or_else(|| evm::vm_sol(&c.root).get(&s))?;
+                    let sig = evm::supported().get(&s).or_else(|| evm::vm_sol().get(&s))?;
                     let args = match sig.ty.abi_decode_params(&n.input[4..]) {
                         Ok(alloy_dyn_abi::DynSolValue::Tuple(v)) => v.iter().map(|x| short(decode::display(x))).collect::<Vec<_>>().join(", "),
                         _ => String::new(),
