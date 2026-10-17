@@ -5,12 +5,13 @@ Compile, test and deploy EVM smart contracts. One ~6 MB binary with no config, n
 ```sh
 plain init                 # src/Counter.sol + test/Counter.t.sol
 plain test                 # compile + run every test
-plain deploy Counter --network base-sepolia --broadcast
+plain deploy Counter --network base-sepolia --broadcast   # deploy, then verify on explorers
 ```
 
 - **Compile:** finds `src/` (or `contracts/`), `test/` and `script/`, picks and downloads the right `solc` from your pragmas (it reuses Foundry's solc cache if present), and compiles in parallel jobs. Results are cached by content hash, per project and in `~/.plain/cache`, which every checkout shares (git worktrees, fresh clones).
-- **Test:** runs Solidity tests in the forge-std style (`*.t.sol`, `setUp`, `test*`, fuzzing, invariants, cheatcodes) on revm, in parallel. It also runs `test/**/*.test.ts` files against a fresh in-process chain per file.
-- **Deploy:** runs Solidity scripts (`vm.startBroadcast`) or a single contract. It always simulates first, against a fork of the target network, then signs and sends when you add `--broadcast`.
+- **Test:** runs Solidity tests in the forge-std style (`*.t.sol`, `setUp`, `test*`, fuzzing, invariants, cheatcodes) on revm, in parallel. It also runs `test/**/*.test.ts` files against a fresh in-process chain per file. A suite whose compiled code and inputs haven't changed reuses its last results.
+- **Deploy:** runs Solidity scripts (`vm.startBroadcast`) or a single contract. It always simulates first, against a fork of the target network, then signs and sends when you add `--broadcast`, and verifies every contract it created on Sourcify, Etherscan and the chain's Blockscout.
+- **Networks:** any chain on [chainlist.org](https://chainlist.org), by name or chain id (`base`, `base-sepolia`, `linea`, `8453`, ...), or a URL.
 - **Zero setup:** `forge-std` is built into the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. `lib/` dependencies, `remappings.txt` and `node_modules` (`@openzeppelin/...`) resolve automatically.
 - **Foundry projects work as they are:** `foundry.toml` `[profile.default]` is read, including solc version, optimizer, via_ir, remappings, fuzz/invariant runs and rpc_endpoints.
 
@@ -18,14 +19,17 @@ plain deploy Counter --network base-sepolia --broadcast
 
 ```
 plain build [--force]
-plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N]
-plain deploy <Contract|path/Script.s.sol> [constructor args...] [--network <name|url>] [--broadcast]
+plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--force]
+plain deploy <Contract|path/Script.s.sol> [constructor args...] [--network <name|id|url>] [--broadcast] [--no-verify]
+plain verify [--network <name|id|url>] [name|address...]
 plain node [--port 8545] [--fork <network|url>]
 plain init
 plain <anything>            # runs `plain-<anything>` from PATH (plugins)
 ```
 
-`filter` matches suite paths (`test/Vault.t.sol:VaultTest`) and test names. Exit code is non-zero on any failure.
+`filter` matches suite paths (`test/Vault.t.sol:VaultTest`) and test names, and only the test files it can match get compiled. Exit code is non-zero on any failure.
+
+Test results are cached: a suite reruns only when its compiled bytecode, the test settings, the plain binary, or something it read (contracts it deployed with `getCode`, files, env vars) changed. Cached suites print `(cached)`. Suites that call `ffi`, `writeFile`, `unixTime` or `setEnv`, and every `--fork` run, always rerun. `--force` recompiles and reruns everything.
 
 ## Writing tests (agents: read this)
 
@@ -101,13 +105,22 @@ The chain supports `evm_snapshot`/`evm_revert`, `evm_increaseTime`, `evm_mine`/`
 
 ```sh
 export PRIVATE_KEY=0x...
+export ETHERSCAN_API_KEY=...                                       # optional: one key covers 60+ chains
 plain deploy Counter 42 0xabc... --network sepolia                # simulate only
-plain deploy script/Deploy.s.sol --network base --broadcast       # forge-style script, sends txs
+plain deploy script/Deploy.s.sol --network base --broadcast       # forge-style script, sends txs, verifies
 ```
 
-Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (the key comes from `$PRIVATE_KEY`), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. External libraries that the deployed contracts link against are deployed first, from `$PRIVATE_KEY`'s address. Deployed addresses are written to `deployments/<network>.json`.
+Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (the key comes from `$PRIVATE_KEY`), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. External libraries that the deployed contracts link against are deployed first, from `$PRIVATE_KEY`'s address.
 
-Networks: `mainnet sepolia base base-sepolia optimism optimism-sepolia arbitrum arbitrum-sepolia polygon polygon-amoy bsc avalanche gnosis local`, or any URL. `$<NAME>_RPC_URL` overrides a built-in URL (for example `BASE_RPC_URL`). Add your own in `plain.toml`:
+What `--broadcast` does:
+1. While solc compiles (only what the target deploys), plain connects to the network and reads the chain id, the latest block and fees in one round trip.
+2. It runs the script against a fork of that block, then replays each transaction on its own, in order, as the chain will run it. That gives each transaction's exact gas (sent with 30% headroom), and it stops before sending anything if a transaction would revert on chain or the sender can't pay.
+3. It signs everything up front and sends the transactions back to back, without waiting for receipts in between (nonces keep them in order), then waits for all receipts at once.
+4. It writes the addresses to `deployments/<network>.json` and verifies every contract created, including proxies and contracts created by other contracts. Each contract goes to every explorer at once: [Sourcify](https://sourcify.dev) (no key), Etherscan's v2 API when `ETHERSCAN_API_KEY` is set (foundry.toml `[etherscan]` keys work too), and the chain's Blockscout and Routescan explorers from chainlist. Each explorer gets the contract's own import closure as standard JSON input, the same sources and settings solc compiled it from, so it compiles no more than it has to. `--no-verify` skips this step.
+
+What explorers need is kept in `.plain/deploys/<chain id>.json`, so `plain verify --network base` retries whatever didn't verify (an explorer was down, or the key was missing). It doesn't compile anything. To verify only some contracts, pass names or addresses.
+
+Networks: any chain on [chainlist.org](https://chainlist.org) by name, short name or chain id (`base`, `base-sepolia`, `arbitrum-sepolia`, `linea`, `monad`, `8453`), plus `local` (127.0.0.1:8545) and any URL. Common chains use their official RPC. For other chains, plain races chainlist's public RPCs that don't track users and takes the first one that answers with the right chain id. `$<NAME>_RPC_URL` picks the RPC for a name (for example `BASE_RPC_URL`), as does a `plain.toml` entry or foundry.toml's `rpc_endpoints`:
 
 ```toml
 [networks]

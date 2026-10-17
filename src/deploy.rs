@@ -351,15 +351,31 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
     let mut deployed = BTreeMap::new();
     let mut failed = false;
     let mut last = Instant::now();
+    // block number of the last receipt (or resend): a block passing without any of ours means the node dropped
+    // them (anvil does when one doesn't fit in a block; public mempools evict): send what's pending again,
+    // nodes answer "already known" otherwise
+    let mut seen = 0;
     while next < sent.len() {
         let pending: Vec<usize> = (0..sent.len()).filter(|i| receipts[*i].is_none()).collect();
-        let calls: Vec<(&str, Value)> = pending.iter().map(|i| ("eth_getTransactionReceipt", json!([sent[*i]]))).collect();
-        if let Ok(rs) = rpc::batch_each(url, &calls) {
+        let mut calls: Vec<(&str, Value)> = pending.iter().map(|i| ("eth_getTransactionReceipt", json!([sent[*i]]))).collect();
+        calls.push(("eth_blockNumber", json!([])));
+        if let Ok(mut rs) = rpc::batch_each(url, &calls) {
+            let block = rs.pop().and_then(|b| b.ok()).map(|b| hexnum(&b)).unwrap_or(0);
+            let mut progress = false;
             for (i, r) in pending.iter().zip(rs) {
                 if let Ok(r) = r.and_then(|r| if r.is_null() { Err(String::new()) } else { Ok(r) }) {
                     receipts[*i] = Some(r);
                     last = Instant::now();
+                    progress = true;
                 }
+            }
+            if progress || seen == 0 {
+                seen = block;
+            } else if block > seen {
+                for i in pending.iter().take(16) {
+                    rpc::call(url, "eth_sendRawTransaction", json!([format!("0x{}", hex::encode(&signed[*i].1))])).ok();
+                }
+                seen = block;
             }
         }
         while let Some(Some(receipt)) = receipts.get(next) {
