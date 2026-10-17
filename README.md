@@ -105,7 +105,7 @@ plain deploy Counter 42 0xabc... --network sepolia                # simulate onl
 plain deploy script/Deploy.s.sol --network base --broadcast       # forge-style script, sends txs
 ```
 
-Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (the key comes from `$PRIVATE_KEY`), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. Deployed addresses are written to `deployments/<network>.json`.
+Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (the key comes from `$PRIVATE_KEY`), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. External libraries that the deployed contracts link against are deployed first, from `$PRIVATE_KEY`'s address. Deployed addresses are written to `deployments/<network>.json`.
 
 Networks: `mainnet sepolia base base-sepolia optimism optimism-sepolia arbitrum arbitrum-sepolia polygon polygon-amoy bsc avalanche gnosis local`, or any URL. `$<NAME>_RPC_URL` overrides a built-in URL (for example `BASE_RPC_URL`). Add your own in `plain.toml`:
 
@@ -142,20 +142,30 @@ Per-test fuzz runs: `/// forge-config: default.fuzz.runs = 10` above the functio
 
 ## Benchmarks
 
-The numbers below are median wall times from hyperfine on an M1 Max (10 cores), using the same harness for every tool. Tool versions are forge 1.7.1, Hardhat 3.20.0 and solc as pinned by each project. The machine was under unrelated background load, which affected all three tools alike. All tests pass under `plain`: 303 in veydrift, 598 in v4-core and 568 in solmate.
+Median wall times from hyperfine on an M1 Max (10 cores), 2026-10-17, same harness for every tool: forge 1.7.1, Hardhat 3.20.0, solc as pinned by each project. "Cold" means nothing compiled anywhere (plain's shared cache cleared too). All tests pass under `plain`: 303 in veydrift, 598 in v4-core, 568 in solmate.
 
-| | veydrift (via-IR, 141 files) | Uniswap v4-core (via-IR) | solmate |
+Foundry / Hardhat / **plain**:
+
+| | veydrift (via-IR) | Uniswap v4-core (via-IR) | solmate |
 |---|---|---|---|
-| cold build: Foundry / Hardhat / **plain** | 117s / 120s / **65s** | 155s / 145s / **29s** | 5.6s / 8.7s / **1.4s** |
-| no-op build | 0.19s / 0.25s / **0.02s** | 0.24s / 0.27s / **0.02s** | 0.15s / 0.76s / **0.01s** |
-| test, warm | 0.26s / 0.42s / **0.10s** | 4.45s / 6.16s / **2.91s** | 4.05s / 3.46s / **3.43s**¹ |
+| cold build | 115s / 117s / **15s** | 140s / 142s / **12s** | 5.6s / 6.7s / **1.0s** |
+| no-op build | 0.18s / 0.25s / **0.02s** | 0.22s / 0.26s / **0.02s** | 0.16s / 0.21s / **0.01s** |
+| test, warm | 0.25s / 0.42s / **0.09s** | 4.3s / 5.8s / **3.1s** | 3.9s / 3.4s / **1.4s**¹ |
+| cold test (compile + test) | 112s / 116s / **15s** | 144s / 149s / **16s** | 9.6s / 9.8s / **2.6s**¹ |
+| edit a test, run tests² | 56s / 61s / **7.6s** | 25s / 27s / **8.4s** | 4.6s / 4.1s / **1.8s** |
+| edit a src function, run tests² | 103s / 109s / **2.1s** | 129s / 134s / **4.6s** | 5.8s / 5.8s / **1.8s** |
+| new worktree/clone of built sources, run tests | cold test / cold test / **0.14s** | cold test / cold test / **3.2s** | cold test / cold test / **1.6s** |
 
-¹ forge 1.x and Hardhat 3 dropped `testFail*`, so their solmate timings exclude those tests (290 tests). `plain` runs all 568, including the legacy `testFail*` ones.
+¹ forge 1.x and Hardhat 3 dropped `testFail*`, so their solmate test timings exclude those tests (290 tests). `plain` runs all 568, including the legacy `testFail*` ones.
+
+² One agent iteration: add a statement to one function, then run the whole test command. The test edits are in the largest test file (veydrift `VeydriftGame.t.sol`, 7,500 lines; v4-core `PoolManager.t.sol`; solmate `ERC20.t.sol`), the src edits in `VeydriftGame.settleFirstPlanet`, `PoolManager.swap` and `ERC20.transfer`.
+
+Cold builds also peak at about 0.7 GB of memory under plain (veydrift, v4-core), against 3.2 to 4.6 GB for Foundry and Hardhat.
 
 Where the speed comes from (solc itself is unchanged: what gets deployed is byte-for-byte what solc produces):
 - **Tests don't embed the contracts they deploy.** In a test contract, `new Vault(args)` would make solc compile and optimize `Vault` again inside the test, once per test file (via-IR makes that the bulk of a build). plain compiles test files with each `new X(...)` replaced by a deploy of X's compiled artifact: the same init code, deployer, nonce and address. The arguments are still type-checked against X's constructor (through `abi.encodeCall` on a generated contract), so a wrong argument is the same compile error as before. If a rewritten file fails to compile, plain compiles the original and reports its errors.
 - **Big test files compile in parallel.** A test file with many tests compiles as several shards at once. Each shard keeps a share of the tests public and turns the rest `internal`, so solc drops them.
-- **Editing src/ doesn't recompile tests.** Since tests no longer contain src bytecode, a test file is cached by its own source plus the *interfaces* of what it imports (function bodies left out). Editing a function body recompiles that one file.
+- **Editing src/ doesn't recompile tests.** Since tests no longer contain src bytecode, a test file is cached by its own source plus the *interfaces* of what it imports (function bodies left out). Editing a function body recompiles that file and whatever inherits from it, not the tests that deploy it. Deploy scripts compile the same way: a script's own bytecode never goes on chain, and the transactions it broadcasts are byte-identical.
 - **Scheduling:** solc jobs run on a work queue, biggest first, sized from the last build's timings (or, cold, from a model of how much code each file compiles). Foundry and Hardhat run one solc process at a time.
 - **Shared cache:** a new worktree or clone reuses artifacts any checkout already compiled.
 - **Tests:** suites, tests and individual fuzz/invariant runs execute in parallel on an in-process revm. Each run starts from a copy-on-write view of the post-`setUp` state.
@@ -165,4 +175,4 @@ Where the speed comes from (solc itself is unchanged: what gets deployed is byte
 
 Gas snapshot files, coverage, formatting, Etherscan verification, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), and the `vm.deployCode` cheatcode (use `vm.getCode` + `create`). Library linking only works for libraries under `src/`/`test/`/`script/`.
 
-Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs. Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test contracts aren't written there).
+Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs. Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).
