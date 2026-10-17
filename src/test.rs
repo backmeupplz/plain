@@ -22,14 +22,18 @@ pub struct Opts {
     /// (runs, depth, fail_on_revert)
     pub invariant: (u32, u32, bool),
     pub quiet_if_empty: bool,
+    /// reuse results of suites whose bytecode, settings and inputs haven't changed (not with --force or --fork)
+    pub cache: bool,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum Status {
     Pass,
     Fail(String),
     Skip(String),
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TestResult {
     name: String,
     status: Status,
@@ -44,6 +48,34 @@ struct Suite {
     id: String,
     results: Vec<TestResult>,
     elapsed: std::time::Duration,
+    /// results reused from an earlier run
+    cached: usize,
+}
+
+/// A suite's results by test, with what it read besides its bytecode (see evm::Reads).
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Entry {
+    deps: std::collections::BTreeMap<String, String>,
+    results: Vec<TestResult>,
+}
+
+/// Results are deterministic given the test contract's bytecode, the settings, this binary and what the
+/// suite read (artifacts it deployed, files, env vars): the key covers the first three, `Entry::deps` the rest.
+fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, u32>) -> String {
+    use sha2::Digest;
+    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let exe = EXE.get_or_init(|| {
+        let m = std::env::current_exe().and_then(std::fs::metadata);
+        m.map(|m| format!("{}{:?}", m.len(), m.modified().ok())).unwrap_or_default()
+    });
+    let mut inline: Vec<_> = inline.iter().collect();
+    inline.sort();
+    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{}|{inline:?}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.seed, opts.allow_internal_revert);
+    hex::encode(sha2::Sha256::digest(s.as_bytes()))
+}
+
+fn entry_path(key: &str) -> std::path::PathBuf {
+    crate::solc::home().join("cache/tests").join(format!("{key}.json"))
 }
 
 /// Deploy `art` (linking libraries first) from SENDER; returns the CREATE result.
@@ -106,13 +138,30 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     let arts = Arc::new(arts);
     let remote = evm::Remote(opts.fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))), None);
     let suites: Vec<&Artifact> = arts.iter().filter(|a| is_test_contract(a)).collect();
-    // a sharded test contract has one artifact per shard; each test runs on the first shard that has it
-    let selectors = |a: &Artifact| -> Vec<[u8; 4]> {
-        serde_json::from_value::<JsonAbi>(a.abi.clone()).map(|abi| abi.functions().map(|f| f.selector().0).collect()).unwrap_or_default()
+    // a sharded test contract has one artifact per unit: a test runs on the unit that owns it; tests no unit
+    // owns but every unit has (inherited from other files) run on unit 0
+    let selectors = |a: &Artifact| -> Vec<([u8; 4], String)> {
+        serde_json::from_value::<JsonAbi>(a.abi.clone()).map(|abi| abi.functions().map(|f| (f.selector().0, f.name.clone())).collect()).unwrap_or_default()
     };
     let skips: Vec<std::collections::HashSet<[u8; 4]>> = suites
         .iter()
-        .map(|a| suites.iter().filter(|b| b.file == a.file && b.name == a.name && b.shard < a.shard).flat_map(|b| selectors(b)).collect())
+        .map(|a| {
+            let sibs: Vec<&&Artifact> = suites.iter().filter(|b| b.file == a.file && b.name == a.name).collect();
+            if sibs.len() < 2 {
+                return Default::default();
+            }
+            let sels: Vec<Vec<([u8; 4], String)>> = sibs.iter().map(|b| selectors(b)).collect();
+            let first = sibs.iter().all(|b| b.shard >= a.shard);
+            selectors(a)
+                .into_iter()
+                .filter(|(sel, name)| {
+                    let owned = sibs.iter().any(|b| b.tests.contains(name));
+                    let run = if owned { a.tests.contains(name) } else { first && sels.iter().all(|s| s.iter().any(|x| x.0 == *sel)) };
+                    !run
+                })
+                .map(|x| x.0)
+                .collect()
+        })
         .collect();
     let filter = opts.filter.as_deref();
     let mut results: Vec<Suite> = suites
@@ -127,10 +176,12 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
             a.results.append(&mut b.results);
             a.results.sort_by(|x, y| x.name.cmp(&y.name));
             a.elapsed = a.elapsed.max(b.elapsed);
+            a.cached += b.cached;
         }
         same
     });
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
+    let cached: usize = results.iter().map(|s| s.cached).sum();
     for s in &results {
         let p = s.results.iter().filter(|r| matches!(r.status, Status::Pass)).count();
         let f = s.results.iter().filter(|r| matches!(r.status, Status::Fail(_))).count();
@@ -145,7 +196,11 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
         if k > 0 {
             line += &format!(", {k} skipped");
         }
-        println!("{line} ({:.0?})", s.elapsed);
+        if s.cached == s.results.len() {
+            println!("{line} (cached)");
+        } else {
+            println!("{line} ({:.0?})", s.elapsed);
+        }
         for r in &s.results {
             let runs = r.runs.map(|n| format!(", runs: {n}")).unwrap_or_default();
             match &r.status {
@@ -182,7 +237,8 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
         }
         println!("no tests found{}", filter.map(|f| format!(" matching {f:?}")).unwrap_or_default());
     }
-    println!("{pass} passed, {fail} failed, {skip} skipped ({} suites, {:.2?})", results.len(), t0.elapsed());
+    let reused = if cached > 0 { format!(", {cached} results cached") } else { String::new() };
+    println!("{pass} passed, {fail} failed, {skip} skipped ({} suites, {:.2?}{reused})", results.len(), t0.elapsed());
     fail == 0
 }
 
@@ -200,7 +256,54 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     }
     tests.sort_by(|a, b| a.name.cmp(&b.name));
     let t0 = Instant::now();
+    let inline = inline_runs(&root.join(&art.file));
+    // results of an unchanged suite come from its last run
+    let key = opts.cache.then(|| cache_key(art, opts, &inline));
+    let old: Option<Entry> = key
+        .as_ref()
+        .and_then(|k| serde_json::from_slice::<Entry>(&std::fs::read(entry_path(k)).ok()?).ok())
+        .filter(|e| e.deps.iter().all(|(k, v)| evm::read_now(k, arts, root).as_ref() == Some(v)));
+    let mut cached = vec![];
+    if let Some(e) = &old {
+        tests.retain(|f| match e.results.iter().find(|r| r.name == sig(f)) {
+            Some(r) => {
+                cached.push(r.clone());
+                false
+            }
+            None => true,
+        });
+    }
+    let n = cached.len();
+    if tests.is_empty() {
+        return Some(Suite { id, results: cached, elapsed: t0.elapsed(), cached: n });
+    }
+    let reads = key.as_ref().map(|_| Arc::new(std::sync::Mutex::new(evm::Reads::default())));
+    let mut results = execute(art, arts, root, opts, remote, &id, &abi, tests, &inline, reads.clone());
+    if let (Some(k), Some(r)) = (key, reads) {
+        let r = r.lock().unwrap();
+        if !r.impure {
+            let mut e = old.unwrap_or_default();
+            e.deps.extend(r.deps.clone());
+            e.results.retain(|x| !results.iter().any(|y| y.name == x.name));
+            e.results.extend(results.iter().cloned());
+            let path = entry_path(&k);
+            std::fs::create_dir_all(path.parent().unwrap()).ok();
+            let tmp = path.with_extension(format!("{}", std::process::id()));
+            if std::fs::write(&tmp, serde_json::to_vec(&e).unwrap()).is_ok() {
+                std::fs::rename(&tmp, &path).ok();
+            }
+        }
+    }
+    results.extend(cached);
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+    Some(Suite { id, results, elapsed: t0.elapsed(), cached: n })
+}
+
+/// Deploys the suite, runs setUp, then `tests` on copies of the post-setUp state.
+#[allow(clippy::too_many_arguments)]
+fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, id: &str, abi: &JsonAbi, tests: Vec<&Function>, inline: &HashMap<String, u32>, reads: Option<Arc<std::sync::Mutex<evm::Reads>>>) -> Vec<TestResult> {
     let mut cheats = Cheats::new(arts.clone(), root.to_path_buf());
+    cheats.reads = reads;
     cheats.fork_url = opts.fork.clone();
     cheats.track_creates = true;
     cheats.allow_internal_revert = opts.allow_internal_revert;
@@ -208,14 +311,15 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     let db = evm::base_db(remote.clone());
     let mut libs = HashMap::new();
     let (db, r) = deploy(db, &mut env, &mut cheats, arts, art, &[], &mut libs);
+    for l in libs.keys() {
+        cheats.read(format!("art:{l}"));
+    }
     cheats.libs = libs;
-    let fail_all = |why: String, logs: Vec<String>| Suite {
-        id: id.clone(),
-        results: tests.iter().map(|f| TestResult { name: sig(f), status: Status::Fail(why.clone()), gas: 0, runs: None, logs: logs.clone(), args: None, trace: vec![] }).collect(),
-        elapsed: t0.elapsed(),
+    let fail_all = |why: String, logs: Vec<String>| -> Vec<TestResult> {
+        tests.iter().map(|f| TestResult { name: sig(f), status: Status::Fail(why.clone()), gas: 0, runs: None, logs: logs.clone(), args: None, trace: vec![] }).collect()
     };
     let Some(addr) = r.address.filter(|_| r.ok) else {
-        return Some(fail_all(format!("constructor reverted: {}", decode::reason(&r.output)), cheats.console));
+        return fail_all(format!("constructor reverted: {}", decode::reason(&r.output)), cheats.console);
     };
     let mut db = db;
     // forge gives the test contract 2^96-1 wei
@@ -228,7 +332,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
         let pending = cheats.finish();
         if !r.ok || pending.is_some() {
             let why = if r.ok { pending.unwrap() } else { decode::reason(&r.output) };
-            return Some(fail_all(format!("setUp() failed: {why}"), cheats.console));
+            return fail_all(format!("setUp() failed: {why}"), cheats.console);
         }
     }
     cheats.console.clear();
@@ -236,7 +340,6 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     cheats.names.insert(addr, art.name.clone());
     // the post-setUp state, shared read-only: each test/run executes on an overlay of it
     let db = Arc::new(db);
-    let inline = inline_runs(&root.join(&art.file));
     let (invariants, tests): (Vec<&Function>, Vec<&Function>) = tests.into_iter().partition(|f| f.name.starts_with("invariant"));
     let mut results: Vec<TestResult> = tests
         .par_iter()
@@ -253,7 +356,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
         results.extend(run_invariants(&invariants, addr, &db, &env, &cheats, opts));
         results.sort_by(|a, b| a.name.cmp(&b.name));
     }
-    Some(Suite { id, results, elapsed: t0.elapsed() })
+    results
 }
 
 /// `/// forge-config: default.fuzz.runs = N` natspec above a test function.

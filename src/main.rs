@@ -94,7 +94,7 @@ fn main() {
             let has_sol = out.artifacts.iter().any(test::is_test_contract);
             let mut ok = true;
             if has_sol || ts_files.is_empty() {
-                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty() };
+                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && fork.is_none() };
                 ok &= test::run(out.artifacts, &p.root, &opts);
             }
             if !ts_files.is_empty() {

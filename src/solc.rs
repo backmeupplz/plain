@@ -17,9 +17,12 @@ pub struct Artifact {
     pub deployed: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub links: Value,
-    /// test contracts of a sharded file: one artifact per shard, each running its own tests
+    /// test contracts of a sharded file: one artifact per unit (see `UnitMeta`), each running its own tests
     #[serde(default, skip_serializing_if = "is_zero")]
     pub shard: u32,
+    /// tests this unit runs (sharded files); tests every unit has (inherited) run on unit 0
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
     /// artifacts this test contract deploys via the getCode cheatcode (see rewrite.rs)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deploys: Vec<String>,
@@ -53,6 +56,23 @@ struct CacheEntry {
     /// rest of its imports, so editing a function body in src/ doesn't recompile the tests
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     code: Vec<String>,
+    /// a big test file compiled as units: hash of everything but its test functions (and of its imports)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    shared: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    units: Vec<UnitMeta>,
+}
+
+/// One unit of a sharded test file: the file with only some of its test functions. While nothing but test
+/// bodies changes, a unit stays valid for the tests it owns whose text is unchanged; edited and new tests
+/// compile into a small "hot" unit, so editing one test recompiles one test.
+#[derive(Serialize, Deserialize, Clone)]
+struct UnitMeta {
+    owns: Vec<String>,
+    /// hash of each test function in the unit's source, as compiled
+    tests: BTreeMap<String, String>,
+    hot: bool,
+    ms: u64,
 }
 
 impl CacheEntry {
@@ -286,7 +306,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let key = {
         use sha2::Digest;
         // bump the suffix when rewrites change what gets compiled
-        hex::encode(sha2::Sha256::digest(format!("{version}{settings}{:?}rw3", p.dirs).as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{version}{settings}{:?}rw5", p.dirs).as_bytes()))
     };
     let cache_path = p.root.join(".plain/cache.json");
     let mut cache: Cache = std::fs::read(&cache_path)
@@ -383,7 +403,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     if !dirty.is_empty() {
         let solc = ensure(&version);
         let v: semver::Version = version.parse().unwrap_or(semver::Version::new(0, 8, 0));
-        let plan = Plan::new(p, &g, &files, &dirty, &v, &cache);
+        let plan = Plan::new(p, &g, &files, &dirty, &v, &cache, &own, force);
         let mut results = run_jobs(&solc, &g, &plan.jobs, &settings, p, &plan.sources, &plan.gen_deps);
         // a rewrite that broke a test file: compile it again from the original sources (also reports real errors)
         let broken: Vec<String> = {
@@ -397,14 +417,18 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 eprintln!("rewrite fallback: {broken:?}");
             }
             results.retain(|r| !r.0.files.iter().any(|f| broken.contains(f)));
-            let jobs: Vec<Job> = broken.into_iter().map(|f| Job { files: vec![f], shard: None, test: false, est: 0 }).collect();
+            let jobs: Vec<Job> = broken.iter().map(|f| Job { files: vec![f.clone()], shard: None, test: false, est: 0 }).collect();
             results.extend(run_jobs(&solc, &g, &jobs, &settings, p, &HashMap::new(), &HashMap::new()));
         }
         let mut warnings = std::collections::BTreeSet::new();
         let mut errors = Vec::new();
         // (artifacts, ms, compiled from rewritten sources)
-        let mut fresh: HashMap<String, (Vec<Artifact>, u64, bool)> = dirty.iter().map(|f| (f.to_string(), (vec![], 0, false))).collect();
+        let mut fresh: HashMap<String, (Vec<Artifact>, u64, bool)> = dirty.iter().map(|f| (f.to_string(), (vec![], 0, plan.units.contains_key(*f) && !broken.contains(f)))).collect();
+        let mut unit_ms: HashMap<(String, usize), u64> = HashMap::new();
         for (job, r, ms) in results {
+            if let Some((k, _)) = job.shard {
+                unit_ms.insert((job.files[0].clone(), k), ms);
+            }
             let total: u64 = job.files.iter().map(|f| plan.est.get(f).copied().unwrap_or(1)).sum::<u64>().max(1);
             for f in &job.files {
                 if let Some(e) = fresh.get_mut(f) {
@@ -421,11 +445,12 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                             a.rewritten = plan.rewritten.contains(&(a.file.clone(), a.name.clone()));
                         }
                         if let Some((k, _)) = job.shard {
-                            // shards differ only in which tests are public: keep shard 0 whole, other shards' test contracts
+                            // units differ only in which tests they have: keep unit 0 whole, other units' test contracts
                             if k > 0 && !crate::test::is_test_contract(&a) {
                                 continue;
                             }
                             a.shard = k as u32;
+                            a.tests = plan.units.get(&job.files[0]).map(|u| u.1[k].0.owns.clone()).unwrap_or_default();
                         }
                         fresh.entry(a.file.clone()).or_default().0.push(a);
                     }
@@ -447,14 +472,31 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
             }
             crate::die("compilation failed");
         }
-        for (f, (mut contracts, ms, test)) in fresh {
+        for (f, (mut contracts, mut ms, test)) in fresh {
+            let (shared, units) = match plan.units.get(&f).filter(|_| !broken.contains(&f)) {
+                Some((shared, units)) => {
+                    let mut metas = vec![];
+                    for (i, (u, reuse)) in units.iter().enumerate() {
+                        let mut m = u.clone();
+                        match reuse {
+                            // a unit from the previous build: its artifacts, now owning only its unchanged tests
+                            Some(old) => contracts.extend(cache.files[&f].contracts.iter().filter(|a| a.shard == *old).map(|a| Artifact { shard: i as u32, tests: if crate::test::is_test_contract(a) { m.owns.clone() } else { vec![] }, ..a.clone() })),
+                            None => m.ms = unit_ms.get(&(f.clone(), i)).copied().unwrap_or(0),
+                        }
+                        metas.push(m);
+                    }
+                    ms = metas.iter().map(|m| m.ms).sum();
+                    (shared.clone(), metas)
+                }
+                None => (String::new(), vec![]),
+            };
             contracts.sort_by_key(|a| a.shard);
             export(&contracts);
             let (hash, code) = match plan.code.get(&f).filter(|_| test) {
                 Some(code) => (dep_hash(&g, &f, code, &own, &mut iface), code.clone()),
                 None => (full[&f].clone(), vec![]),
             };
-            let e = CacheEntry { hash, contracts, ms, code };
+            let e = CacheEntry { hash, contracts, ms, code, shared, units };
             store.put(&full[&f], &e);
             cache.files.insert(f.clone(), e);
         }
@@ -497,10 +539,12 @@ struct Plan {
     code: HashMap<String, Vec<String>>,
     /// (file, contract) of test and script contracts, compiled from rewritten sources
     rewritten: std::collections::HashSet<(String, String)>,
+    /// sharded test files: shared hash and units, each reusing the previous build's unit (by index) or compiled
+    units: HashMap<String, (String, Vec<(UnitMeta, Option<u32>)>)>,
 }
 
 impl Plan {
-    fn new(p: &Project, g: &Graph, files: &[String], dirty: &[&String], v: &semver::Version, cache: &Cache) -> Plan {
+    fn new(p: &Project, g: &Graph, files: &[String], dirty: &[&String], v: &semver::Version, cache: &Cache, own_hash: &HashMap<String, String>, force: bool) -> Plan {
         use crate::rewrite::{self, Unit};
         let workers = std::env::var("PLAIN_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
         let is_test = |f: &str| rewritten(p, f);
@@ -653,29 +697,91 @@ impl Plan {
         let slot = (total / workers as u64).max(1);
         let mut jobs = vec![];
         let mut small: [Vec<(String, u64)>; 2] = [vec![], vec![]];
+        let mut unit_plans = HashMap::new();
         for f in dirty {
             let (e, own, test_bytes) = est_own[f.as_str()];
             let test = is_test(f) && *v >= semver::Version::new(0, 8, 0);
-            // a file whose own code is over half a core's share is split into shards by test function;
-            // every shard still compiles what the file embeds, so only the own share counts
+            // a file whose own code is over half a core's share is split into units by test function;
+            // every unit still compiles what the file embeds, so only the own share counts
             let split = (e as f64 * own) as u64;
-            // via-IR: also cap a shard at ~48 KB of test code (several seconds of solc) when there's no history.
-            // Each shard re-pays the file's fixed cost (analysis, setUp, helpers), so shards aim at about one
+            // via-IR: also cap a unit at ~48 KB of test code (several seconds of solc) when there's no history.
+            // Each unit re-pays the file's fixed cost (analysis, setUp, helpers), so units aim at about one
             // core's share of the build, not less.
             let floor = if p.via_ir { 48 * 1024 } else { usize::MAX };
-            if test && (split > slot || test_bytes > 2 * floor) && workers > 1 {
+            let old = cache.files.get(*f).filter(|o| !o.units.is_empty() && !force);
+            if test && workers > 1 && (old.is_some() || split > slot || test_bytes > 2 * floor) {
                 // contract indices survive the `new` rewrite (it only edits bodies and appends a free function)
                 let in_test = |ci: usize| testish.get(&(f.as_str(), ci)).copied().unwrap_or(false);
                 let content = sources.get(*f).cloned().unwrap_or_else(|| g.files[*f].content.clone());
                 if let Some((cu, tests)) = Unit::parse(&content).and_then(|cu| Some((rewrite::test_funcs(&content, &cu, &in_test)?, cu)).map(|(t, cu)| (cu, t))) {
+                    let rm = rewrite::removable(&content, &cu, &tests);
+                    let hashes = rewrite::test_hashes(&content, &cu, &in_test);
+                    let shared = {
+                        use sha2::Digest;
+                        let text = rewrite::apply(&content, rewrite::unit_edits(&content, &cu, &in_test, &|_| false, &rm));
+                        let deps = g.closure_hash(f, &mut |u| if u == f.as_str() { String::new() } else { own_hash[u].clone() });
+                        if std::env::var("PLAIN_DEBUG").is_ok_and(|v| v == "units") {
+                            eprintln!("units {f}: text {} deps {deps}", hex::encode(sha2::Sha256::digest(text.as_bytes())));
+                            std::fs::write(p.root.join(format!(".plain/shared-{}.sol", f.replace('/', "_"))), &text).ok();
+                        }
+                        hex::encode(sha2::Sha256::digest(format!("{text}{deps}").as_bytes()))
+                    };
+                    let size: HashMap<&str, usize> = tests.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+                    let sz = |v: &[String]| v.iter().map(|n| size.get(n.as_str()).copied().unwrap_or(0)).sum::<usize>();
+                    let total = tests.iter().map(|t| t.1).sum::<usize>().max(1);
                     let k = (split.div_ceil(slot) as usize).max(test_bytes.div_ceil(floor)).min(workers).min(tests.len() / 2);
-                    if k >= 2 {
+                    let meta = |owns: Vec<String>, hot: bool| UnitMeta { tests: owns.iter().map(|n| (n.clone(), hashes[n].clone())).collect(), owns, hot, ms: 0 };
+                    let mut units: Vec<(UnitMeta, Option<u32>)> = vec![];
+                    if let Some(o) = old.filter(|o| o.shared == shared) {
+                        // only test bodies changed: units keep the tests they compiled unchanged (unit 0 stays
+                        // regardless: it brings the file's other contracts and inherited tests)
+                        for (i, u) in o.units.iter().enumerate() {
+                            let owns: Vec<String> = u.owns.iter().filter(|n| hashes.get(*n).is_some() && hashes.get(*n) == u.tests.get(*n)).cloned().collect();
+                            if i == 0 || !owns.is_empty() {
+                                units.push((UnitMeta { owns, ..u.clone() }, Some(i as u32)));
+                            }
+                        }
+                        let covered: std::collections::HashSet<&String> = units.iter().flat_map(|u| u.0.owns.iter()).collect();
+                        let mut pending: Vec<String> = tests.iter().map(|t| t.0.clone()).filter(|n| !covered.contains(n)).collect();
+                        if !pending.is_empty() {
+                            // one hot unit for edited and new tests, absorbing earlier hot units while it stays small
+                            let hot: Vec<String> = units.iter().skip(1).filter(|u| u.0.hot).flat_map(|u| u.0.owns.clone()).collect();
+                            if sz(&pending) + sz(&hot) <= total / k.max(2) {
+                                let mut i = 0;
+                                units.retain(|u| {
+                                    i += 1;
+                                    i == 1 || !u.0.hot
+                                });
+                                pending.extend(hot);
+                            } else {
+                                units.iter_mut().for_each(|u| u.0.hot = false);
+                            }
+                            pending.sort();
+                            units.push((meta(pending, true), None));
+                        }
+                        if units.len() > 2 * k.max(2) + 2 {
+                            units.clear(); // fragmented: shard afresh
+                        }
+                    }
+                    if units.is_empty() && k >= 2 {
                         let a = rewrite::assign(&tests, k);
                         for s in 0..k {
-                            let keep = |n: &str| a.get(n).copied() == Some(s);
-                            sources.insert(format!("{f}#{s}"), rewrite::apply(&content, rewrite::shard_edits(&content, &cu, &in_test, &keep)));
-                            jobs.push(Job { files: vec![f.to_string()], shard: Some((s, k)), test: true, est: e - split + split / k as u64 });
+                            let mut owns: Vec<String> = a.iter().filter(|(_, x)| **x == s).map(|(n, _)| n.clone()).collect();
+                            owns.sort();
+                            units.push((meta(owns, false), None));
                         }
+                    }
+                    if !units.is_empty() {
+                        let n = units.len();
+                        for (i, (u, reuse)) in units.iter().enumerate() {
+                            if reuse.is_some() {
+                                continue;
+                            }
+                            let keep = |x: &str| u.owns.iter().any(|o| o == x);
+                            sources.insert(format!("{f}#{i}"), rewrite::apply(&content, rewrite::unit_edits(&content, &cu, &in_test, &keep, &rm)));
+                            jobs.push(Job { files: vec![f.to_string()], shard: Some((i, n)), test: true, est: e - split + split * sz(&u.owns) as u64 / total as u64 });
+                        }
+                        unit_plans.insert(f.to_string(), (shared, units));
                         continue;
                     }
                 }
@@ -740,7 +846,7 @@ impl Plan {
             code.insert(f.to_string(), out);
         }
         let rewritten = testish.iter().filter(|(_, t)| **t).map(|((f, ci), _)| (f.to_string(), units[*f].contracts[*ci].name.clone())).collect();
-        Plan { jobs, sources, est, deploys, gen_deps, code, rewritten }
+        Plan { jobs, sources, est, deploys, gen_deps, code, rewritten, units: unit_plans }
     }
 }
 
@@ -961,6 +1067,7 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
                 deployed: c["evm"]["deployedBytecode"]["object"].as_str().unwrap_or_default().to_string(),
                 links: if links.as_object().is_some_and(|o| !o.is_empty()) { links.clone() } else { Value::Null },
                 shard: 0,
+                tests: vec![],
                 deploys: vec![],
                 rewritten: false,
             });

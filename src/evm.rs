@@ -355,6 +355,34 @@ pub struct Cheats {
     pub failed: bool,
     /// libraries deployed for the suite ("file:Name" -> address), used to link getCode results
     pub libs: HashMap<String, Address>,
+    /// what the suite read from outside the EVM, when its results may be cached (see test.rs)
+    pub reads: Option<Arc<Mutex<Reads>>>,
+    /// getCode results, linked and decoded, shared by the suite's tests
+    code_memo: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+/// Inputs a test read besides its own bytecode, "kind:name" -> hash or value; `impure` when it did something
+/// a cached result can't stand for (ffi, writing files, wall-clock time, forks, setEnv).
+#[derive(Default)]
+pub struct Reads {
+    pub deps: std::collections::BTreeMap<String, String>,
+    pub impure: bool,
+}
+
+/// What `Reads` records for an input, as of now (None: the kind is unknown).
+pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path) -> Option<String> {
+    let (kind, name) = key.split_once(':')?;
+    Some(match kind {
+        "art" => arts.iter().find(|a| a.shard == 0 && format!("{}:{}", a.file, a.name) == name).map_or("missing".into(), art_hash),
+        "file" => std::fs::read(root.join(name)).map_or("missing".into(), |b| keccak256(b).to_string()),
+        "env" => std::env::var(name).unwrap_or_else(|_| "\0unset".into()),
+        "root" => root.to_string_lossy().into(),
+        _ => return None,
+    })
+}
+
+pub fn art_hash(a: &Artifact) -> String {
+    keccak256(format!("{}|{}|{}", a.bytecode, a.deployed, a.links).as_bytes()).to_string()
 }
 
 fn revert_bytes(msg: &str) -> Vec<u8> {
@@ -539,6 +567,22 @@ fn enc(v: DynSolValue) -> Vec<u8> {
 impl Cheats {
     pub fn new(artifacts: Arc<Vec<Artifact>>, root: std::path::PathBuf) -> Cheats {
         Cheats { artifacts, root, ..Default::default() }
+    }
+
+    pub fn read(&self, key: String) {
+        if let Some(r) = &self.reads {
+            let mut r = r.lock().unwrap();
+            if !r.deps.contains_key(&key) {
+                let v = read_now(&key, &self.artifacts, &self.root).unwrap_or_default();
+                r.deps.insert(key, v);
+            }
+        }
+    }
+
+    fn impure(&self) {
+        if let Some(r) = &self.reads {
+            r.lock().unwrap().impure = true;
+        }
     }
 
     /// Reset per-transaction expectations; returns problems left pending at end of a test.
@@ -768,14 +812,19 @@ impl Cheats {
                 let had = self.snapshots.get_mut(id).and_then(Option::take).is_some();
                 Ok(enc(DynSolValue::Bool(had)))
             }
-            "envExists(string)" => Ok(enc(DynSolValue::Bool(std::env::var(st(&args[0])).is_ok()))),
+            "envExists(string)" => {
+                self.read(format!("env:{}", st(&args[0])));
+                Ok(enc(DynSolValue::Bool(std::env::var(st(&args[0])).is_ok())))
+            }
             "setEnv(string,string)" => {
+                self.impure();
                 // SAFETY-ish: tests run in threads; forge has the same process-global semantics
                 unsafe { std::env::set_var(st(&args[0]), st(&args[1])) };
                 ok
             }
             sg if sg.starts_with("env") => {
                 let key = st(&args[0]);
+                self.read(format!("env:{key}"));
                 let ty = match &s.ty {
                     DynSolType::Tuple(t) if t.len() == 2 => t[1].clone(),
                     _ => match s.name.as_str() {
@@ -809,8 +858,16 @@ impl Cheats {
             "getCode(string)" | "getDeployedCode(string)" => {
                 let what = st(&args[0]);
                 let art = find_artifact(&self.artifacts, &what).ok_or(format!("no artifact for {what:?} (only project src/test/script contracts are compiled to bytecode)"))?;
+                self.read(format!("art:{}:{}", art.file, art.name));
                 if s.name == "getCode" {
-                    return Ok(enc(DynSolValue::Bytes(link_code(&art.bytecode, &art.links, &self.libs).map_err(|e| format!("getCode {what}: {e}"))?)));
+                    // tests deploy the same contracts run after run: link and decode each once per suite
+                    let id = format!("{}:{}", art.file, art.name);
+                    if let Some(c) = self.code_memo.lock().unwrap().get(&id) {
+                        return Ok(enc(DynSolValue::Bytes(c.clone())));
+                    }
+                    let code = link_code(&art.bytecode, &art.links, &self.libs).map_err(|e| format!("getCode {what}: {e}"))?;
+                    self.code_memo.lock().unwrap().insert(id, code.clone());
+                    return Ok(enc(DynSolValue::Bytes(code)));
                 }
                 if art.deployed.contains("__$") {
                     return Err(format!("{what} needs library linking, unsupported in getDeployedCode"));
@@ -857,22 +914,31 @@ impl Cheats {
                 let deployer = args.get(2).map(a).unwrap_or(CREATE2_DEPLOYER);
                 Ok(enc(DynSolValue::Address(deployer.create2(b32(&args[0]), b32(&args[1])))))
             }
-            "projectRoot()" => Ok(enc(DynSolValue::String(self.root.to_string_lossy().into()))),
+            "projectRoot()" => {
+                self.read("root:".into());
+                Ok(enc(DynSolValue::String(self.root.to_string_lossy().into())))
+            }
             "readFile(string)" => {
+                self.read(format!("file:{}", st(&args[0])));
                 let p = self.root.join(st(&args[0]));
                 Ok(enc(DynSolValue::String(std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)))
             }
             "writeFile(string,string)" => {
+                self.impure();
                 let p = self.root.join(st(&args[0]));
                 std::fs::write(&p, st(&args[1])).map_err(|e| format!("{}: {e}", p.display()))?;
                 ok
             }
-            "exists(string)" => Ok(enc(DynSolValue::Bool(self.root.join(st(&args[0])).exists()))),
-            "unixTime()" => Ok(enc(DynSolValue::Uint(
-                U256::from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()),
-                256,
-            ))),
+            "exists(string)" => {
+                self.read(format!("file:{}", st(&args[0])));
+                Ok(enc(DynSolValue::Bool(self.root.join(st(&args[0])).exists())))
+            }
+            "unixTime()" => {
+                self.impure();
+                Ok(enc(DynSolValue::Uint(U256::from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()), 256)))
+            }
             "rpcUrl(string)" => {
+                self.impure();
                 let p = crate::project::Project::load();
                 let name = st(&args[0]);
                 Ok(enc(DynSolValue::String(crate::rpc::network_url(&p, &name).ok_or(format!("unknown network {name:?}"))?)))
@@ -880,6 +946,7 @@ impl Cheats {
             "activeFork()" => Ok(enc(DynSolValue::Uint(U256::ZERO, 256))),
             "selectFork(uint256)" => ok,
             "createSelectFork(string)" | "createSelectFork(string,uint256)" | "createFork(string)" | "createFork(string,uint256)" => {
+                self.impure();
                 // ponytail: one fork per run; pick it with `plain test --fork <url|network>`
                 match &self.fork_url {
                     Some(_) => Ok(enc(DynSolValue::Uint(U256::ZERO, 256))),
@@ -898,6 +965,7 @@ impl Cheats {
             }
             sg if sg.starts_with("snapshotValue") => ok,
             "ffi(string[])" => {
+                self.impure();
                 let argv: Vec<String> = args[0].as_array().unwrap_or_default().iter().map(st).collect();
                 let out = std::process::Command::new(argv.first().ok_or("ffi: empty command")?)
                     .args(&argv[1..])
@@ -909,6 +977,7 @@ impl Cheats {
                 Ok(enc(DynSolValue::Bytes(bytes)))
             }
             "readFileBinary(string)" => {
+                self.read(format!("file:{}", st(&args[0])));
                 let p = self.root.join(st(&args[0]));
                 Ok(enc(DynSolValue::Bytes(std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)))
             }

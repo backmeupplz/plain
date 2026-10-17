@@ -3,7 +3,7 @@
 //!   instead of embedding X's bytecode, so X is optimized once, in its own job, not in every test.
 //! - big test files compile as shards: shard k keeps its share of test functions public and turns
 //!   the others `internal` (solc drops unused internal functions), so one file uses several cores.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum K {
@@ -494,13 +494,44 @@ pub fn test_funcs(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool) -> Optio
     Some(out)
 }
 
-/// Edits making every test function not in `keep` internal (and non-payable).
-pub fn shard_edits(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool, keep: &dyn Fn(&str) -> bool) -> Vec<Edit> {
+/// Test functions nothing else in the file names (no calls, no `this.test_x.selector`): a unit that doesn't
+/// run them can leave them out entirely, so solc neither analyzes nor compiles them.
+pub fn removable(src: &str, u: &Unit, tests: &[(String, usize)]) -> HashSet<String> {
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    for t in u.toks.iter().filter(|t| t.k == K::Ident) {
+        *uses.entry(&src[t.s..t.e]).or_default() += 1;
+    }
+    let mut defs: HashMap<&str, usize> = HashMap::new();
+    for f in &u.funcs {
+        *defs.entry(f.name.as_str()).or_default() += 1;
+    }
+    tests.iter().filter(|(n, _)| uses.get(n.as_str()) == defs.get(n.as_str())).map(|(n, _)| n.clone()).collect()
+}
+
+/// Hash of each test function's text (overloads together), to tell which tests an edit touched.
+pub fn test_hashes(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool) -> std::collections::BTreeMap<String, String> {
+    use sha2::Digest;
+    let mut h: std::collections::BTreeMap<String, sha2::Sha256> = Default::default();
+    for f in u.funcs.iter().filter(|f| in_test(f.contract) && (f.name.starts_with("test") || f.name.starts_with("invariant"))) {
+        h.entry(f.name.clone()).or_default().update(&src[u.toks[f.toks.0].s..u.toks[f.toks.1].e]);
+    }
+    h.into_iter().map(|(n, h)| (n, hex::encode(h.finalize()))).collect()
+}
+
+/// Edits for a unit running only the tests `keep` accepts: other removable tests are cut out with the comments
+/// before them (whole, so the rest of the file reads the same whatever their size), the rest made internal
+/// (and non-payable).
+pub fn unit_edits(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool, keep: &dyn Fn(&str) -> bool, removable: &HashSet<String>) -> Vec<Edit> {
     let mut edits = vec![];
     for f in &u.funcs {
         let Some(v) = f.vis else { continue };
         let vis = &src[u.toks[v].s..u.toks[v].e];
         if !matches!(vis, "public" | "external") || !in_test(f.contract) || !(f.name.starts_with("test") || f.name.starts_with("invariant")) || keep(&f.name) {
+            continue;
+        }
+        if removable.contains(&f.name) {
+            let (s, e) = (u.toks[f.toks.0 - 1].e, u.toks[f.toks.1].e);
+            edits.push((s, e, String::new()));
             continue;
         }
         edits.push((u.toks[v].s, u.toks[v].e, "internal".into()));
@@ -588,9 +619,17 @@ contract VaultTest is Test {
         let a = assign(&tests, 2);
         assert_eq!(a["invariant_C"], 0);
         let keep = |n: &str| a[n] == 1;
-        let sh = apply(SRC, shard_edits(SRC, &u, &in_test, &keep));
+        let rm = removable(SRC, &u, &tests);
+        assert!(rm.contains("test_A") && rm.contains("invariant_C"));
+        let none = HashSet::new();
+        let sh = apply(SRC, unit_edits(SRC, &u, &in_test, &keep, &none));
         assert_eq!(sh.contains("function test_A() internal  {"), a["test_A"] == 0, "{sh}");
         assert!(sh.contains("function invariant_C() internal {}"));
         assert!(sh.contains("function setUp() public"));
+        let cut = apply(SRC, unit_edits(SRC, &u, &in_test, &keep, &rm));
+        assert_eq!(cut.contains("function test_A"), a["test_A"] == 1, "{cut}");
+        assert!(!cut.contains("invariant_C") && cut.contains("function setUp() public") && cut.contains("function helper() internal {}"));
+        let h = test_hashes(SRC, &u, &in_test);
+        assert_eq!(h.len(), 4);
     }
 }
