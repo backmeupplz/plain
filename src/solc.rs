@@ -300,6 +300,12 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     if files.is_empty() {
         crate::die(&format!("no .sol files under {}", p.dirs.join(", ")));
     }
+    let t0 = std::time::Instant::now();
+    let phase = |name: &str| {
+        if std::env::var_os("PLAIN_DEBUG").is_some() {
+            eprintln!("build: {name} at {:.2?}", t0.elapsed());
+        }
+    };
     let g = Graph::build(p, &files);
     let version = pick_version(p, &g);
     let settings = settings(p);
@@ -391,7 +397,12 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let dirty: Vec<&String> = dirty
         .into_iter()
         .filter(|f| {
-            let hit = (!force).then(|| store.get(&full[*f])).flatten().filter(|e| e.code.iter().all(|c| own.contains_key(c)));
+            let hit = (!force)
+                .then(|| store.get(&full[*f]))
+                .flatten()
+                .filter(|e| e.code.iter().all(|c| own.contains_key(c)))
+                // never trade units for an unsharded build of the same source: the next edit would recompile them all
+                .filter(|e| !e.units.is_empty() || cache.files.get(*f).is_none_or(|c| c.units.is_empty()));
             let Some(e) = hit else { return true };
             export(&e.contracts);
             cache.files.insert(f.to_string(), e);
@@ -403,8 +414,17 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     if !dirty.is_empty() {
         let solc = ensure(&version);
         let v: semver::Version = version.parse().unwrap_or(semver::Version::new(0, 8, 0));
+        phase("plan");
         let plan = Plan::new(p, &g, &files, &dirty, &v, &cache, &own, force);
+        phase("jobs");
         let mut results = run_jobs(&solc, &g, &plan.jobs, &settings, p, &plan.sources, &plan.gen_deps);
+        // unoptimized code can run out of stack where optimized code doesn't: those compile as configured
+        let retry: Vec<Job> = results.iter().filter(|r| r.0.fast && r.1.is_err()).map(|r| Job { fast: false, files: r.0.files.clone(), only: r.0.only.clone(), ..r.0 }).collect();
+        if !retry.is_empty() {
+            results.retain(|r| !(r.0.fast && r.1.is_err()));
+            results.extend(run_jobs(&solc, &g, &retry, &settings, p, &plan.sources, &plan.gen_deps));
+        }
+        phase("collect");
         // a rewrite that broke a test file: compile it again from the original sources (also reports real errors)
         let broken: Vec<String> = {
             let mut b: Vec<String> = results.iter().filter(|r| r.1.is_err() && r.0.test).flat_map(|r| r.0.files.clone()).collect();
@@ -417,7 +437,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 eprintln!("rewrite fallback: {broken:?}");
             }
             results.retain(|r| !r.0.files.iter().any(|f| broken.contains(f)));
-            let jobs: Vec<Job> = broken.iter().map(|f| Job { files: vec![f.clone()], shard: None, test: false, est: 0 }).collect();
+            let jobs: Vec<Job> = broken.iter().map(|f| Job { files: vec![f.clone()], shard: None, test: false, est: 0, fast: false, only: vec![] }).collect();
             results.extend(run_jobs(&solc, &g, &jobs, &settings, p, &HashMap::new(), &HashMap::new()));
         }
         let mut warnings = std::collections::BTreeSet::new();
@@ -507,7 +527,9 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
         }
         cache.iface = iface;
         std::fs::create_dir_all(p.root.join(".plain")).ok();
+        phase("write");
         std::fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        phase("done");
         gitignore(p);
     }
     Output {
@@ -524,6 +546,11 @@ struct Job {
     /// compiled from rewritten test sources
     test: bool,
     est: u64,
+    /// without the optimizer: a hot unit (a few edited tests) of test code that doesn't look at its own gas.
+    /// solc takes a third of the time; only gas spent in the test contract itself differs
+    fast: bool,
+    /// contracts to compile, when not every contract in `files` (units after the first: the test contracts)
+    only: Vec<String>,
 }
 
 struct Plan {
@@ -778,8 +805,12 @@ impl Plan {
                                 continue;
                             }
                             let keep = |x: &str| u.owns.iter().any(|o| o == x);
-                            sources.insert(format!("{f}#{i}"), rewrite::apply(&content, rewrite::unit_edits(&content, &cu, &in_test, &keep, &rm)));
-                            jobs.push(Job { files: vec![f.to_string()], shard: Some((i, n)), test: true, est: e - split + split * sz(&u.owns) as u64 / total as u64 });
+                            let src = rewrite::apply(&content, rewrite::unit_edits(&content, &cu, &in_test, &keep, &rm));
+                            let fast = u.hot && !observes_gas(&src) && !g.closure(f).iter().any(|c| c != *f && is_test(c) && observes_gas(&g.files[c].content));
+                            sources.insert(format!("{f}#{i}"), src);
+                            // unit 0 also compiles the file's other contracts (mocks, harnesses); the rest only the tests
+                            let only = if i == 0 { vec![] } else { cu.contracts.iter().enumerate().filter(|(ci, c)| in_test(*ci) && !c.is_abstract && c.kind == "contract").map(|(_, c)| c.name.clone()).collect() };
+                            jobs.push(Job { files: vec![f.to_string()], shard: Some((i, n)), test: true, est: e - split + split * sz(&u.owns) as u64 / total as u64, fast, only });
                         }
                         unit_plans.insert(f.to_string(), (shared, units));
                         continue;
@@ -787,7 +818,7 @@ impl Plan {
                 }
             }
             if e > slot / 4 {
-                jobs.push(Job { files: vec![f.to_string()], shard: None, test, est: e });
+                jobs.push(Job { files: vec![f.to_string()], shard: None, test, est: e, fast: false, only: vec![] });
             } else {
                 small[test as usize].push((f.to_string(), e));
             }
@@ -795,10 +826,10 @@ impl Plan {
         // pack small files into jobs of about a quarter share each (fewer processes, shared analysis)
         for (test, mut list) in small.into_iter().enumerate() {
             list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let mut cur = Job { files: vec![], shard: None, test: test == 1, est: 0 };
+            let mut cur = Job { files: vec![], shard: None, test: test == 1, est: 0, fast: false, only: vec![] };
             for (f, e) in list {
                 if cur.est + e > slot / 4 && !cur.files.is_empty() {
-                    jobs.push(std::mem::replace(&mut cur, Job { files: vec![], shard: None, test: test == 1, est: 0 }));
+                    jobs.push(std::mem::replace(&mut cur, Job { files: vec![], shard: None, test: test == 1, est: 0, fast: false, only: vec![] }));
                 }
                 cur.files.push(f);
                 cur.est += e;
@@ -848,6 +879,12 @@ impl Plan {
         let rewritten = testish.iter().filter(|(_, t)| **t).map(|((f, ci), _)| (f.to_string(), units[*f].contracts[*ci].name.clone())).collect();
         Plan { jobs, sources, est, deploys, gen_deps, code, rewritten, units: unit_plans }
     }
+}
+
+/// Test code that measures its own gas (`gasleft()`, gas snapshots between cheatcode calls) must be compiled
+/// as configured; `snapshotGasLastCall` measures the callee only.
+fn observes_gas(src: &str) -> bool {
+    src.contains("gasleft") || src.contains("startSnapshotGas") || src.contains("stopSnapshotGas")
 }
 
 /// Cold-build cost model: bytes of source compiled into a contract's bytecode, i.e. its body, its bases'
@@ -961,7 +998,7 @@ fn run_jobs(solc: &PathBuf, g: &Graph, jobs: &[Job], settings: &Value, p: &Proje
                 let r = compile(solc, g, job, settings, p, sources, gen_deps);
                 let ms = t.elapsed().as_millis() as u64;
                 if std::env::var_os("PLAIN_DEBUG").is_some() {
-                    eprintln!("job {:.1}s at {:.1}s est {} {:?}{}", ms as f64 / 1000.0, (t0.elapsed().as_millis() as u64 - ms) as f64 / 1000.0, job.est, job.files, job.shard.map(|(k, n)| format!(" shard {k}/{n}")).unwrap_or_default());
+                    eprintln!("job {:.1}s at {:.1}s est {} {:?}{}{}", ms as f64 / 1000.0, (t0.elapsed().as_millis() as u64 - ms) as f64 / 1000.0, job.est, job.files, job.shard.map(|(k, n)| format!(" shard {k}/{n}")).unwrap_or_default(), if job.fast { " fast" } else { "" });
                 }
                 out.lock().unwrap().push((i, r, ms));
             });
@@ -969,7 +1006,7 @@ fn run_jobs(solc: &PathBuf, g: &Graph, jobs: &[Job], settings: &Value, p: &Proje
     });
     let mut res = out.into_inner().unwrap();
     res.sort_by_key(|r| r.0);
-    res.into_iter().map(|(i, r, ms)| (Job { files: jobs[i].files.clone(), shard: jobs[i].shard, test: jobs[i].test, est: jobs[i].est }, r, ms)).collect()
+    res.into_iter().map(|(i, r, ms)| (Job { files: jobs[i].files.clone(), shard: jobs[i].shard, test: jobs[i].test, est: jobs[i].est, fast: jobs[i].fast, only: jobs[i].only.clone() }, r, ms)).collect()
 }
 
 fn gitignore(p: &Project) {
@@ -1015,10 +1052,14 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
         }
     }
     let mut settings = settings.clone();
+    if job.fast {
+        settings["optimizer"]["enabled"] = json!(false);
+    }
+    let out = json!(["abi", "evm.bytecode.object", "evm.bytecode.linkReferences", "evm.deployedBytecode.object"]);
     let sel: serde_json::Map<String, Value> = job
         .files
         .iter()
-        .map(|f| (f.clone(), json!({"*": ["abi", "evm.bytecode.object", "evm.bytecode.linkReferences", "evm.deployedBytecode.object"]})))
+        .map(|f| (f.clone(), if job.only.is_empty() { json!({"*": out}) } else { Value::Object(job.only.iter().map(|c| (c.clone(), out.clone())).collect()) }))
         .collect();
     settings["outputSelection"] = Value::Object(sel);
     let input = json!({"language": "Solidity", "sources": sources, "settings": settings});
