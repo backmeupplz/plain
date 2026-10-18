@@ -44,14 +44,52 @@ pub fn expand_env(s: &str) -> String {
     out + rest
 }
 
+/// The project root: the nearest folder up with plain.toml or foundry.toml, else the current one.
+pub fn root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    cwd.ancestors().find(|d| d.join("plain.toml").exists() || d.join("foundry.toml").exists()).unwrap_or(&cwd).to_path_buf()
+}
+
+/// Sets what the project's .env has and the environment doesn't, like forge. Runs before any thread starts.
+pub fn load_env() {
+    let Ok(s) = std::fs::read_to_string(root().join(".env")) else { return };
+    for line in s.lines() {
+        let line = line.trim();
+        let Some((k, v)) = line.strip_prefix("export ").unwrap_or(line).split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        let v = match v.chars().next() {
+            Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
+            _ => v.split(" #").next().unwrap_or_default().trim_end(),
+        };
+        if !k.is_empty() && !k.starts_with('#') && std::env::var_os(k).is_none() {
+            // SAFETY: called first thing in main, before any other thread exists
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
+/// ~/.plain/config.toml: settings for every project, like the Etherscan key the menu saves.
+pub fn user_config() -> Table {
+    read_toml(&crate::solc::home().join("config.toml")).unwrap_or_default()
+}
+
+/// Saves one setting in ~/.plain/config.toml, readable only by you (it holds API keys).
+pub fn set_user_config(key: &str, value: &str) {
+    let path = crate::solc::home().join("config.toml");
+    let mut t = user_config();
+    t.insert(key.into(), value.into());
+    std::fs::create_dir_all(path.parent().unwrap()).ok();
+    std::fs::write(&path, toml::to_string(&t).unwrap()).unwrap_or_else(|e| crate::die(&format!("{}: {e}", path.display())));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+}
+
 impl Project {
     pub fn load() -> Project {
-        let cwd = std::env::current_dir().unwrap();
-        let root = cwd
-            .ancestors()
-            .find(|d| d.join("plain.toml").exists() || d.join("foundry.toml").exists())
-            .unwrap_or(&cwd)
-            .to_path_buf();
+        let root = root();
         // foundry.toml [profile.default] first, plain.toml (same keys, top level) overrides.
         let mut cfg = Table::new();
         let mut networks = BTreeMap::new();

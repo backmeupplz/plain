@@ -1,12 +1,14 @@
 # plain
 
-Compile, test, deploy and verify EVM smart contracts with one ~7 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
+Compile, test, deploy, verify and upgrade EVM smart contracts with one ~7 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
 
 ```sh
 curl -fsSL https://getplain.org/install | sh   # macOS and Linux
 plain init                 # src/Counter.sol + test/Counter.t.sol
-plain test                 # compile + run every test
-plain deploy Counter --network base-sepolia --broadcast   # deploy, then verify on explorers
+plain test --watch         # compile + run every test, again on every save
+plain account new deployer # a deployer key, encrypted with your password
+plain deploy Counter --network base-sepolia --account deployer --broadcast   # deploy, then verify on explorers
+plain                      # or do all of it from a menu
 ```
 
 Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`. The [docs](https://getplain.org/docs/) walk through new and existing projects, testing and deploying.
@@ -20,7 +22,9 @@ Or build it from source: `cargo install --git https://github.com/backmeupplz/pla
 
 - **Compile:** finds `src/` (or `contracts/`), `test/` and `script/`, picks and downloads the right `solc` from your pragmas (it reuses Foundry's solc cache if present), and compiles in parallel jobs. Results are cached by content hash, per project and in `~/.plain/cache`, which every checkout shares (git worktrees, fresh clones).
 - **Test:** runs Solidity tests in the forge-std style (`*.t.sol`, `setUp`, `test*`, fuzzing, invariants, cheatcodes) on revm, in parallel. It also runs `test/**/*.test.ts` files against a fresh in-process chain per file. A suite whose compiled code and inputs haven't changed reuses its last results.
-- **Deploy:** runs Solidity scripts (`vm.startBroadcast`) or a single contract. It always simulates first, against a fork of the target network, then signs and sends when you add `--broadcast`, and verifies every contract it created on Sourcify, Etherscan and the chain's Blockscout.
+- **Deploy:** runs Solidity scripts (`vm.startBroadcast`) or a single contract, optionally behind an OpenZeppelin proxy. It always simulates first, against a fork of the target network, then signs and sends when you add `--broadcast`, and verifies every contract it created on Sourcify, Etherscan and the chain's Blockscout. Keys stay in encrypted keystores (`plain account`, Foundry's work too).
+- **Upgrade:** `plain upgrade` checks that the new implementation keeps the proxy's storage layout, then deploys it and points the proxy at it.
+- **Menu:** `plain` with no arguments opens a menu for all of the above that prints every command it runs.
 - **Networks:** any chain on [chainlist.org](https://chainlist.org), by name or chain id (`base`, `base-sepolia`, `linea`, `8453`, ...), or a URL.
 - **Zero setup:** `forge-std` is built into the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. `lib/` dependencies, `remappings.txt` and `node_modules` (`@openzeppelin/...`) resolve automatically.
 - **Foundry projects work as they are:** `foundry.toml` `[profile.default]` is read, including solc version, optimizer, via_ir, remappings, fuzz/invariant runs and rpc_endpoints.
@@ -28,10 +32,13 @@ Or build it from source: `cargo install --git https://github.com/backmeupplz/pla
 ## Commands
 
 ```
+plain                       # in a terminal: a menu for everything below
 plain build [--force]
-plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--rerun] [--force]
-plain deploy <Contract|path/Script.s.sol> [constructor args...] [--network <name|id|url>] [--broadcast] [--no-verify]
-plain verify [--network <name|id|url>] [name|address...]
+plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--rerun] [--force] [--watch]
+plain deploy <Contract|path/Script.s.sol> [args...] [--network <name|id|url>] [--account <name>] [--broadcast] [--proxy] [--no-verify]
+plain upgrade <proxy> [Contract] [--call <function> args...] --network <name|id|url> [--account <name>] [--broadcast]
+plain verify [--network <name|id|url>] [name|address...] [--export]
+plain account [new <name> | import <name>]
 plain node [--port 8545] [--fork <network|url>]
 plain init
 plain <anything>            # runs `plain-<anything>` from PATH (plugins)
@@ -114,13 +121,15 @@ The chain supports `evm_snapshot`/`evm_revert`, `evm_increaseTime`, `evm_mine`/`
 ## Deploying
 
 ```sh
-export PRIVATE_KEY=0x...
-export ETHERSCAN_API_KEY=...                                       # optional: one key covers 60+ chains
-plain deploy Counter 42 0xabc... --network sepolia                # simulate only
-plain deploy script/Deploy.s.sol --network base --broadcast       # forge-style script, sends txs, verifies
+plain account new deployer                                         # once: a key encrypted with your password
+export ETHERSCAN_API_KEY=...                                       # optional: one key covers Etherscan's chains
+plain deploy Counter 42 0xabc... --network sepolia --account deployer                  # simulate only
+plain deploy script/Deploy.s.sol --network base --account deployer --broadcast         # sends txs, verifies
 ```
 
-Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (the key comes from `$PRIVATE_KEY`), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. External libraries that the deployed contracts link against are deployed first, from `$PRIVATE_KEY`'s address.
+The deployer key comes from `--account <name>` (a keystore in `~/.plain/keystores` or Foundry's `~/.foundry/keystores`, unlocked with its password when something is sent), else `$PRIVATE_KEY`. Local chains (chain id 31337) use the first dev account. The project's `.env` is read like forge reads it. A simulation also prints what the deployer holds and the most the deploy can cost.
+
+Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (signing with the deployer), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. External libraries that the deployed contracts link against are deployed first, from the deployer's address.
 
 What `--broadcast` does:
 1. While solc compiles (only what the target deploys), plain connects to the network and reads the chain id, the latest block and fees in one round trip.
@@ -128,7 +137,9 @@ What `--broadcast` does:
 3. It signs everything up front. The first transaction goes out alone, so a fee, balance or chain problem stops the deploy before anything else is in the mempool. The rest go out in one batch, in nonce order. Then plain waits for the receipts, asking only for each sender's next one until it's in.
 4. It writes the addresses to `deployments/<network>.json` and verifies every contract created, including proxies and contracts created by other contracts. Each contract goes to every explorer at once: [Sourcify](https://sourcify.dev) (no key), Etherscan's v2 API when `ETHERSCAN_API_KEY` is set (foundry.toml `[etherscan]` keys work too), and the chain's Blockscout and Routescan explorers from chainlist. Each explorer gets the contract's own import closure as standard JSON input, the same sources and settings solc compiled it from, so it compiles no more than it has to. `--no-verify` skips this step.
 
-What explorers need is kept in `.plain/deploys/<chain id>.json`, so `plain verify --network base` retries whatever didn't verify (an explorer was down, or the key was missing). It doesn't compile anything. To verify only some contracts, pass names or addresses.
+What explorers need is kept in `.plain/deploys/<chain id>.json`, so `plain verify --network base` retries whatever didn't verify (an explorer was down, or the key was missing). It doesn't compile anything. To verify only some contracts, pass names or addresses. `--export` writes `verify/<network>/<Contract>.json` (the standard JSON input, libraries linked) and `<Contract>.txt` (address, compiler version, license, constructor arguments and the explorer's verify page) for verifying by hand.
+
+Upgradeable contracts: `plain deploy Box <initialize args> --proxy` deploys the implementation and an OpenZeppelin proxy (`ERC1967Proxy` for UUPS contracts, else `TransparentUpgradeableProxy`) compiled from the project's `@openzeppelin/contracts`, calling `initialize` in the proxy's constructor. `deployments/<network>.json` gets `Box` (the proxy) and `Box_Implementation`. `plain upgrade Box [BoxV2] [--call initializeV2 args...]` reads the current implementation from the ERC-1967 slot, compares solc's storage layouts (variables must keep their slots and types; renames, appends and `__gap` use are fine; ERC-7201 namespaced storage isn't checked), then deploys the new implementation and calls `upgradeToAndCall` (or the ProxyAdmin's `upgradeAndCall`). With an Etherscan key, proxies are also marked as proxies there.
 
 Networks: any chain on [chainlist.org](https://chainlist.org) by name, short name or chain id (`base`, `base-sepolia`, `arbitrum-sepolia`, `linea`, `monad`, `8453`), plus `local` (127.0.0.1:8545) and any URL. Common chains use their official RPC. For other chains, plain races chainlist's public RPCs that don't track users and takes the first one that answers with the right chain id. `$<NAME>_RPC_URL` picks the RPC for a name (for example `BASE_RPC_URL`), as does a `plain.toml` entry or foundry.toml's `rpc_endpoints`:
 
@@ -212,6 +223,6 @@ Where the speed comes from (solc itself is unchanged: what gets deployed is byte
 
 ## Not included (on purpose)
 
-Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), and the `vm.deployCode` cheatcode (use `vm.getCode` + `create`). Library linking only works for libraries under `src/`/`test/`/`script/`.
+Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), the `vm.deployCode` cheatcode (use `vm.getCode` + `create`), beacon proxies, and checking ERC-7201 namespaced storage on upgrades. Library linking only works for libraries under `src/`/`test/`/`script/`.
 
 Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs (more so for tests you just edited, which compile without the optimizer until the file is re-split). Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).

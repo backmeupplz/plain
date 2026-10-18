@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 /// name, chain id, default RPC ("" = take RPCs from chainlist)
-const NETWORKS: &[(&str, u64, &str)] = &[
+pub const NETWORKS: &[(&str, u64, &str)] = &[
     ("mainnet", 1, "https://ethereum-rpc.publicnode.com"),
     ("sepolia", 11155111, "https://ethereum-sepolia-rpc.publicnode.com"),
     ("hoodi", 560048, ""),
@@ -23,6 +23,11 @@ const NETWORKS: &[(&str, u64, &str)] = &[
     ("avalanche", 43114, "https://api.avax.network/ext/bc/C/rpc"),
     ("gnosis", 100, "https://rpc.gnosischain.com"),
 ];
+
+/// A built-in network's name for a chain id ("base-sepolia" for 84532).
+pub fn name_of(chain: u64) -> Option<&'static str> {
+    NETWORKS.iter().find(|n| n.1 == chain).map(|n| n.0)
+}
 
 pub struct Net {
     pub url: String,
@@ -100,6 +105,9 @@ pub struct Chain {
     pub explorers: Vec<String>,
     #[serde(default)]
     pub testnet: bool,
+    /// the native token ("ETH", "POL")
+    #[serde(default)]
+    pub symbol: String,
 }
 
 /// chainlist.org's chain list, cached for a week in ~/.plain/chainlist.json. Without `download`, only the cache.
@@ -118,7 +126,7 @@ fn chainlist(download: bool) -> Vec<Chain> {
                     .filter_map(|c| {
                         let rpcs = c["rpc"].as_array().into_iter().flatten().filter(|r| r["tracking"] == "none").filter_map(|r| r["url"].as_str()).filter(|u| u.starts_with("https://") && !u.contains('$')).map(String::from).collect();
                         let explorers = c["explorers"].as_array().into_iter().flatten().filter_map(|e| e["url"].as_str()).map(|u| u.trim_end_matches('/').to_string()).collect();
-                        Some(Chain { id: c["chainId"].as_u64()?, name: s(c, "name"), slug: s(c, "chainSlug"), short: s(c, "shortName"), rpcs, explorers, testnet: c["isTestnet"] == true })
+                        Some(Chain { id: c["chainId"].as_u64()?, name: s(c, "name"), slug: s(c, "chainSlug"), short: s(c, "shortName"), rpcs, explorers, testnet: c["isTestnet"] == true, symbol: c["nativeCurrency"]["symbol"].as_str().unwrap_or_default().into() })
                     })
                     .collect();
                 std::fs::create_dir_all(path.parent().unwrap()).ok();
@@ -130,6 +138,11 @@ fn chainlist(download: bool) -> Vec<Chain> {
         }
     }
     std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// The chain's native token from the cached chain list, without downloading it; ETH when unknown.
+pub fn symbol(id: u64) -> String {
+    chainlist(false).into_iter().find(|c| c.id == id).map(|c| c.symbol).filter(|s| !s.is_empty()).unwrap_or("ETH".into())
 }
 
 /// A chain's chainlist entry (explorers, name).
@@ -235,7 +248,7 @@ impl<F: FnMut()> Drop for Defer<F> {
 mod tests {
     #[test]
     fn names() {
-        let c = |id, name: &str, slug: &str, short: &str| super::Chain { id, name: name.into(), slug: slug.into(), short: short.into(), rpcs: vec![], explorers: vec![], testnet: false };
+        let c = |id, name: &str, slug: &str, short: &str| super::Chain { id, name: name.into(), slug: slug.into(), short: short.into(), rpcs: vec![], explorers: vec![], testnet: false, symbol: String::new() };
         let list = vec![c(8453, "Base", "base", "base"), c(84532, "Base Sepolia Testnet", "", "basesep"), c(238, "Blast Mainnet", "", "blast"), c(81457, "Blast", "blast", "blastmainnet"), c(42161, "Arbitrum One", "arbitrum", "arb1")];
         let f = |q: &str| super::find(&list, q).map(|c| c.id).unwrap_or(0);
         assert_eq!(f("base"), 8453);

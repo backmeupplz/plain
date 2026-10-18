@@ -29,6 +29,9 @@ pub struct Record {
     pub input: String,
     #[serde(default)]
     pub verified: Vec<String>,
+    /// an ERC-1967 proxy plain deployed: Etherscan is told to read it through its implementation
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy: bool,
 }
 
 /// Standard JSON input for `file`: its import closure as compiled, the project's settings. solc's metadata (and
@@ -45,17 +48,32 @@ fn dir(p: &Project) -> std::path::PathBuf {
     p.root.join(".plain/deploys")
 }
 
+pub fn input_hash(input: &Value) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(serde_json::to_vec(input).unwrap()))
+}
+
 /// Saves an input once per content hash; returns the hash.
 pub fn save_input(p: &Project, input: &Value) -> String {
-    use sha2::Digest;
-    let body = serde_json::to_vec(input).unwrap();
-    let h = hex::encode(sha2::Sha256::digest(&body));
+    let h = input_hash(input);
     let path = dir(p).join("inputs").join(format!("{h}.json"));
     if !path.exists() {
         std::fs::create_dir_all(path.parent().unwrap()).ok();
-        std::fs::write(&path, body).ok();
+        std::fs::write(&path, serde_json::to_vec(input).unwrap()).ok();
     }
     h
+}
+
+/// A saved input with the record's libraries in its settings, the way solc links them at compile time
+/// (what explorers' Etherscan-style APIs and their upload forms take).
+fn with_libs(input: &str, r: &Record) -> Value {
+    let mut input: Value = serde_json::from_str(input).unwrap_or_default();
+    for (id, a) in &r.libs {
+        if let Some((f, n)) = id.rsplit_once(':') {
+            input["settings"]["libraries"][f][n] = json!(a.to_checksum(None));
+        }
+    }
+    input
 }
 
 pub fn load(p: &Project, chain: u64) -> BTreeMap<Address, Record> {
@@ -96,15 +114,17 @@ impl Explorer {
     }
 }
 
-fn etherscan_key(p: &Project) -> Option<String> {
-    std::env::var("ETHERSCAN_API_KEY").ok().filter(|k| !k.is_empty()).or_else(|| p.etherscan_key.clone())
+/// $ETHERSCAN_API_KEY (or the project's .env), foundry.toml's [etherscan], or the one the menu saved.
+pub fn etherscan_key(p: &Project) -> Option<String> {
+    let saved = || crate::project::user_config().get("etherscan_api_key").and_then(|k| k.as_str()).map(String::from);
+    std::env::var("ETHERSCAN_API_KEY").ok().or_else(|| p.etherscan_key.clone()).or_else(saved).filter(|k| !k.is_empty())
 }
 
 fn explorers(p: &Project, chain: u64, skipped: &mut Vec<String>) -> Vec<Explorer> {
     let mut out = vec![Explorer::new("sourcify", String::new(), String::new(), 100)];
     match etherscan_key(p) {
         Some(k) => out.push(Explorer::new("etherscan", format!("https://api.etherscan.io/v2/api?chainid={chain}"), k, 350)),
-        None => skipped.push("etherscan (set ETHERSCAN_API_KEY)".into()),
+        None => skipped.push("etherscan (no API key: set ETHERSCAN_API_KEY, or run plain and open Settings)".into()),
     }
     if let Some(c) = rpc::chain_info(chain) {
         for e in &c.explorers {
@@ -237,13 +257,8 @@ fn submit(e: &Explorer, chain: u64, addr: Address, r: &Record, input: &str) -> S
             _ => Step::Done(Outcome::Failed(v["message"].as_str().map(String::from).unwrap_or_else(|| format!("HTTP {status}")))),
         };
     }
-    // Etherscan-style APIs; libraries go in the settings, the way solc links them at compile time
-    let mut input: Value = serde_json::from_str(input).unwrap_or_default();
-    for (id, a) in &r.libs {
-        if let Some((f, n)) = id.rsplit_once(':') {
-            input["settings"]["libraries"][f][n] = json!(a.to_checksum(None));
-        }
-    }
+    // Etherscan-style APIs
+    let input = with_libs(input, r);
     let args = r.args.trim_start_matches("0x");
     let form = [
         ("apikey", e.key.as_str()),
@@ -312,4 +327,80 @@ fn debug(e: &Explorer, msg: &str) {
     if std::env::var_os("PLAIN_DEBUG").is_some() {
         eprintln!("{}: {}", e.name, msg.chars().take(400).collect::<String>());
     }
+}
+
+/// Marks `proxy` as a proxy on Etherscan, so its page reads and writes through its implementation's ABI (what
+/// "Is this a proxy?" does there). Best effort: a failure only prints a line.
+pub fn link_proxy(p: &Project, chain: u64, proxy: Address) {
+    let Some(key) = etherscan_key(p) else { return };
+    let api = format!("https://api.etherscan.io/v2/api?chainid={chain}");
+    let addr = proxy.to_checksum(None);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut guid: Option<String> = None;
+    let mut msg = String::new();
+    while Instant::now() < deadline {
+        let res = match &guid {
+            None => rpc::agent().post(&api).send_form([("apikey", key.as_str()), ("module", "contract"), ("action", "verifyproxycontract"), ("address", &addr)]),
+            Some(g) => rpc::agent().get(&format!("{api}&module=contract&action=checkproxyverification&guid={g}&apikey={key}")).call(),
+        };
+        let v: Value = res.ok().and_then(|mut r| r.body_mut().read_json().ok()).unwrap_or_default();
+        msg = v["result"].as_str().unwrap_or_default().to_string();
+        let low = msg.to_lowercase();
+        match (&guid, v["status"] == "1") {
+            (None, true) => guid = Some(msg.clone()),
+            (Some(_), true) => {
+                println!("etherscan: {addr} now reads as a proxy");
+                return;
+            }
+            // not indexed or verified yet, still in the queue, rate limited
+            _ if ["pending", "queue", "unable to locate", "not found", "rate limit", "in progress"].iter().any(|t| low.contains(t)) || v.is_null() => {}
+            _ => break,
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    println!("etherscan: {addr} isn't marked as a proxy yet ({}); \"Is this a proxy?\" on its page does it", if msg.is_empty() { "timed out" } else { &msg });
+}
+
+/// Files to verify by hand on any explorer's "verify and publish" page: for each contract, the standard JSON input
+/// to upload (libraries linked in) and a note with every value the form asks for. Returns the folder.
+pub fn export(p: &Project, chain: u64, net: &str, recs: &BTreeMap<Address, Record>) -> std::path::PathBuf {
+    let out = p.root.join("verify").join(net);
+    std::fs::create_dir_all(&out).unwrap_or_else(|e| crate::die(&format!("{}: {e}", out.display())));
+    // (chainlist files 31337 under another chain; a dev chain has no explorer)
+    let explorers = if matches!(chain, 31337 | 1337) { vec![] } else { rpc::chain_info(chain).map(|c| c.explorers).unwrap_or_default() };
+    for (addr, r) in recs {
+        let stem = match recs.values().filter(|x| x.name == r.name).count() {
+            1 => r.name.clone(),
+            _ => format!("{}-{}", r.name, &addr.to_string()[..8]),
+        };
+        let Ok(raw) = std::fs::read_to_string(dir(p).join("inputs").join(format!("{}.json", r.input))) else {
+            eprintln!("{} {addr}: its standard JSON input is missing from .plain/deploys/inputs", r.name);
+            continue;
+        };
+        let input = with_libs(&raw, r);
+        let file = r.contract.rsplit_once(':').map_or("", |x| x.0);
+        let license = input["sources"][file]["content"].as_str().and_then(|s| s.split("SPDX-License-Identifier:").nth(1)).and_then(|s| s.split_whitespace().next()).unwrap_or("none");
+        let args = r.args.trim_start_matches("0x");
+        // Etherscan-family explorers take the address in their verify page's URL
+        let pages: Vec<String> = explorers
+            .iter()
+            .map(|e| match e.contains("etherscan") || (e.contains("scan.") && !e.contains("routescan")) {
+                true => format!("{e}/verifyContract?a={addr}"),
+                false => format!("{e}/address/{addr}"),
+            })
+            .collect();
+        let mut note = format!("{} at {addr} (chain {chain})\n\n", r.name);
+        if !pages.is_empty() {
+            note += &format!("Verify page:\n  {}\n\n", pages.join("\n  "));
+        }
+        note += &format!("Compiler type:     Solidity (Standard-Json-Input)\nCompiler version:  v{}\nLicense:           {license}\nFile to upload:    {stem}.json\nContract name:     {}\nConstructor args:  {}\n", r.compiler, r.contract, if args.is_empty() { "none" } else { args });
+        for (lib, a) in &r.libs {
+            note += &format!("Library:           {lib} at {a}\n");
+        }
+        std::fs::write(out.join(format!("{stem}.json")), serde_json::to_vec_pretty(&input).unwrap()).ok();
+        std::fs::write(out.join(format!("{stem}.txt")), &note).ok();
+        println!("{}", note.trim_end());
+        println!();
+    }
+    out
 }

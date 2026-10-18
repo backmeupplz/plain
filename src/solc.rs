@@ -1053,6 +1053,34 @@ pub fn settings(p: &Project) -> Value {
     s
 }
 
+/// solc's standard JSON output for `input`.
+fn run(solc: &PathBuf, root: &std::path::Path, input: &Value) -> Result<Value, String> {
+    let mut child = Command::new(solc)
+        .args(["--standard-json", "--base-path"])
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn solc: {e}"))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let body = serde_json::to_vec(input).unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(&body));
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    writer.join().ok();
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("solc output: {e}: {}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Compiles a standard JSON input with solc `version` ("0.8.28", or as explorers write it); errors as solc prints them.
+pub fn standard_json(version: &str, input: &Value, root: &std::path::Path) -> Result<Value, String> {
+    let v = run(&ensure(version.split('+').next().unwrap_or(version)), root, input)?;
+    let errs: Vec<&str> = v["errors"].as_array().into_iter().flatten().filter(|e| e["severity"] == "error").filter_map(|e| e["formattedMessage"].as_str()).collect();
+    match errs.is_empty() {
+        true => Ok(v),
+        false => Err(errs.join("\n")),
+    }
+}
+
 fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, overrides: &HashMap<String, String>, gen_deps: &HashMap<String, Vec<String>>) -> Result<(Vec<Artifact>, Vec<String>), String> {
     let mut sources = serde_json::Map::new();
     for f in &job.files {
@@ -1088,20 +1116,7 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
         let name = format!("{}{}.json", job.files[0].replace('/', "_"), job.shard.map(|(k, _)| format!("#{k}")).unwrap_or_default());
         std::fs::write(dir.join(name), input.to_string()).ok();
     }
-    let mut child = Command::new(solc)
-        .args(["--standard-json", "--base-path"])
-        .arg(&p.root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn solc: {e}"))?;
-    let mut stdin = child.stdin.take().unwrap();
-    let body = serde_json::to_vec(&input).unwrap();
-    let writer = std::thread::spawn(move || stdin.write_all(&body));
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    writer.join().ok();
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("solc output: {e}: {}", String::from_utf8_lossy(&out.stderr)))?;
+    let v = run(solc, &p.root, &input)?;
     let mut errs = Vec::new();
     let mut warns = Vec::new();
     for e in v["errors"].as_array().into_iter().flatten() {

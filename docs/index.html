@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>plain: compile, test and deploy Solidity in seconds</title>
-<meta name="description" content="plain is one small binary that compiles, tests, deploys and verifies Solidity contracts. It runs Foundry projects as they are and turns the minute-long edit-and-test loop into about a second.">
+<meta name="description" content="plain is one small binary that compiles, tests, deploys, verifies and upgrades Solidity contracts. It runs Foundry projects as they are and turns the minute-long edit-and-test loop into about a second.">
 <link rel="canonical" href="https://getplain.org/">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fbfbf8" media="(prefers-color-scheme: light)">
@@ -35,8 +35,8 @@
 
 <script type="application/ld+json">
 {"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "plain", "url": "https://getplain.org/",
- "description": "One binary that compiles, tests, deploys and verifies Solidity contracts and runs Foundry projects as they are.",
- "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS, Linux", "softwareVersion": "0.1.1",
+ "description": "One binary that compiles, tests, deploys, verifies and upgrades Solidity contracts and runs Foundry projects as they are.",
+ "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS, Linux", "softwareVersion": "0.2.0",
  "downloadUrl": "https://github.com/backmeupplz/plain/releases/latest", "codeRepository": "https://github.com/backmeupplz/plain",
  "license": "https://opensource.org/licenses/MIT", "image": "https://getplain.org/og.png",
  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
@@ -98,6 +98,20 @@ h2 { font-size: clamp(26px, 4vw, 34px); line-height: 1.15; letter-spacing: -0.8p
 .card p { margin: 0; color: var(--muted); font-size: 15.5px; }
 .card code { font-size: 13.5px; color: var(--fg); }
 ul.why { padding-left: 20px; margin: 0; max-width: 720px; }
+ol.loop { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+ol.loop li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 16px; background: var(--card); border: 1px solid var(--line);
+  border-radius: 14px; padding: 18px 20px; }
+ol.loop .n { width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: var(--accent-fg);
+  font: 700 15px var(--mono); display: flex; align-items: center; justify-content: center; }
+ol.loop h3 { margin: 4px 0 4px; font-size: 18px; }
+ol.loop p { margin: 0 0 10px; color: var(--muted); font-size: 15.5px; }
+ol.loop div > code, .menu { display: block; font: 13.5px var(--mono); background: var(--code); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 12px; overflow-wrap: anywhere; }
+ol.loop div > code::before { content: "$ "; color: var(--muted); }
+ol.loop p code { font-size: 14px; color: var(--fg); }
+.menu { white-space: pre; overflow-x: auto; overflow-wrap: normal; line-height: 1.55; padding: 14px 16px; margin: 0 0 22px; max-width: 640px; }
+.menu .g { color: var(--accent); font-weight: 650; }
+.menu .d { color: var(--muted); }
 ul.why li { margin: 0 0 12px; }
 footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--muted); font-size: 15px; }
 @media (max-width: 640px) {
@@ -120,15 +134,15 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
 
   <div class="hero">
     <h1>Compile, test and deploy Solidity in <em>seconds</em>, not minutes</h1>
-    <p class="lead">plain is one small binary that compiles, tests, deploys and verifies your contracts. It runs your Foundry project as it is, needs nothing else installed, and turns the minute-long edit-and-test loop into about a second.</p>
+    <p class="lead">plain is one small binary that compiles, tests, deploys, verifies and upgrades your contracts. It runs your Foundry project as it is, needs nothing else installed, and turns the minute-long edit-and-test loop into about a second.</p>
     <div class="install"><code>curl -fsSL https://getplain.org/install | sh</code><button class="copy" data-copy="curl -fsSL https://getplain.org/install | sh" aria-label="Copy the install command">Copy</button></div>
     <p class="note">The installer works on macOS and Linux. With Rust installed, <code>cargo install --git https://github.com/backmeupplz/plain</code> builds it from source.</p>
 <pre><span class="c"># a Counter contract and its test, in an empty folder</span>
 plain init
-<span class="c"># compile and run every test</span>
-plain test
-<span class="c"># simulate, send, then verify on Sourcify, Etherscan and Blockscout</span>
-plain deploy Counter --network base-sepolia --broadcast</pre>
+<span class="c"># run every test, then again whenever you save</span>
+plain test --watch
+<span class="c"># or pick every step from a menu</span>
+plain</pre>
   </div>
 
   <section id="speed">
@@ -164,12 +178,36 @@ plain deploy Counter --network base-sepolia --broadcast</pre>
     <p class="note">Each edit run makes a new change, each cold build starts with nothing cached anywhere, and what plain deploys is byte-for-byte what solc produces. The <a href="https://github.com/backmeupplz/plain#benchmarks">full tables</a> also cover no-op builds, fresh clones and solmate.</p>
   </section>
 
+  <section id="loop">
+    <h2>From an empty folder to an upgraded contract in six steps</h2>
+    <p class="sub">Each step is one command, the same in a new project or in the Foundry project you already have. If you'd rather not remember them, run <code>plain</code> on its own: a menu walks you through every step, shows the command it runs, and asks for keys without echoing them.</p>
+<div class="menu" aria-label="The plain menu in a terminal"><span class="d">$ plain</span>
+<span class="g">?</span> What next?
+<span class="g">❯ Build</span>     compile the contracts
+  Test      <span class="d">run the tests, once or on every save</span>
+  Deploy    <span class="d">put a contract on a chain, local or live</span>
+  Verify    <span class="d">publish the source code on block explorers</span>
+  Upgrade   <span class="d">point a proxy at a new implementation</span>
+  Settings  <span class="d">deployer accounts, Etherscan key, RPCs</span></div>
+    <ol class="loop">
+      <li><span class="n">1</span><div><h3>Write</h3><p>Start from a contract and its test, or open the project you already have. forge-std is built in, and OpenZeppelin works straight from npm.</p><code>plain init</code></div></li>
+      <li><span class="n">2</span><div><h3>Compile</h3><p>The right solc comes from your pragmas and downloads once, and files you haven't changed come from the cache.</p><code>plain build</code></div></li>
+      <li><span class="n">3</span><div><h3>Test</h3><p>Every test runs, then runs again each time you save, and a compile error just waits for your fix.</p><code>plain test --watch</code></div></li>
+      <li><span class="n">4</span><div><h3>Deploy</h3><p>A key made by <code>plain account new</code> stays encrypted with your password. Every chain on chainlist.org works by name, and a simulation shows the gas and the cost before anything is sent.</p><code>plain deploy Counter --network base-sepolia --account deployer --broadcast</code></div></li>
+      <li><span class="n">5</span><div><h3>Verify</h3><p>Deploys verify on Sourcify, Blockscout and Etherscan by themselves. When you'd rather verify by hand, plain writes the JSON to upload and every value the explorer's form asks for.</p><code>plain verify --network base-sepolia --export</code></div></li>
+      <li><span class="n">6</span><div><h3>Upgrade</h3><p><code>--proxy</code> deploys behind an OpenZeppelin proxy, and an upgrade goes out only after plain has checked that the new code keeps the proxy's storage.</p><code>plain upgrade Box --network base-sepolia --account deployer --broadcast</code></div></li>
+    </ol>
+    <p class="note">The <a href="/docs/">docs</a> cover each step in detail, from getting testnet funds to verifying a contract by hand.</p>
+  </section>
+
   <section>
     <h2>Nothing to set up before your first test</h2>
     <p class="sub">plain replaces a toolchain with a single command, so a new project or a fresh clone is ready as soon as the binary is on your PATH.</p>
     <div class="cards">
       <div class="card"><h3>One binary and nothing around it</h3><p>plain is a single 7 MB executable. You don't need Node, npm or git submodules, and forge-std is built in, so <code>import {Test} from "forge-std/Test.sol"</code> works in an empty folder.</p></div>
       <div class="card"><h3>Your Foundry project already works</h3><p>plain reads <code>foundry.toml</code>, remappings and <code>lib/</code> the way they are, picks the solc version your pragmas ask for, and downloads it the first time you build.</p></div>
+      <div class="card"><h3>A menu when you want one</h3><p>Run <code>plain</code> on its own to build, test, deploy, verify and upgrade from a menu. It asks only what each step needs and prints the command it runs, so the next time you can type it yourself.</p></div>
+      <div class="card"><h3>Keys that stay encrypted</h3><p><code>plain account new</code> makes a deployer key encrypted with your password, in the keystore format Foundry's cast uses, so no private key has to sit in a <code>.env</code> file.</p></div>
       <div class="card"><h3>Deploys that verify themselves</h3><p>plain deploy runs your script against a fork first, sends the transactions only when every one of them would succeed, and then verifies each new contract on Sourcify, Blockscout and, with your API key, Etherscan.</p></div>
       <div class="card"><h3>Every chain by its name</h3><p>Pass <code>--network base</code>, <code>linea</code> or a chain id, and plain finds a working public RPC on chainlist.org, while your own RPC URLs still take priority.</p></div>
     </div>

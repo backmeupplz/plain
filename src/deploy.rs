@@ -6,9 +6,9 @@ use crate::solc::Artifact;
 use crate::verify::Record;
 use crate::{decode, die, rpc};
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
-use alloy_dyn_abi::{DynSolType, JsonAbiExt, Specifier};
+use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt, Specifier};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_json_abi::JsonAbi;
+use alloy_json_abi::{Function, JsonAbi, Param};
 use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -20,6 +20,12 @@ pub struct Opts {
     pub args: Vec<String>,
     pub broadcast: bool,
     pub verify: bool,
+    /// a keystore (see account.rs) to sign with, instead of $PRIVATE_KEY
+    pub account: Option<String>,
+    /// deploy behind an OpenZeppelin proxy, `args` going to initialize()
+    pub proxy: bool,
+    /// point this proxy at `target`, `args` going to the plan's call
+    pub upgrade: Option<crate::upgrade::Plan>,
 }
 
 /// The network as of now, fetched in one round trip while solc compiles.
@@ -55,6 +61,43 @@ pub fn connect(p: &Project, name: &str) -> Conn {
         gas_price: r[3].as_ref().map(hexnum).unwrap_or(0),
         url: net.url,
     }
+}
+
+/// deployments/<network>.json, where deploys save addresses by name.
+pub fn addresses_path(p: &Project, conn: &Conn) -> std::path::PathBuf {
+    let file = if conn.name.contains("://") { conn.chain.to_string() } else { conn.name.clone() };
+    p.root.join("deployments").join(format!("{file}.json"))
+}
+
+pub fn addresses(p: &Project, conn: &Conn) -> BTreeMap<String, String> {
+    std::fs::read(addresses_path(p, conn)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Command-line arguments as `params`, ABI-encoded.
+fn encode(params: &[Param], args: &[String], what: &str) -> Vec<u8> {
+    if params.len() != args.len() {
+        die(&format!("{what} takes {} args ({}), got {}", params.len(), params.iter().map(|i| i.ty.clone()).collect::<Vec<_>>().join(", "), args.len()));
+    }
+    let vals: Vec<DynSolValue> = params
+        .iter()
+        .zip(args)
+        .map(|(i, a)| {
+            let ty: DynSolType = i.resolve().unwrap();
+            ty.coerce_str(a).unwrap_or_else(|e| die(&format!("arg {:?} as {}: {e}", a, i.ty)))
+        })
+        .collect();
+    DynSolValue::Tuple(vals).abi_encode_params()
+}
+
+/// Calldata for `name(args)` on `abi`, picking the overload that takes that many arguments.
+fn calldata(abi: &JsonAbi, contract: &str, name: &str, args: &[String]) -> Vec<u8> {
+    let fs = abi.function(name).unwrap_or_else(|| die(&format!("{contract} has no function {name}")));
+    let f = fs.iter().find(|f| f.inputs.len() == args.len()).unwrap_or(&fs[0]);
+    [f.selector().to_vec(), encode(&f.inputs, args, &format!("{contract}.{name}"))].concat()
+}
+
+fn call_sig(sig: &str, args: &[DynSolValue]) -> Bytes {
+    Function::parse(sig).unwrap().abi_encode_input(args).unwrap().into()
 }
 
 fn key_addr(k: B256) -> Address {
@@ -104,7 +147,10 @@ fn describe(tx: &BroadcastTx, names: &HashMap<Address, String>) -> String {
                 None if tx.data.is_empty() => "transfer".into(),
                 None => format!("0x{}", hex::encode(&tx.data[..4.min(tx.data.len())])),
             };
-            format!("call {to}.{call}")
+            match names.get(&to) {
+                Some(n) => format!("call {n} ({to}).{call}"),
+                None => format!("call {to}.{call}"),
+            }
         }
     }
 }
@@ -117,15 +163,36 @@ struct Sim {
 }
 
 pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
-    let arts = out.artifacts;
+    let mut arts = out.artifacts;
+    if o.proxy {
+        let uups = find(&arts, &o.target).abi.as_array().is_some_and(|f| f.iter().any(|x| x["name"] == "proxiableUUID"));
+        arts.extend(crate::upgrade::proxy_artifacts(p, &out.solc, uups));
+    }
+    if o.upgrade.as_ref().is_some_and(|u| u.admin.is_some()) {
+        // ProxyAdmin's ABI, so the upgrade shows as a call rather than a selector
+        let abi = json!([{"type": "function", "name": "upgradeAndCall", "stateMutability": "payable", "outputs": [],
+            "inputs": [{"name": "proxy", "type": "address"}, {"name": "implementation", "type": "address"}, {"name": "data", "type": "bytes"}]}]);
+        arts.push(Artifact { name: "ProxyAdmin".into(), file: String::new(), abi, bytecode: String::new(), deployed: String::new(), links: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false });
+    }
     decode::init(&arts);
-    let key = std::env::var("PRIVATE_KEY").ok().map(|k| k.trim().parse::<B256>().unwrap_or_else(|_| die("PRIVATE_KEY must be 32 bytes hex")));
-    let me = key.map(key_addr);
     if o.broadcast && conn.is_none() {
         die("--broadcast needs --network <name|chain id|url>");
     }
+    let key = match &o.account {
+        // the password only when it's needed: to send, or for a keystore that doesn't record its address
+        Some(a) if o.broadcast || crate::account::address(a).is_none() => Some(crate::account::unlock(a)),
+        Some(_) => None,
+        None => std::env::var("PRIVATE_KEY").ok().filter(|k| !k.is_empty()).map(|k| k.trim().parse::<B256>().unwrap_or_else(|_| die("PRIVATE_KEY must be 32 bytes hex"))),
+    };
+    // a dev chain (plain node, anvil, hardhat) deploys from its first funded account unless told otherwise
+    let dev = key.is_none() && o.account.is_none() && conn.as_ref().is_some_and(|c| c.chain == 31337);
+    let key = key.or_else(|| dev.then(|| crate::node::KEYS[0].parse().unwrap()));
+    let me = key.map(key_addr).or_else(|| o.account.as_deref().and_then(crate::account::address));
     if o.broadcast && key.is_none() {
-        die("--broadcast needs PRIVATE_KEY in the environment");
+        die("--broadcast needs a deployer: --account <name> (`plain account new <name>` makes one), or PRIVATE_KEY in the environment");
+    }
+    if o.broadcast && dev {
+        println!("sending from the dev account {}", me.unwrap());
     }
 
     let arts = Arc::new(arts);
@@ -140,7 +207,7 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     let mut cheats = Cheats::new(arts.clone(), p.root.clone());
     cheats.default_broadcaster = Some(me.unwrap_or(SENDER));
     if let Some(k) = key {
-        cheats.keys.insert(me.unwrap(), k);
+        cheats.keys.insert(key_addr(k), k);
     }
     let db = evm::base_db(evm::Remote(fork.clone(), None));
     cheats.track_creates = true;
@@ -152,7 +219,12 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     let mut libs = HashMap::new();
     let mut txs: Vec<BroadcastTx> = vec![];
     let db = crate::test::deploy_libs(db, &mut env, &mut cheats, &arts, &art, &mut libs, from, &mut Some(&mut txs));
+    // proxies this deploys or upgrades, to point Etherscan at their implementation
+    let mut proxies: Vec<Address> = vec![];
     cheats.libs = libs.clone();
+    if is_script && o.proxy {
+        die("--proxy is for a contract; a script deploys its own proxies (new ERC1967Proxy(...))");
+    }
     if is_script {
         // the script contract itself only runs locally
         let (db, r) = crate::test::deploy(db, &mut env, &mut cheats, &arts, &art, &[], &mut libs);
@@ -168,27 +240,64 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     } else {
         let abi: JsonAbi = serde_json::from_value(art.abi.clone()).unwrap();
         let inputs = abi.constructor().map(|c| c.inputs.clone()).unwrap_or_default();
-        if inputs.len() != o.args.len() {
-            die(&format!("{} constructor takes {} args ({}), got {}", art.name, inputs.len(), inputs.iter().map(|i| i.ty.clone()).collect::<Vec<_>>().join(", "), o.args.len()));
+        let code = evm::link_code(&art.bytecode, &art.links, &libs).unwrap_or_else(|e| die(&format!("{}: {e}", art.name)));
+        if (o.proxy || o.upgrade.is_some()) && !inputs.is_empty() {
+            die(&format!("{}'s constructor takes arguments, which a proxy never passes; an upgradeable contract takes them in initialize()", art.name));
         }
-        let vals: Vec<_> = inputs
-            .iter()
-            .zip(&o.args)
-            .map(|(i, a)| {
-                let ty: DynSolType = i.resolve().unwrap();
-                ty.coerce_str(a).unwrap_or_else(|e| die(&format!("arg {:?} as {}: {e}", a, i.ty)))
-            })
-            .collect();
-        let mut data = evm::link_code(&art.bytecode, &art.links, &libs).unwrap_or_else(|e| die(&format!("{}: {e}", art.name)));
-        data.extend(alloy_dyn_abi::DynSolValue::Tuple(vals).abi_encode_params());
-        let (_, r) = evm::transact(db, &mut env, &mut cheats, from, TxKind::Create, data.clone().into(), U256::ZERO, false);
-        if let Some(a) = r.address {
-            cheats.names.insert(a, art.name.clone());
+        // the contract itself; behind a proxy, as the implementation
+        let what = if o.proxy || o.upgrade.is_some() { "implementation" } else { "constructor" };
+        let data: Bytes = match o.proxy || o.upgrade.is_some() {
+            true => code.into(),
+            false => [code, encode(&inputs, &o.args, &format!("{} constructor", art.name))].concat().into(),
+        };
+        let (db, r) = evm::transact(db, &mut env, &mut cheats, from, TxKind::Create, data.clone(), U256::ZERO, true);
+        let addr = r.address.filter(|_| r.ok).unwrap_or_else(|| die(&format!("{} {what} reverted: {}", art.name, decode::reason(&r.output))));
+        let name = o.upgrade.as_ref().map_or(art.name.clone(), |u| u.name.clone());
+        cheats.names.insert(addr, if what == "implementation" { format!("{name}_Implementation") } else { name });
+        txs.push(BroadcastTx { from, to: None, value: U256::ZERO, data, created: Some(addr) });
+        if o.proxy {
+            // UUPS implementations upgrade themselves and go behind a plain ERC1967Proxy; anything else behind a
+            // TransparentUpgradeableProxy, whose ProxyAdmin the deployer owns
+            let init = match abi.function("initialize") {
+                Some(_) => calldata(&abi, &art.name, "initialize", &o.args),
+                None if o.args.is_empty() => vec![],
+                None => die(&format!("{} has no initialize() to take those arguments", art.name)),
+            };
+            let uups = abi.function("proxiableUUID").is_some();
+            let proxy = arts.iter().find(|a| a.name == if uups { "ERC1967Proxy" } else { "TransparentUpgradeableProxy" }).unwrap();
+            let args = match uups {
+                true => vec![DynSolValue::Address(addr), DynSolValue::Bytes(init)],
+                false => vec![DynSolValue::Address(addr), DynSolValue::Address(from), DynSolValue::Bytes(init)],
+            };
+            let data: Bytes = [hex::decode(&proxy.bytecode).unwrap(), DynSolValue::Tuple(args).abi_encode_params()].concat().into();
+            let (_, r) = evm::transact(db, &mut env, &mut cheats, from, TxKind::Create, data.clone(), U256::ZERO, false);
+            let px = r.address.filter(|_| r.ok).unwrap_or_else(|| die(&format!("{} reverted while setting up the proxy (in initialize?): {}", art.name, decode::reason(&r.output))));
+            cheats.names.insert(px, art.name.clone());
+            txs.push(BroadcastTx { from, to: None, value: U256::ZERO, data, created: Some(px) });
+            proxies.push(px);
+        } else if let Some(u) = &o.upgrade {
+            let call = match &u.call {
+                Some(f) => calldata(&abi, &art.name, f, &o.args),
+                None if o.args.is_empty() => vec![],
+                None => die("arguments after the contract go to the function --call names"),
+            };
+            let (to, data) = match u.admin {
+                Some(admin) => {
+                    cheats.names.insert(admin, format!("{}'s ProxyAdmin", u.name));
+                    (admin, call_sig("upgradeAndCall(address,address,bytes)", &[DynSolValue::Address(u.proxy), DynSolValue::Address(addr), DynSolValue::Bytes(call)]))
+                }
+                // OpenZeppelin 4's UUPS calls the new implementation even with no data; its upgradeTo doesn't
+                None if call.is_empty() && abi.function("upgradeTo").is_some() => (u.proxy, call_sig("upgradeTo(address)", &[DynSolValue::Address(addr)])),
+                None => (u.proxy, call_sig("upgradeToAndCall(address,bytes)", &[DynSolValue::Address(addr), DynSolValue::Bytes(call)])),
+            };
+            let (_, r) = evm::transact(db, &mut env, &mut cheats, from, TxKind::Call(to), data.clone(), U256::ZERO, false);
+            if !r.ok {
+                die(&format!("upgrading {} reverted: {} (may {from} upgrade it?)", u.name, decode::reason(&r.output)));
+            }
+            cheats.names.insert(u.proxy, u.name.clone());
+            txs.push(BroadcastTx { from, to: Some(to), value: U256::ZERO, data, created: None });
+            proxies.push(u.proxy);
         }
-        if !r.ok {
-            die(&format!("{} constructor reverted: {}", art.name, decode::reason(&r.output)));
-        }
-        txs.push(BroadcastTx { from, to: None, value: U256::ZERO, data: data.into(), created: r.address });
     }
 
     if txs.is_empty() {
@@ -212,6 +321,14 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     let conn = match conn {
         Some(c) if o.broadcast => c,
         c => {
+            // what sending will cost, before anyone is asked for a password
+            if let (Some(c), Some(who)) = (c.as_ref().filter(|c| c.chain != 31337), me) {
+                let (need, sym) = (cost(c, who, &txs, &sims), rpc::symbol(c.chain));
+                if let Ok(have) = rpc::call(&c.url, "eth_getBalance", json!([who, "latest"])).map(|b| hexnum(&b)) {
+                    let short = if have < need { "; that's not enough, so fund it first" } else { "" };
+                    println!("{who} has {} {sym}; sending can cost up to {} {sym}{short}", eth(have), eth(need));
+                }
+            }
             println!("simulated {} transaction(s){}; add --broadcast to send", txs.len(), c.map(|c| format!(" against {}", c.name)).unwrap_or_default());
             return;
         }
@@ -231,12 +348,15 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
             };
             let input = inputs.entry(a.file.clone()).or_insert_with(|| crate::verify::save_input(p, &crate::verify::input(p, &a.file))).clone();
             let used: BTreeMap<String, Address> = a.links.as_object().into_iter().flatten().flat_map(|(f, ns)| ns.as_object().into_iter().flatten().map(move |(n, _)| format!("{f}:{n}"))).filter_map(|id| Some((id.clone(), *libs.get(&id)?))).collect();
-            recs.insert(*addr, Record { name: a.name.clone(), contract: format!("{}:{}", a.file, a.name), args: format!("0x{}", hex::encode(&init[code.len()..])), tx: Some(*hash), libs: used, compiler: compiler.clone(), input, verified: vec![] });
+            recs.insert(*addr, Record { name: a.name.clone(), contract: format!("{}:{}", a.file, a.name), args: format!("0x{}", hex::encode(&init[code.len()..])), tx: Some(*hash), libs: used, compiler: compiler.clone(), input, verified: vec![], proxy: proxies.contains(addr) });
         }
     }
     let mut all = crate::verify::load(p, conn.chain);
     all.extend(recs.clone());
     crate::verify::save(p, conn.chain, &all);
+    if o.proxy {
+        println!("{} is upgradeable: plain upgrade {} --network {}", art.name, art.name, conn.name);
+    }
     if recs.is_empty() {
         return;
     }
@@ -250,6 +370,9 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     let ok = crate::verify::run(p, conn.chain, &mut recs);
     all.extend(recs);
     crate::verify::save(p, conn.chain, &all);
+    for px in proxies {
+        crate::verify::link_proxy(p, conn.chain, px);
+    }
     if !ok {
         println!("retry the failed ones with: plain verify --network {}", conn.name);
     }
@@ -287,6 +410,22 @@ fn replay(fork: Option<Arc<evm::Fork>>, env: &Env, txs: &[BroadcastTx], arts: &A
     out
 }
 
+/// Max fee and priority fee per gas: EIP-1559 when the chain has a base fee, with room for it to double.
+fn fees(conn: &Conn) -> (u128, u128) {
+    match conn.base_fee {
+        Some(base) => {
+            let prio = conn.prio.unwrap_or_else(|| conn.gas_price.saturating_sub(base).max(1_000_000));
+            (base * 2 + prio, prio)
+        }
+        None => (conn.gas_price + conn.gas_price / 10, 0),
+    }
+}
+
+/// The most sending `txs` from `who` can cost, gas at 30% over the simulation as sent and fees at their cap.
+fn cost(conn: &Conn, who: Address, txs: &[BroadcastTx], sims: &[Sim]) -> u128 {
+    txs.iter().zip(sims).filter(|(t, _)| t.from == who).map(|(t, s)| (s.gas * 13 / 10) as u128 * fees(conn).0 + t.value.to::<u128>()).sum()
+}
+
 /// Signs every transaction up front, sends them back to back (nonces keep them in order), then waits for all
 /// receipts at once. Returns the transaction hashes.
 fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &HashMap<Address, B256>, names: &HashMap<Address, String>) -> Vec<B256> {
@@ -298,14 +437,7 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
     let r = rpc::batch(url, &calls).unwrap_or_else(|e| die(&e));
     let mut nonces: HashMap<Address, u64> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[2 * i]) as u64)).collect();
     let balances: HashMap<Address, u128> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[2 * i + 1]))).collect();
-    // fees: EIP-1559 when the chain has a base fee, with room for it to double
-    let (max_fee, prio) = match conn.base_fee {
-        Some(base) => {
-            let prio = conn.prio.unwrap_or_else(|| conn.gas_price.saturating_sub(base).max(1_000_000));
-            (base * 2 + prio, prio)
-        }
-        None => (conn.gas_price + conn.gas_price / 10, 0),
-    };
+    let (max_fee, prio) = fees(conn);
     let mut cost: HashMap<Address, u128> = HashMap::new();
     let mut signed = vec![];
     for (tx, s) in txs.iter().zip(sims) {
@@ -341,7 +473,8 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
     for (a, need) in &cost {
         let have = balances[a];
         if have < *need {
-            die(&format!("{a} has {} but these transactions can cost up to {} (in the chain's native token, at a {} gwei max fee)", eth(have), eth(*need), max_fee as f64 / 1e9));
+            let sym = rpc::symbol(conn.chain);
+            die(&format!("{a} has {} {sym} but these transactions can cost up to {} {sym} (at a {} gwei max fee); fund it first", eth(have), eth(*need), max_fee as f64 / 1e9));
         }
     }
     let t = Instant::now();
@@ -446,9 +579,8 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
         }
     }
     if !deployed.is_empty() {
-        let file = if conn.name.contains("://") { conn.chain.to_string() } else { conn.name.clone() };
-        let path = p.root.join("deployments").join(format!("{file}.json"));
-        let mut all: BTreeMap<String, String> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let path = addresses_path(p, conn);
+        let mut all = addresses(p, conn);
         all.extend(deployed);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&all).unwrap() + "\n").unwrap();
@@ -461,5 +593,11 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
 }
 
 fn eth(wei: u128) -> String {
-    format!("{:.6}", wei as f64 / 1e18)
+    // L2 deploys cost fractions of a cent: more digits below 0.001
+    let v = wei as f64 / 1e18;
+    match v {
+        0.0 => "0".into(),
+        v if v < 0.001 => format!("{v:.9}"),
+        v => format!("{v:.6}"),
+    }
 }
