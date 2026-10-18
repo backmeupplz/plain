@@ -1,9 +1,25 @@
 [package]
-name = "plain"
-version = "0.3.1"
+name = "plain-evm" # "plain" on crates.io is an unrelated crate; the binary is still `plain`
+version = "0.3.2"
 edition = "2024"
-description = "Compile, test and deploy EVM smart contracts. One binary, zero setup."
+description = "Compile, test and deploy EVM smart contracts with a single binary that needs no setup"
 license = "MIT"
+repository = "https://github.com/backmeupplz/plain"
+homepage = "https://getplain.org"
+readme = "README.md"
+keywords = ["ethereum", "evm", "solidity", "foundry", "smart-contracts"]
+categories = ["command-line-utilities", "development-tools::testing", "cryptography::cryptocurrencies"]
+include = ["/src", "/std", "/LICENSE", "/README.md"]
+
+[[bin]]
+name = "plain"
+path = "src/main.rs"
+
+# cargo binstall plain-evm: downloads the release tarball instead of compiling
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/plain-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 aes = "0.8"

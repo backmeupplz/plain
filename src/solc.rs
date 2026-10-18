@@ -180,10 +180,11 @@ pub fn home() -> PathBuf {
 }
 
 fn platform() -> &'static str {
-    // ponytail: no official linux-arm64 solc builds; add a mirror if someone needs it
-    match std::env::consts::OS {
-        "macos" => "macosx-amd64",
-        "windows" => "windows-amd64",
+    // official linux-arm64 builds start at solc 0.8.31, so older pragmas get "not available for linux-arm64" there
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", _) => "macosx-amd64",
+        ("windows", _) => "windows-amd64",
+        ("linux", "aarch64") => "linux-arm64",
         _ => "linux-amd64",
     }
 }
@@ -318,7 +319,12 @@ fn pick_version(p: &Project, g: &Graph) -> String {
         .rev()
         .find(ok)
         .map(|v| v.to_string())
-        .unwrap_or_else(|| crate::die("no single solc version satisfies all pragmas; set `solc = \"x.y.z\"` in plain.toml"))
+        .unwrap_or_else(|| {
+            crate::die(&format!(
+                "no solc release for {} satisfies all pragmas; set `solc = \"x.y.z\"` in plain.toml",
+                platform()
+            ))
+        })
 }
 
 pub struct Output {

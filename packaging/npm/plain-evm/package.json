@@ -1,0 +1,17 @@
+{
+  "name": "plain-evm",
+  "version": "0.0.0",
+  "description": "Compile, test and deploy EVM smart contracts with a single binary that needs no setup",
+  "keywords": ["ethereum", "evm", "solidity", "foundry", "smart-contracts", "testing", "deploy"],
+  "homepage": "https://getplain.org",
+  "repository": { "type": "git", "url": "git+https://github.com/backmeupplz/plain.git" },
+  "license": "MIT",
+  "bin": { "plain": "bin/plain.js" },
+  "files": ["bin"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "plain-evm-darwin-arm64": "0.0.0",
+    "plain-evm-darwin-x64": "0.0.0",
+    "plain-evm-linux-x64": "0.0.0"
+  }
+}

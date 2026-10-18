@@ -7,7 +7,7 @@ arch: amd64 # nfpm writes amd64 into the .deb and x86_64 into the .rpm
 platform: linux
 version: ${VERSION}
 maintainer: Nikita Kolmogorov <backmeupplz@gmail.com>
-description: Compile, test and deploy EVM smart contracts. One binary, zero setup.
+description: Compile, test and deploy EVM smart contracts with a single binary that needs no setup
 homepage: https://getplain.org
 license: MIT
 section: devel

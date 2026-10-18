@@ -7,8 +7,8 @@
     { self, nixpkgs }:
     let
       # the platforms plain ships solc support for, minus x86_64-darwin, which nixpkgs 26.11 dropped
-      # (Intel Macs use the installer or mise); aarch64-linux needs solc.rs to pick linux-arm64 first
-      systems = [ "aarch64-darwin" "x86_64-linux" ];
+      # (Intel Macs use the installer or mise); on aarch64-linux, solc has official builds only from 0.8.31
+      systems = [ "aarch64-darwin" "x86_64-linux" "aarch64-linux" ];
       forEachSystem = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
