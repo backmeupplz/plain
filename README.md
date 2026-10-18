@@ -114,8 +114,8 @@ Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (the key comes from
 
 What `--broadcast` does:
 1. While solc compiles (only what the target deploys), plain connects to the network and reads the chain id, the latest block and fees in one round trip.
-2. It runs the script against a fork of that block, then replays each transaction on its own, in order, as the chain will run it. That gives each transaction's exact gas (sent with 30% headroom), and it stops before sending anything if a transaction would revert on chain or the sender can't pay.
-3. It signs everything up front and sends the transactions back to back, without waiting for receipts in between (nonces keep them in order), then waits for all receipts at once.
+2. It runs the script against a fork of that block, then replays each transaction on its own, in order, as the chain will run it. That gives each transaction's exact gas (sent with 30% headroom), and it stops before sending anything if a transaction would revert on chain or the sender can't pay. The addresses where contracts will land are assumed empty during the run and then all checked in one round trip. If one isn't empty (say, a CREATE2 salt was used before), the replay runs again on what's really there.
+3. It signs everything up front. The first transaction goes out alone, so a fee, balance or chain problem stops the deploy before anything else is in the mempool. The rest go out in one batch, in nonce order. Then plain waits for the receipts, asking only for each sender's next one until it's in.
 4. It writes the addresses to `deployments/<network>.json` and verifies every contract created, including proxies and contracts created by other contracts. Each contract goes to every explorer at once: [Sourcify](https://sourcify.dev) (no key), Etherscan's v2 API when `ETHERSCAN_API_KEY` is set (foundry.toml `[etherscan]` keys work too), and the chain's Blockscout and Routescan explorers from chainlist. Each explorer gets the contract's own import closure as standard JSON input, the same sources and settings solc compiled it from, so it compiles no more than it has to. `--no-verify` skips this step.
 
 What explorers need is kept in `.plain/deploys/<chain id>.json`, so `plain verify --network base` retries whatever didn't verify (an explorer was down, or the key was missing). It doesn't compile anything. To verify only some contracts, pass names or addresses.
@@ -161,31 +161,47 @@ Foundry / Hardhat / **plain**:
 
 | | veydrift (via-IR) | Uniswap v4-core (via-IR) | solmate |
 |---|---|---|---|
-| cold build | 115s / 117s / **15s** | 140s / 142s / **12s** | 5.6s / 6.7s / **1.0s** |
-| no-op build | 0.18s / 0.25s / **0.02s** | 0.22s / 0.26s / **0.02s** | 0.16s / 0.21s / **0.01s** |
-| test, warm | 0.25s / 0.42s / **0.09s** | 4.3s / 5.8s / **3.1s** | 3.9s / 3.4s / **1.4s**¹ |
-| cold test (compile + test) | 112s / 116s / **15s** | 144s / 149s / **16s** | 9.6s / 9.8s / **2.6s**¹ |
-| edit a test, run tests² | 56s / 61s / **7.6s** | 25s / 27s / **8.4s** | 4.6s / 4.1s / **1.8s** |
-| edit a src function, run tests² | 103s / 109s / **2.1s** | 129s / 134s / **4.6s** | 5.8s / 5.8s / **1.8s** |
-| new worktree/clone of built sources, run tests | cold test / cold test / **0.14s** | cold test / cold test / **3.2s** | cold test / cold test / **1.6s** |
+| cold build | 116s / 115s / **15s** | 141s / 144s / **12s** | 5.6s / 6.8s / **1.1s** |
+| no-op build | 0.18s / 0.25s / **0.02s** | 0.24s / 0.27s / **0.02s** | 0.15s / 0.21s / **0.01s** |
+| test, warm (plain reuses unchanged results) | 0.25s / 0.43s / **0.04s** | 4.7s / 5.8s / **0.61s**³ | 4.0s / 3.5s / **0.02s**¹ |
+| test, warm, every test run (`--rerun`) | 0.25s / 0.43s / **0.10s** | 4.7s / 5.8s / **3.2s** | 4.0s / 3.5s / **1.6s**¹ |
+| cold test (compile + test) | 113s / 115s / **15s** | 144s / 147s / **16s** | 9.5s / 9.9s / **2.7s**¹ |
+| edit a test, run tests² | 56s / 61s / **0.99s** | 24s / 26s / **1.8s** | 4.6s / 4.2s / **0.07s** |
+| edit a src function, run tests² | 103s / 109s / **2.1s** | 130s / 132s / **4.2s** | 6.0s / 5.7s / **1.5s** |
+| new worktree/clone of built sources, run tests | cold test / cold test / **0.06s** | cold test / cold test / **0.76s** | cold test / cold test / **0.03s** |
 
 ¹ forge 1.x and Hardhat 3 dropped `testFail*`, so their solmate test timings exclude those tests (290 tests). `plain` runs all 568, including the legacy `testFail*` ones.
 
-² One agent iteration: add a statement to one function, then run the whole test command. The test edits are in the largest test file (veydrift `VeydriftGame.t.sol`, 7,500 lines; v4-core `PoolManager.t.sol`; solmate `ERC20.t.sol`), the src edits in `VeydriftGame.settleFirstPlanet`, `PoolManager.swap` and `ERC20.transfer`.
+² One agent iteration: add a statement to one function, then run the whole test command. Every run is a new edit, the first one right after a build. The test edits are in the largest test file (veydrift `VeydriftGame.t.sol`, 7,500 lines; v4-core `PoolManager.t.sol`; solmate `ERC20.t.sol`), the src edits in `VeydriftGame.settleFirstPlanet`, `PoolManager.swap` and `ERC20.transfer`.
+
+³ v4-core's two `ffi` suites (they spawn `npm` per call) run every time.
+
+Deploying veydrift's `script/Deploy.s.sol` (40 transactions, 74M gas) to an anvil with 2 s blocks, forge script / **plain deploy** (Hardhat has no forge-style scripts):
+
+| | local RPC | RPC 80 ms away⁴ |
+|---|---|---|
+| warm (built) | 4.1s / **1.9s** | 8.0s / **2.0s** |
+| cold (nothing compiled) | 30s / **5.8s** | 35s / **6.1s** |
+
+⁴ Every answer delayed 80 ms (`latency-proxy.py` in the benchmark repo), like a public RPC on another continent. Waiting for the block is about 1 s of plain's time. The anvil has a 300M block gas limit: at anvil's default 30M it drops queued transactions that don't fit the next block, which plain resends (11 s) and forge waits on forever (`--slow`: 69 s).
 
 Cold builds also peak at about 0.7 GB of memory under plain (veydrift, v4-core), against 3.2 to 4.6 GB for Foundry and Hardhat.
 
 Where the speed comes from (solc itself is unchanged: what gets deployed is byte-for-byte what solc produces):
 - **Tests don't embed the contracts they deploy.** In a test contract, `new Vault(args)` would make solc compile and optimize `Vault` again inside the test, once per test file (via-IR makes that the bulk of a build). plain compiles test files with each `new X(...)` replaced by a deploy of X's compiled artifact: the same init code, deployer, nonce and address. The arguments are still type-checked against X's constructor (through `abi.encodeCall` on a generated contract), so a wrong argument is the same compile error as before. If a rewritten file fails to compile, plain compiles the original and reports its errors.
-- **Big test files compile in parallel.** A test file with many tests compiles as several shards at once. Each shard keeps a share of the tests public and turns the rest `internal`, so solc drops them.
+- **Test files compile as units, and an edit recompiles only the tests it touched.** A big test file compiles as several units at once, each with only its share of the test functions (the others are cut out of the source, so solc doesn't even type-check them). Every test file, split or compiled whole, remembers which tests each unit holds. While only test bodies change, every unit keeps the tests it compiled unchanged, and edited or new tests compile into one small "hot" unit. The hot unit compiles without the optimizer, unless its code reads gas (`gasleft()`, gas snapshots), which takes about a third of solc's time. Only gas spent inside the test contract itself differs; the code under test is compiled exactly as configured.
 - **Editing src/ doesn't recompile tests.** Since tests no longer contain src bytecode, a test file is cached by its own source plus the *interfaces* of what it imports (function bodies left out). Editing a function body recompiles that file and whatever inherits from it, not the tests that deploy it. Deploy scripts compile the same way: a script's own bytecode never goes on chain, and the transactions it broadcasts are byte-identical.
+- **Unchanged tests don't run again.** A suite's results are reused while its bytecode, the settings and everything it read (deployed artifacts, files, env vars) are unchanged, so after an edit only the tests that can see it run. Tests are deterministic (fixed fuzz seed, no wall clock), and anything that isn't (`ffi`, `unixTime`, forks) always reruns.
+- **Only what's needed compiles.** `plain test <filter>` compiles only test files the filter can match. `plain deploy` compiles only the target and what it deploys.
 - **Scheduling:** solc jobs run on a work queue, biggest first, sized from the last build's timings (or, cold, from a model of how much code each file compiles). Foundry and Hardhat run one solc process at a time.
-- **Shared cache:** a new worktree or clone reuses artifacts any checkout already compiled.
+- **Shared cache:** a new worktree or clone reuses artifacts, and test results, that any checkout already produced.
 - **Tests:** suites, tests and individual fuzz/invariant runs execute in parallel on an in-process revm. Each run starts from a copy-on-write view of the post-`setUp` state.
+- **Deploys count round trips, not just CPU.** Connecting happens while solc compiles. Gas comes from replaying each transaction locally, so there are no `eth_estimateGas` calls. Where contracts will land is assumed empty and checked in one batch afterwards, instead of one fetch per contract. Transactions go out in one batch after the first, and receipt polling asks for each sender's next receipt only. veydrift's 40-transaction deploy makes 13 round trips instead of 77. A block that passes without our pending transactions triggers a resend (some nodes drop queued transactions).
+- **Verification:** each contract goes to every explorer at once, with only its own import closure as input. Sourcify gets the creation transaction hash, so it doesn't have to search for it.
 - **Startup:** one native binary with no JS runtime.
 
 ## Not included (on purpose)
 
-Gas snapshot files, coverage, formatting, Etherscan verification, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), and the `vm.deployCode` cheatcode (use `vm.getCode` + `create`). Library linking only works for libraries under `src/`/`test/`/`script/`.
+Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), and the `vm.deployCode` cheatcode (use `vm.getCode` + `create`). Library linking only works for libraries under `src/`/`test/`/`script/`.
 
-Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs. Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).
+Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs (more so for tests you just edited, which compile without the optimizer until the file is re-split). Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).
