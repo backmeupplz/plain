@@ -26,7 +26,7 @@ On any other platform, or to build from source with Rust:
 cargo install --git https://github.com/backmeupplz/plain
 ```
 
-The same binaries install through [mise](https://mise.jdx.dev), which checks each download against the release, and the repository is a Nix flake that builds from source:
+The same binaries install through [mise](https://mise.jdx.dev), which checks each download against the release, and the repository is a Nix flake that builds from source on Apple silicon Macs and x86_64 Linux:
 
 ```sh
 mise use -g github:backmeupplz/plain   # add @<version> on release day: mise hides releases younger than a day
