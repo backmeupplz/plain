@@ -33,4 +33,4 @@ overrides:
       - glibc >= 2.34
 rpm:
   signature:
-    key_file: ${RPM_SIGNING_KEY_FILE} # unset = unsigned rpm; the passphrase, if any, comes from NFPM_RPM_PASSPHRASE
+    key_file: ${RPM_SIGNING_KEY_FILE} # unset = unsigned rpm; the key must have no passphrase (the workflow passes none)
