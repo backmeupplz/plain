@@ -1,5 +1,5 @@
 #!/bin/sh
-# plain installer: curl -fsSL https://getplain.sh/install | sh
+# plain installer: curl -fsSL https://getplain.org/install | sh
 # Puts the latest release in ~/.plain/bin (or $PLAIN_DIR) and adds that to your shell's PATH.
 set -eu
 

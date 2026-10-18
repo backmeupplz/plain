@@ -3,7 +3,7 @@
 Compile, test, deploy and verify EVM smart contracts with one ~7 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
 
 ```sh
-curl -fsSL https://getplain.sh/install | sh   # macOS and Linux
+curl -fsSL https://getplain.org/install | sh   # macOS and Linux
 plain init                 # src/Counter.sol + test/Counter.t.sol
 plain test                 # compile + run every test
 plain deploy Counter --network base-sepolia --broadcast   # deploy, then verify on explorers
