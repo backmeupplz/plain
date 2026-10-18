@@ -55,7 +55,7 @@ const USAGE: &str = "plain: compile, test and deploy EVM contracts
 
 usage:
   plain                                      in a terminal: a menu for everything below
-  plain init                                 scaffold src/Counter.sol + test/Counter.t.sol
+  plain init [dir]                           scaffold src/Counter.sol + test/Counter.t.sol (in dir, if given)
   plain build [--force] [--check]            compile src/, test/, script/ (solc auto-selected from pragmas);
                                              --check: confirm each contract matches solc's own compile
   plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts;
@@ -85,7 +85,11 @@ outside the EVM: vm.ffi needs ffi = true, file cheatcodes need fs_permissions (a
           test/**/*.test.ts run only with typescript = true (they're programs with your permissions)
 ";
 
-pub fn init() {
+/// Scaffolds a project in `dir` (created when missing), else in the current directory. Existing files are kept.
+pub fn init(dir: Option<&str>) {
+    if let Some(d) = dir {
+        std::fs::create_dir_all(d).and_then(|_| std::env::set_current_dir(d)).unwrap_or_else(|e| die(&format!("{d}: {e}")));
+    }
     let files = [
         ("src/Counter.sol", "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.24;\n\ncontract Counter {\n    uint256 public number;\n\n    function increment() external {\n        number++;\n    }\n}\n"),
         ("test/Counter.t.sol", "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.24;\n\nimport {Test} from \"forge-std/Test.sol\";\nimport {Counter} from \"../src/Counter.sol\";\n\ncontract CounterTest is Test {\n    Counter counter;\n\n    function setUp() public {\n        counter = new Counter();\n    }\n\n    function test_Increment() public {\n        counter.increment();\n        assertEq(counter.number(), 1);\n    }\n}\n"),
@@ -100,7 +104,10 @@ pub fn init() {
         std::fs::write(path, body).unwrap_or_else(|e| die(&format!("{path}: {e}")));
         println!("wrote {path}");
     }
-    println!("next: plain test");
+    match dir {
+        Some(d) => println!("next: cd {d} && plain test"),
+        None => println!("next: plain test"),
+    }
 }
 
 /// `plain test --watch`: the tests, then again whenever something under src/, test/ or script/ or the config
@@ -340,7 +347,14 @@ fn main() {
                 std::thread::park();
             }
         }
-        "init" => init(),
+        "init" => {
+            no_options(&args);
+            match &args[..] {
+                [] => init(None),
+                [dir] => init(Some(dir.as_str())),
+                _ => die("usage: plain init [dir]"),
+            }
+        }
         "help" | "-h" | "--help" => print!("{USAGE}"),
         "version" | "-V" | "--version" => println!("plain {}", env!("CARGO_PKG_VERSION")),
         other => {

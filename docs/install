@@ -17,9 +17,22 @@ esac
 
 dir="${PLAIN_DIR:-$HOME/.plain/bin}"
 mkdir -p "$dir"
-url="https://github.com/$repo/releases/latest/download/plain-$target.tar.gz"
-echo "downloading $url"
-curl -fsSL "$url" | tar -xzf - -C "$dir"
+base="https://github.com/$repo/releases/latest/download"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+echo "downloading $base/plain-$target.tar.gz"
+curl -fsSL -o "$tmp/plain-$target.tar.gz" "$base/plain-$target.tar.gz"
+# the release's SHA256SUMS: a download that doesn't match it never gets unpacked
+curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum"; else sum="shasum -a 256"; fi
+# compared by hand: some sha256sum -c pass on empty input, so a missing line would skip the check
+want="$(grep " plain-$target.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
+got="$($sum "$tmp/plain-$target.tar.gz" | cut -d' ' -f1)"
+[ -n "$want" ] && [ "$want" = "$got" ] || {
+  echo "plain-$target.tar.gz doesn't match the release's SHA256SUMS; nothing was installed" >&2
+  exit 1
+}
+tar -xzf "$tmp/plain-$target.tar.gz" -C "$dir"
 chmod +x "$dir/plain"
 echo "installed $("$dir/plain" --version) to $dir/plain"
 

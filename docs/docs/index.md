@@ -52,7 +52,7 @@ The sections below go through each step. If you'd rather not remember any of it,
 
 ```
 $ plain
-plain. 0.3.0 · ~/code/my-project
+plain. 0.3.1 · ~/code/my-project
 Contracts live in src/ and tests in test/; each step shows the command it runs.
 ? What next?
 ❯ Build     compile the contracts
@@ -74,7 +74,7 @@ mkdir my-project && cd my-project
 plain init
 ```
 
-`plain init` writes three files: a `Counter` contract in `src/Counter.sol`, its test in `test/Counter.t.sol`, and a `.gitignore` that leaves out `.plain/`, `node_modules/` and `.env`. Contracts go in `src/` (or `contracts/` when there's no `src/`), tests in `test/` and deploy scripts in `script/`. No config file is needed, and forge-std ships inside the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. Libraries come from npm or `lib/`, as [Dependencies](#dependencies) explains.
+`plain init` writes three files: a `Counter` contract in `src/Counter.sol`, its test in `test/Counter.t.sol`, and a `.gitignore` that leaves out `.plain/`, `node_modules/` and `.env`. Given a folder name, as in `plain init my-project`, it creates that folder and writes them there, and it never overwrites a file that already exists. Contracts go in `src/` (or `contracts/` when there's no `src/`), tests in `test/` and deploy scripts in `script/`. No config file is needed, and forge-std ships inside the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. Libraries come from npm or `lib/`, as [Dependencies](#dependencies) explains.
 
 ## 2. Compile
 
