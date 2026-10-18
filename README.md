@@ -9,7 +9,7 @@ plain test                 # compile + run every test
 plain deploy Counter --network base-sepolia --broadcast   # deploy, then verify on explorers
 ```
 
-Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`.
+Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`. The [docs](https://getplain.org/docs/) walk through new and existing projects, testing and deploying.
 
 | On real projects ([details](#benchmarks)) | Foundry | Hardhat 3 | plain |
 |---|---|---|---|

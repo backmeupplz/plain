@@ -1,0 +1,7 @@
+# GitHub Pages builds docs/ with Jekyll: index.html, install and the images are copied as they are,
+# docs/docs/index.md renders into /docs/ with _layouts/docs.html.
+markdown: kramdown
+kramdown:
+  input: GFM
+  toc_levels: 2..2
+  syntax_highlighter: rouge
