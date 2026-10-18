@@ -1,5 +1,7 @@
-# Pushing a v* tag builds plain for each platform the installer (docs/install) supports, then publishes them in one
-# go with SHA256SUMS, which the installer checks. Actions are pinned to commits: a moved tag can't change a release.
+# Pushing a v* tag builds plain for each platform the installer (docs/install) supports, packages the Linux binary
+# as a .deb and an .rpm, then publishes everything in one go with SHA256SUMS, which the installer checks, and build
+# provenance attestations (`gh attestation verify <file> -R backmeupplz/plain`; mise checks them by itself).
+# Actions and images are pinned to digests: a moved tag can't change a release.
 name: release
 on:
   push:
@@ -30,14 +32,34 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write # this and the two below: build provenance attestations
+      attestations: write
+      artifact-metadata: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: plain-*
+          path: dist
           merge-multiple: true
-      - run: sha256sum plain-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: .deb and .rpm
+        env:
+          # optional: signs the .rpm (rpm checks package signatures, apt doesn't check .deb ones); unset = unsigned
+          GPG_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+          NFPM: goreleaser/nfpm:v2.48.0@sha256:d57a1452e7a019896b355f7b1ec67262278f6c503631f652d4fce7aef9ac8df7
+        run: |
+          tar -xzf dist/plain-x86_64-unknown-linux-gnu.tar.gz # ./plain, which packaging/nfpm.yaml packages
+          key=
+          if [ -n "$GPG_KEY" ]; then (umask 077 && printf '%s\n' "$GPG_KEY" > key.asc) && key=/w/key.asc; fi
+          for format in deb rpm; do
+            docker run --rm -v "$PWD:/w" -w /w -e VERSION="${GITHUB_REF_NAME#v}" -e RPM_SIGNING_KEY_FILE="$key" \
+              "$NFPM" pkg -f packaging/nfpm.yaml -p "$format" -t dist/
+          done
+          rm -f key.asc plain
+      - run: cd dist && sha256sum plain* > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: |
-            plain-*.tar.gz
-            SHA256SUMS
+          files: dist/*

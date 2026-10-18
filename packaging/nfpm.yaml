@@ -1,0 +1,36 @@
+# .deb and .rpm for x86_64 Linux, built from the release binary (./plain) by the release workflow:
+#   VERSION=0.2.0 nfpm pkg -f packaging/nfpm.yaml -p deb -t dist/
+#   VERSION=0.2.0 RPM_SIGNING_KEY_FILE=key.asc nfpm pkg -f packaging/nfpm.yaml -p rpm -t dist/
+# The binary needs glibc 2.34+ (Debian 12, Ubuntu 22.04, RHEL/Rocky/Alma 9, Amazon Linux 2023, Fedora 35+).
+name: plain
+arch: amd64 # nfpm writes amd64 into the .deb and x86_64 into the .rpm
+platform: linux
+version: ${VERSION}
+maintainer: Nikita Kolmogorov <backmeupplz@gmail.com>
+description: Compile, test and deploy EVM smart contracts. One binary, zero setup.
+homepage: https://getplain.org
+license: MIT
+section: devel
+contents:
+  - src: ./plain
+    dst: /usr/bin/plain
+    file_info:
+      mode: 0755
+  - src: ./LICENSE
+    dst: /usr/share/doc/plain/copyright
+    packager: deb
+  - src: ./LICENSE
+    dst: /usr/share/licenses/plain/LICENSE
+    type: license
+    packager: rpm
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libgcc-s1
+  rpm:
+    depends:
+      - glibc >= 2.34
+rpm:
+  signature:
+    key_file: ${RPM_SIGNING_KEY_FILE} # unset = unsigned rpm; the passphrase, if any, comes from NFPM_RPM_PASSPHRASE
