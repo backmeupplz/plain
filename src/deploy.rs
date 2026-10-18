@@ -144,6 +144,7 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     }
     let db = evm::base_db(evm::Remote(fork.clone(), None));
     cheats.track_creates = true;
+    cheats.presume_creates = true;
     let is_script = art.file.ends_with(".s.sol") || (p.dirs.get(2).is_some_and(|d| art.file.starts_with(&format!("{d}/"))) && has_run(&art));
 
     // libraries go on chain first, deployed by the broadcaster (like forge script)
@@ -194,7 +195,14 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         println!("nothing to broadcast (did the script call vm.startBroadcast?)");
         return;
     }
-    let sims = replay(fork, &fresh_env, &txs, &arts, p);
+    // where contracts land was taken as empty (`Fork::presume`): one round trip checks it all, and the replay
+    // runs again on the chain's own state when something was there after all (a CREATE2 salt used before)
+    let settle = || fork.as_ref().is_some_and(|f| f.settle().unwrap_or_else(|e| die(&e.to_string())));
+    settle();
+    let mut sims = replay(fork.clone(), &fresh_env, &txs, &arts, p);
+    while settle() {
+        sims = replay(fork.clone(), &fresh_env, &txs, &arts, p);
+    }
     for (i, (tx, s)) in txs.iter().zip(&sims).enumerate() {
         println!("{}. {} (from {}, gas {})", i + 1, describe(tx, &cheats.names), tx.from, s.gas);
         if std::env::var_os("PLAIN_DEBUG").is_some() {
@@ -258,6 +266,7 @@ fn replay(fork: Option<Arc<evm::Fork>>, env: &Env, txs: &[BroadcastTx], arts: &A
     }
     let mut cheats = Cheats::new(arts.clone(), p.root.clone());
     cheats.track_creates = true;
+    cheats.presume_creates = true;
     let mut vm = evm::Vm::new(db, env, &mut cheats);
     let mut out = vec![];
     for (i, tx) in txs.iter().enumerate() {
@@ -333,15 +342,31 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
         }
     }
     let t = Instant::now();
+    let raw = |i: usize| ("eth_sendRawTransaction", json!([format!("0x{}", hex::encode(&signed[i].1))]));
+    // the first on its own: a fee, balance or chain problem stops the deploy before anything else is in the pool.
+    // The rest in one batch, in nonce order (a round trip each would cost seconds on a remote RPC)
+    let mut results = vec![rpc::call(url, raw(0).0, raw(0).1)];
+    if results[0].is_ok() && signed.len() > 1 {
+        let calls: Vec<(&str, Value)> = (1..signed.len()).map(raw).collect();
+        results.extend(rpc::batch_each(url, &calls).unwrap_or_else(|e| vec![Err(e); calls.len()]));
+    }
     let mut sent = vec![];
-    for (i, (hash, raw)) in signed.iter().enumerate() {
-        match rpc::call(url, "eth_sendRawTransaction", json!([format!("0x{}", hex::encode(raw))])) {
-            Ok(_) => sent.push(*hash),
-            Err(e) if e.contains("already known") => sent.push(*hash),
-            Err(e) => {
+    for (i, r) in results.into_iter().enumerate() {
+        let r = match r {
+            // a node that ran the batch out of order: again, now that the nonces before it are in
+            Err(e) if e.contains("nonce too high") || e.contains("gap") => rpc::call(url, raw(i).0, raw(i).1),
+            r => r,
+        };
+        match r {
+            // (nonce too low past the first: ours, mined while a rate-limited batch was retried)
+            Err(e) if !["already known", "known transaction", "already imported"].iter().any(|k| e.to_lowercase().contains(k)) && !(i > 0 && e.contains("nonce too low")) => {
                 eprintln!("transaction {} rejected: {e}", i + 1);
+                if i + 1 < signed.len() && i > 0 {
+                    eprintln!("the {} after it went out in the same batch and wait behind its nonce", signed.len() - i - 1);
+                }
                 break;
             }
+            _ => sent.push(signed[i].0),
         }
     }
     println!("sent {}/{} transactions to {} in {:.1?}; waiting for receipts", sent.len(), signed.len(), conn.name, t.elapsed());
@@ -357,24 +382,33 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
     let mut seen = 0;
     while next < sent.len() {
         let pending: Vec<usize> = (0..sent.len()).filter(|i| receipts[*i].is_none()).collect();
-        let mut calls: Vec<(&str, Value)> = pending.iter().map(|i| ("eth_getTransactionReceipt", json!([sent[*i]]))).collect();
-        calls.push(("eth_blockNumber", json!([])));
-        if let Ok(mut rs) = rpc::batch_each(url, &calls) {
-            let block = rs.pop().and_then(|b| b.ok()).map(|b| hexnum(&b)).unwrap_or(0);
-            let mut progress = false;
-            for (i, r) in pending.iter().zip(rs) {
+        // a sender's transactions are mined in nonce order: ask for each sender's first pending receipt, and for
+        // the rest once one of those is in (public RPCs rate-limit per call, batched or not)
+        let heads: Vec<usize> = pending.iter().copied().filter(|&i| !pending.iter().any(|&j| j < i && txs[j].from == txs[i].from)).collect();
+        let (mut block, mut progress, mut polled) = (0, false, false);
+        for ask in [heads, pending.clone()] {
+            let ask: Vec<usize> = ask.into_iter().filter(|i| receipts[*i].is_none()).collect();
+            if ask.is_empty() || (polled && !progress) {
+                break;
+            }
+            let mut calls: Vec<(&str, Value)> = ask.iter().map(|i| ("eth_getTransactionReceipt", json!([sent[*i]]))).collect();
+            calls.push(("eth_blockNumber", json!([])));
+            let Ok(mut rs) = rpc::batch_each(url, &calls) else { break };
+            polled = true;
+            block = rs.pop().and_then(|b| b.ok()).map(|b| hexnum(&b)).unwrap_or(0);
+            for (i, r) in ask.iter().zip(rs) {
                 if let Ok(r) = r.and_then(|r| if r.is_null() { Err(String::new()) } else { Ok(r) }) {
                     receipts[*i] = Some(r);
                     last = Instant::now();
                     progress = true;
                 }
             }
+        }
+        if polled {
             if progress || seen == 0 {
                 seen = block;
             } else if block > seen {
-                for i in pending.iter().take(16) {
-                    rpc::call(url, "eth_sendRawTransaction", json!([format!("0x{}", hex::encode(&signed[*i].1))])).ok();
-                }
+                rpc::batch_each(url, &pending.iter().take(16).map(|&i| raw(i)).collect::<Vec<_>>()).ok();
                 seen = block;
             }
         }
@@ -405,7 +439,7 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
             if last.elapsed() > Duration::from_secs(300) {
                 die(&format!("no receipt for {} after 5 minutes", sent[next]));
             }
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
     if !deployed.is_empty() {

@@ -55,6 +55,8 @@ pub struct Fork {
     settled: std::sync::atomic::AtomicBool,
     accounts: Mutex<HashMap<Address, AccountInfo>>,
     slots: Mutex<HashMap<(Address, U256), U256>>,
+    /// accounts taken as empty without asking (see `presume`)
+    presumed: Mutex<Vec<Address>>,
 }
 
 impl Fork {
@@ -63,7 +65,42 @@ impl Fork {
             let b = crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).unwrap_or_else(|e| crate::die(&format!("fork {url}: {e}")));
             u64::from_str_radix(b.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
         });
-        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default() }
+        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default(), presumed: Default::default() }
+    }
+
+    /// Takes a contract's address-to-be as empty, as it nearly always is, instead of a round trip per contract
+    /// created; `settle` checks them all at once.
+    pub fn presume(&self, a: Address) {
+        let mut accounts = self.accounts.lock().unwrap();
+        if !accounts.contains_key(&a) {
+            accounts.insert(a, AccountInfo::default());
+            self.presumed.lock().unwrap().push(a);
+        }
+    }
+
+    /// Fetches every presumed account in one batch; true if any isn't empty after all.
+    pub fn settle(&self) -> Result<bool, DbErr> {
+        let list = std::mem::take(&mut *self.presumed.lock().unwrap());
+        if list.is_empty() {
+            return Ok(false);
+        }
+        // chunks at once: a provider capping batch size falls back to single calls per chunk, not for all
+        let r: Vec<serde_json::Value> = std::thread::scope(|s| {
+            let hs: Vec<_> = list
+                .chunks(8)
+                .map(|c| s.spawn(move || self.q(&c.iter().flat_map(|a| ["eth_getBalance", "eth_getTransactionCount", "eth_getCode"].map(|m| (m, serde_json::json!([a])))).collect::<Vec<_>>())))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect::<Result<Vec<_>, _>>()
+        })?
+        .concat();
+        let mut accounts = self.accounts.lock().unwrap();
+        let mut surprise = false;
+        for (a, r) in list.iter().zip(r.chunks(3)) {
+            let info = account(r);
+            surprise |= !info.is_empty();
+            accounts.insert(*a, info);
+        }
+        Ok(surprise)
     }
 
     pub fn block(&self) -> u64 {
@@ -95,6 +132,13 @@ fn hexu(v: &serde_json::Value) -> U256 {
     v.as_str().and_then(|s| U256::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_default()
 }
 
+/// An account from [eth_getBalance, eth_getTransactionCount, eth_getCode] results.
+fn account(r: &[serde_json::Value]) -> AccountInfo {
+    let code = hex::decode(r[2].as_str().unwrap_or("0x").trim_start_matches("0x")).unwrap_or_default();
+    let bc = Bytecode::new_raw(code.into());
+    AccountInfo::new(hexu(&r[0]), hexu(&r[1]).to::<u64>(), bc.hash_slow(), bc)
+}
+
 impl DatabaseRef for Remote {
     type Error = DbErr;
     fn basic_ref(&self, a: Address) -> Result<Option<AccountInfo>, DbErr> {
@@ -106,11 +150,7 @@ impl DatabaseRef for Remote {
             return Ok(Some(i.clone()));
         }
         let p = serde_json::json!([a]);
-        let r = f.q(&[("eth_getBalance", p.clone()), ("eth_getTransactionCount", p.clone()), ("eth_getCode", p)])?;
-        let (bal, nonce, code) = (hexu(&r[0]), hexu(&r[1]).to::<u64>(), &r[2]);
-        let code = hex::decode(code.as_str().unwrap_or("0x").trim_start_matches("0x")).unwrap_or_default();
-        let bc = Bytecode::new_raw(code.into());
-        let info = AccountInfo::new(bal, nonce, bc.hash_slow(), bc);
+        let info = account(&f.q(&[("eth_getBalance", p.clone()), ("eth_getTransactionCount", p.clone()), ("eth_getCode", p)])?);
         f.accounts.lock().unwrap().insert(a, info.clone());
         Ok(Some(info))
     }
@@ -346,6 +386,8 @@ pub struct Cheats {
     /// address -> contract name for contracts created while `track_creates` is on
     pub names: HashMap<Address, String>,
     pub track_creates: bool,
+    /// deploys: take where contracts land on the fork as empty (`Fork::presume`); tests must see the chain as is
+    pub presume_creates: bool,
     /// every contract created while `track_creates` is on, with its init code (for verification)
     pub creates: Vec<(Address, Bytes)>,
     pub trace: Option<Vec<TraceNode>>,
@@ -1175,6 +1217,17 @@ impl Inspector<Ctx> for Cheats {
         if caller != inputs.caller() {
             let _ = ctx.journaled_state.load_account(caller);
             inputs.set_call(caller);
+        }
+        // deploys: where the contract lands is taken as empty (the caller settles the fork in one batch)
+        if let Some(f) = ctx.journaled_state.database.db.0.clone().filter(|_| self.presume_creates) {
+            let addr = match inputs.scheme() {
+                revm::context_interface::CreateScheme::Create => ctx.journaled_state.load_account(caller).ok().map(|a| caller.create(a.info.nonce)),
+                revm::context_interface::CreateScheme::Create2 { salt } => Some(caller.create2(salt.to_be_bytes::<32>(), keccak256(inputs.init_code()))),
+                _ => None,
+            };
+            if let Some(a) = addr {
+                f.presume(a);
+            }
         }
         if let Some(t) = &mut self.trace {
             self.trace_stack.push(t.len());

@@ -43,7 +43,8 @@ pub fn network(p: &Project, name: &str) -> Result<Net, String> {
     if name == "local" {
         return Ok(Net { url: "http://127.0.0.1:8545".into(), chain: None });
     }
-    let builtin = NETWORKS.iter().find(|n| n.0 == name);
+    // by name, or by chain id ("8453" uses Base's own RPC too)
+    let builtin = NETWORKS.iter().find(|n| (n.0 == name || name.parse() == Ok(n.1)) && !n.2.is_empty()).or_else(|| NETWORKS.iter().find(|n| n.0 == name));
     // built-ins don't wait for a chainlist download; a cached one only adds race candidates
     let list = chainlist(builtin.is_none_or(|b| b.2.is_empty()));
     let id = match builtin {

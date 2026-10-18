@@ -136,6 +136,7 @@ pub fn run(p: &Project, chain: u64, recs: &mut BTreeMap<Address, Record>) -> boo
         return true;
     }
     let t = Instant::now();
+    println!("verifying {} contract(s) on {}", recs.len(), exps.iter().map(|e| e.name).collect::<Vec<_>>().join(", "));
     let inputs: BTreeMap<String, String> = recs
         .values()
         .map(|r| (r.input.clone(), std::fs::read_to_string(dir(p).join("inputs").join(format!("{}.json", r.input))).unwrap_or_default()))
