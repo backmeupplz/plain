@@ -1,6 +1,7 @@
 # Pushing a v* tag builds plain for each platform the installer (docs/install) supports, packages the Linux binary
-# as a .deb and an .rpm, then publishes everything in one go with SHA256SUMS, which the installer checks, and build
-# provenance attestations (`gh attestation verify <file> -R backmeupplz/plain`; mise checks them by itself).
+# as a .deb and an .rpm, then publishes everything in one go with SHA256SUMS, which the installer checks, and a build
+# provenance attestation for each file listed in it (`gh attestation verify <file> -R backmeupplz/plain`; mise checks
+# them by itself). SHA256SUMS itself isn't attested.
 # Actions and images are pinned to digests: a moved tag can't change a release.
 name: release
 on:
