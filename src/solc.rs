@@ -514,7 +514,8 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                         match reuse {
                             // a unit from the previous build: its artifacts, now owning only its unchanged tests
                             Some(old) => contracts.extend(cache.files[&f].contracts.iter().filter(|a| a.shard == *old).map(|a| Artifact { shard: i as u32, tests: if crate::test::is_test_contract(a) { m.owns.clone() } else { vec![] }, ..a.clone() })),
-                            None => m.ms = unit_ms.get(&(f.clone(), i)).copied().unwrap_or(0),
+                            // (a file compiled whole has no unit timing: it's the file's)
+                            None => m.ms = unit_ms.get(&(f.clone(), i)).copied().unwrap_or(ms),
                         }
                         metas.push(m);
                     }
@@ -749,7 +750,8 @@ impl Plan {
             // core's share of the build, not less.
             let floor = if p.via_ir { 48 * 1024 } else { usize::MAX };
             let old = cache.files.get(*f).filter(|o| !o.units.is_empty() && !force);
-            if test && workers > 1 && (old.is_some() || split > slot || test_bytes > 2 * floor) {
+            let big = old.is_some_and(|o| o.units.len() > 1) || split > slot || test_bytes > 2 * floor;
+            if test && workers > 1 {
                 // contract indices survive the `new` rewrite (it only edits bodies and appends a free function)
                 let in_test = |ci: usize| testish.get(&(f.as_str(), ci)).copied().unwrap_or(false);
                 let content = sources.get(*f).cloned().unwrap_or_else(|| g.files[*f].content.clone());
@@ -803,7 +805,7 @@ impl Plan {
                             units.clear(); // fragmented: shard afresh
                         }
                     }
-                    if units.is_empty() && k >= 2 {
+                    if units.is_empty() && k >= 2 && big {
                         let a = rewrite::assign(&tests, k);
                         for s in 0..k {
                             let mut owns: Vec<String> = a.iter().filter(|(_, x)| **x == s).map(|(n, _)| n.clone()).collect();
@@ -828,6 +830,10 @@ impl Plan {
                         unit_plans.insert(f.to_string(), (shared, units));
                         continue;
                     }
+                    // compiled whole, but recorded as one unit: the next edit compiles only the tests it changed
+                    let mut all: Vec<String> = tests.iter().map(|t| t.0.clone()).collect();
+                    all.sort();
+                    unit_plans.insert(f.to_string(), (shared, vec![(meta(all, false), None)]));
                 }
             }
             if e > slot / 4 {
