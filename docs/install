@@ -1,0 +1,44 @@
+#!/bin/sh
+# plain installer: curl -fsSL https://getplain.sh/install | sh
+# Puts the latest release in ~/.plain/bin (or $PLAIN_DIR) and adds that to your shell's PATH.
+set -eu
+
+repo=backmeupplz/plain
+case "$(uname -s)/$(uname -m)" in
+  Darwin/arm64) target=aarch64-apple-darwin ;;
+  Darwin/x86_64) target=x86_64-apple-darwin ;;
+  Linux/x86_64 | Linux/amd64) target=x86_64-unknown-linux-gnu ;;
+  *)
+    echo "plain has no prebuilt binary for $(uname -s) $(uname -m) yet." >&2
+    echo "Build it from source instead: cargo install --git https://github.com/$repo" >&2
+    exit 1
+    ;;
+esac
+
+dir="${PLAIN_DIR:-$HOME/.plain/bin}"
+mkdir -p "$dir"
+url="https://github.com/$repo/releases/latest/download/plain-$target.tar.gz"
+echo "downloading $url"
+curl -fsSL "$url" | tar -xzf - -C "$dir"
+chmod +x "$dir/plain"
+echo "installed $("$dir/plain" --version) to $dir/plain"
+
+case ":$PATH:" in
+  *":$dir:"*) exit 0 ;;
+esac
+line="export PATH=\"$dir:\$PATH\""
+case "${SHELL:-}" in
+  */zsh) rc="$HOME/.zshrc" ;;
+  */bash) if [ "$(uname -s)" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi ;;
+  */fish)
+    rc=""
+    mkdir -p "$HOME/.config/fish/conf.d"
+    echo "fish_add_path $dir" > "$HOME/.config/fish/conf.d/plain.fish"
+    ;;
+  *) rc="$HOME/.profile" ;;
+esac
+if [ -n "$rc" ] && ! grep -qsF "$line" "$rc"; then
+  printf '\n# plain\n%s\n' "$line" >> "$rc"
+  echo "added $dir to PATH in $rc"
+fi
+echo "open a new terminal (or run: $line), then try: plain init && plain test"

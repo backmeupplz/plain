@@ -1,0 +1,26 @@
+# Pushing a v* tag builds plain for each platform the installer (docs/install) supports and attaches
+# plain-<target>.tar.gz to that tag's GitHub release.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          # glibc 2.35+; solc has no official linux-arm64 builds, so neither does plain
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: tar -czf plain-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release plain
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: plain-${{ matrix.target }}.tar.gz

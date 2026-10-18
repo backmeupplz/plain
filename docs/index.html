@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plain: Solidity in seconds</title>
+<meta name="description" content="plain is one small binary that compiles, tests, deploys and verifies Solidity contracts. It runs Foundry projects as they are and turns the minute-long edit-and-test loop into about a second.">
+<meta property="og:title" content="plain: Solidity in seconds">
+<meta property="og:description" content="One binary that compiles, tests, deploys and verifies Solidity. Edit a test and rerun the suite in 1 s where Foundry takes 56 s.">
+<meta property="og:url" content="https://getplain.sh">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f7a4d'/%3E%3Ctext x='16' y='22.5' font-family='ui-monospace,Menlo,monospace' font-size='19' font-weight='700' text-anchor='middle' fill='%23fff'%3Ep%3C/text%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #fbfbf8; --fg: #1b1b19; --muted: #66665f; --line: #e4e3dc; --card: #f3f2ec;
+  --code: #efeee7; --accent: #1f7a4d; --accent-fg: #ffffff; --bar: #cfcec6;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111110; --fg: #ecebe5; --muted: #9a9991; --line: #282825; --card: #191917;
+    --code: #1d1d1b; --accent: #4cc38a; --accent-fg: #0d1f16; --bar: #3a3a35; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 var(--sans); }
+a { color: inherit; text-decoration-color: var(--muted); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+code, pre, .mono { font-family: var(--mono); }
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+.mark { font: 700 22px var(--mono); letter-spacing: -0.5px; text-decoration: none; }
+.mark span { color: var(--accent); }
+nav a { margin-left: 22px; font-size: 15px; color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--fg); }
+.hero { padding: 64px 0 40px; }
+h1 { font-size: clamp(34px, 6vw, 54px); line-height: 1.08; letter-spacing: -1.5px; margin: 0 0 22px; font-weight: 750; }
+h1 em { font-style: normal; color: var(--accent); }
+.lead { font-size: 20px; color: var(--muted); max-width: 680px; margin: 0 0 34px; }
+.install { display: flex; align-items: center; gap: 12px; background: var(--code); border: 1px solid var(--line);
+  border-radius: 12px; padding: 14px 14px 14px 18px; max-width: 640px; }
+.install code { flex: 1; font-size: 16px; overflow-x: auto; white-space: nowrap; }
+.install code::before { content: "$ "; color: var(--muted); }
+button.copy { font: 600 14px var(--sans); border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer;
+  background: var(--accent); color: var(--accent-fg); }
+.note { font-size: 14px; color: var(--muted); margin: 12px 0 0; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
+  font-size: 14.5px; line-height: 1.7; overflow-x: auto; margin: 26px 0 0; max-width: 640px; }
+pre .c { color: var(--muted); }
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+h2 { font-size: clamp(26px, 4vw, 34px); line-height: 1.15; letter-spacing: -0.8px; margin: 0 0 14px; }
+.sub { color: var(--muted); max-width: 700px; margin: 0 0 34px; }
+.rows { display: grid; gap: 26px; }
+.row h3 { font-size: 17px; margin: 0 0 10px; font-weight: 600; }
+.row h3 b { color: var(--accent); font-weight: 700; margin-left: 6px; }
+.bar { display: grid; grid-template-columns: 74px 1fr 64px; align-items: center; gap: 12px; font-size: 14px; margin: 5px 0; }
+.bar .who { color: var(--muted); }
+.bar .track { height: 12px; }
+.bar .fill { height: 100%; min-width: 4px; border-radius: 6px; background: var(--bar); }
+.bar.plain .fill { background: var(--accent); }
+.bar.plain .who, .bar.plain .t { color: var(--fg); font-weight: 650; }
+.bar .t { text-align: right; font-family: var(--mono); color: var(--muted); }
+.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 22px 20px; }
+.card h3 { margin: 0 0 8px; font-size: 18px; }
+.card p { margin: 0; color: var(--muted); font-size: 15.5px; }
+.card code { font-size: 13.5px; color: var(--fg); }
+ul.why { padding-left: 20px; margin: 0; max-width: 720px; }
+ul.why li { margin: 0 0 12px; }
+footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--muted); font-size: 15px; }
+@media (max-width: 640px) {
+  body { font-size: 16px; }
+  .hero { padding: 36px 0 28px; }
+  .lead { font-size: 18px; }
+  .cards { grid-template-columns: 1fr; }
+  .bar { grid-template-columns: 64px 1fr 56px; gap: 8px; }
+  nav a { margin-left: 14px; }
+  .install code { font-size: 14px; white-space: normal; word-break: break-all; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="mark" href="/">plain<span>.</span></a>
+    <nav><a href="#speed">Benchmarks</a><a href="https://github.com/backmeupplz/plain#readme">Docs</a><a href="https://github.com/backmeupplz/plain">GitHub</a></nav>
+  </header>
+
+  <div class="hero">
+    <h1>Compile, test and deploy Solidity in <em>seconds</em>, not minutes</h1>
+    <p class="lead">plain is one small binary that compiles, tests, deploys and verifies your contracts. It runs your Foundry project as it is, needs nothing else installed, and turns the minute-long edit-and-test loop into about a second.</p>
+    <div class="install"><code>curl -fsSL https://getplain.sh/install | sh</code><button class="copy" data-copy="curl -fsSL https://getplain.sh/install | sh" aria-label="Copy the install command">Copy</button></div>
+    <p class="note">The installer works on macOS and Linux. With Rust installed, <code>cargo install --git https://github.com/backmeupplz/plain</code> builds it from source.</p>
+<pre><span class="c"># a Counter contract and its test, in an empty folder</span>
+plain init
+<span class="c"># compile and run every test</span>
+plain test
+<span class="c"># simulate, send, then verify on Sourcify, Etherscan and Blockscout</span>
+plain deploy Counter --network base-sepolia --broadcast</pre>
+  </div>
+
+  <section id="speed">
+    <h2>The loop you run all day, measured on real projects</h2>
+    <p class="sub">These are median wall times on an M1 Max for veydrift, a game with 300 tests in a 7,500-line via-IR test file, and for Uniswap v4-core. Foundry ran the same commands on the same machine. Hardhat 3 ran them too, and its times are in the full tables.</p>
+    <div class="rows">
+      <div class="row">
+        <h3>Edit one test, then run the whole suite <b>56× faster</b></h3>
+        <div class="bar"><span class="who">Foundry</span><span class="track"><span class="fill" style="display:block;width:100%"></span></span><span class="t">56 s</span></div>
+        <div class="bar plain"><span class="who">plain</span><span class="track"><span class="fill" style="display:block;width:1.8%"></span></span><span class="t">0.99 s</span></div>
+      </div>
+      <div class="row">
+        <h3>Edit a contract function, then run the whole suite <b>49× faster</b></h3>
+        <div class="bar"><span class="who">Foundry</span><span class="track"><span class="fill" style="display:block;width:100%"></span></span><span class="t">103 s</span></div>
+        <div class="bar plain"><span class="who">plain</span><span class="track"><span class="fill" style="display:block;width:2%"></span></span><span class="t">2.1 s</span></div>
+      </div>
+      <div class="row">
+        <h3>Build everything from scratch <b>8× faster</b></h3>
+        <div class="bar"><span class="who">Foundry</span><span class="track"><span class="fill" style="display:block;width:100%"></span></span><span class="t">116 s</span></div>
+        <div class="bar plain"><span class="who">plain</span><span class="track"><span class="fill" style="display:block;width:12.9%"></span></span><span class="t">15 s</span></div>
+      </div>
+      <div class="row">
+        <h3>Rerun v4-core's 598 tests when nothing has changed <b>7.6× faster</b></h3>
+        <div class="bar"><span class="who">Foundry</span><span class="track"><span class="fill" style="display:block;width:100%"></span></span><span class="t">4.7 s</span></div>
+        <div class="bar plain"><span class="who">plain</span><span class="track"><span class="fill" style="display:block;width:13%"></span></span><span class="t">0.61 s</span></div>
+      </div>
+      <div class="row">
+        <h3>Deploy 40 transactions over an RPC 80 ms away <b>4× faster</b></h3>
+        <div class="bar"><span class="who">Foundry</span><span class="track"><span class="fill" style="display:block;width:100%"></span></span><span class="t">8.0 s</span></div>
+        <div class="bar plain"><span class="who">plain</span><span class="track"><span class="fill" style="display:block;width:25%"></span></span><span class="t">2.0 s</span></div>
+      </div>
+    </div>
+    <p class="note">Each edit run makes a new change, each cold build starts with nothing cached anywhere, and what plain deploys is byte-for-byte what solc produces. The <a href="https://github.com/backmeupplz/plain#benchmarks">full tables</a> also cover no-op builds, fresh clones and solmate.</p>
+  </section>
+
+  <section>
+    <h2>Nothing to set up before your first test</h2>
+    <p class="sub">plain replaces a toolchain with a single command, so a new project or a fresh clone is ready as soon as the binary is on your PATH.</p>
+    <div class="cards">
+      <div class="card"><h3>One binary and nothing around it</h3><p>plain is a single 7 MB executable. You don't need Node, npm or git submodules, and forge-std is built in, so <code>import {Test} from "forge-std/Test.sol"</code> works in an empty folder.</p></div>
+      <div class="card"><h3>Your Foundry project already works</h3><p>plain reads <code>foundry.toml</code>, remappings and <code>lib/</code> the way they are, picks the solc version your pragmas ask for, and downloads it the first time you build.</p></div>
+      <div class="card"><h3>Deploys that verify themselves</h3><p>plain deploy runs your script against a fork first, sends the transactions only when every one of them would succeed, and then verifies each new contract on Sourcify, Blockscout and, with your API key, Etherscan.</p></div>
+      <div class="card"><h3>Every chain by its name</h3><p>Pass <code>--network base</code>, <code>linea</code> or a chain id, and plain finds a working public RPC on chainlist.org, while your own RPC URLs still take priority.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Why it's fast</h2>
+    <ul class="why">
+      <li>Test files no longer recompile the contracts they deploy, so editing a contract recompiles that contract and leaves the tests alone.</li>
+      <li>Editing one test recompiles just that test, and suites whose code and inputs haven't changed reuse their last results instead of running again.</li>
+      <li>Big test files compile in parallel, and solc jobs are scheduled from the timings of your previous build, with a cache that every clone and worktree shares.</li>
+      <li>Deploys batch their network round trips, so a 40-transaction deploy makes 13 requests to the RPC where sending and checking one at a time would take 77.</li>
+    </ul>
+  </section>
+
+  <footer>plain is MIT licensed. The source, the docs and the full benchmarks are on <a href="https://github.com/backmeupplz/plain">GitHub</a>.</footer>
+</div>
+<script>
+document.querySelectorAll("button.copy").forEach(function (b) {
+  b.addEventListener("click", function () {
+    navigator.clipboard.writeText(b.dataset.copy).then(function () {
+      b.textContent = "Copied";
+      setTimeout(function () { b.textContent = "Copy"; }, 1500);
+    }).catch(function () {});
+  });
+});
+</script>
+</body>
+</html>

@@ -1,12 +1,22 @@
 # plain
 
-Compile, test and deploy EVM smart contracts. One ~6 MB binary with no config, no `npm install` and no `forge install`.
+Compile, test, deploy and verify EVM smart contracts with one ~7 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
 
 ```sh
+curl -fsSL https://getplain.sh/install | sh   # macOS and Linux
 plain init                 # src/Counter.sol + test/Counter.t.sol
 plain test                 # compile + run every test
 plain deploy Counter --network base-sepolia --broadcast   # deploy, then verify on explorers
 ```
+
+Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`.
+
+| On real projects ([details](#benchmarks)) | Foundry | Hardhat 3 | plain |
+|---|---|---|---|
+| Edit a test, rerun the suite (300 tests, via-IR) | 56 s | 61 s | **0.99 s** |
+| Edit a contract, rerun the suite | 103 s | 109 s | **2.1 s** |
+| Build from scratch | 116 s | 115 s | **15 s** |
+| Deploy 40 transactions over an RPC 80 ms away | 8.0 s | — | **2.0 s** |
 
 - **Compile:** finds `src/` (or `contracts/`), `test/` and `script/`, picks and downloads the right `solc` from your pragmas (it reuses Foundry's solc cache if present), and compiles in parallel jobs. Results are cached by content hash, per project and in `~/.plain/cache`, which every checkout shares (git worktrees, fresh clones).
 - **Test:** runs Solidity tests in the forge-std style (`*.t.sol`, `setUp`, `test*`, fuzzing, invariants, cheatcodes) on revm, in parallel. It also runs `test/**/*.test.ts` files against a fresh in-process chain per file. A suite whose compiled code and inputs haven't changed reuses its last results.
@@ -183,7 +193,7 @@ Deploying veydrift's `script/Deploy.s.sol` (40 transactions, 74M gas) to an anvi
 | warm (built) | 4.1s / **1.9s** | 8.0s / **2.0s** |
 | cold (nothing compiled) | 30s / **5.8s** | 35s / **6.1s** |
 
-⁴ Every answer delayed 80 ms (`latency-proxy.py` in the benchmark repo), like a public RPC on another continent. Waiting for the block is about 1 s of plain's time. The anvil has a 300M block gas limit: at anvil's default 30M it drops queued transactions that don't fit the next block, which plain resends (11 s) and forge waits on forever (`--slow`: 69 s).
+⁴ Every answer delayed 80 ms by a local proxy, like a public RPC on another continent. Waiting for the block is about 1 s of plain's time. The anvil has a 300M block gas limit: at anvil's default 30M it drops queued transactions that don't fit the next block, which plain resends (11 s) and forge waits on forever (`--slow`: 69 s).
 
 Cold builds also peak at about 0.7 GB of memory under plain (veydrift, v4-core), against 3.2 to 4.6 GB for Foundry and Hardhat.
 
