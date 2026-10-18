@@ -11,7 +11,7 @@ plain deploy Counter --network base-sepolia --account deployer --broadcast   # d
 plain                      # or do all of it from a menu
 ```
 
-Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`. It also installs with `mise use -g github:backmeupplz/plain` or `nix run github:backmeupplz/plain`, and releases after 0.3.1 carry a `.deb` and an `.rpm`. The [docs](https://getplain.org/docs/) walk through new and existing projects, testing and deploying.
+plain is also on Homebrew (`brew install backmeupplz/tap/plain`), mise, apt, dnf, Nix and crates.io, as the [install guide](https://getplain.org/docs/#install) shows, and `cargo install --git https://github.com/backmeupplz/plain` builds it from source. The [docs](https://getplain.org/docs/) walk through new and existing projects, testing and deploying.
 
 | On real projects ([details](#benchmarks)) | Foundry | Hardhat 3 | plain |
 |---|---|---|---|

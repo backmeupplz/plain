@@ -18,24 +18,44 @@ description: "How to install plain and go from an empty folder to a verified, up
 curl -fsSL https://getplain.org/install | sh
 ```
 
-The installer puts the latest release in `~/.plain/bin` and adds that folder to your shell's `PATH`, so `plain` works in any new terminal. Set `PLAIN_DIR` to install it somewhere else. Prebuilt binaries cover macOS on Apple silicon and Intel, and Linux on x86_64 with glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9, Amazon Linux 2023 and later).
+The installer puts the latest release in `~/.plain/bin` and adds that folder to your shell's `PATH`, so `plain` works in any new terminal. Set `PLAIN_DIR` to install it somewhere else. It checks the download against the release's `SHA256SUMS` before unpacking anything. Prebuilt binaries cover macOS on Apple silicon and Intel, and Linux on x86_64 with glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9, Amazon Linux 2023 and later).
 
-On any other platform, or to build from source with Rust:
+The same binaries come through package managers too, if you'd rather update plain along with everything else:
+
+| Package manager | Install |
+|---|---|
+| Homebrew | `brew install backmeupplz/tap/plain` |
+| mise | `mise use -g github:backmeupplz/plain`, with `@<version>` on release day because mise hides releases younger than a day |
+| Nix | `nix profile install github:backmeupplz/plain` on Apple silicon Macs and Linux, where it builds from source |
+| Cargo | `cargo binstall plain-evm` downloads the release binary, and `cargo install plain-evm` builds it |
+
+On Debian and Ubuntu, add the signed apt repository at pkg.getplain.org:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/plain.asc https://pkg.getplain.org/plain.asc
+sudo curl -fsSLo /etc/apt/sources.list.d/plain.sources https://pkg.getplain.org/plain.sources
+sudo apt update && sudo apt install plain
+```
+
+On Fedora, RHEL and Amazon Linux it's a dnf repository, and openSUSE takes the same file with `zypper addrepo`:
+
+```sh
+sudo curl -fsSLo /etc/yum.repos.d/plain.repo https://pkg.getplain.org/plain.repo
+sudo dnf install plain
+```
+
+Each release also attaches the `.deb` and `.rpm` themselves for installing without the repository (`sudo apt install ./plain_<version>_amd64.deb` or `sudo dnf install ./plain-<version>-1.x86_64.rpm`), and every archive and package (each file listed in `SHA256SUMS`) comes with a build provenance attestation that `gh attestation verify <file> -R backmeupplz/plain` checks.
+
+On any other platform, such as Linux on arm64, build plain from source with Rust, either from crates.io with `cargo install plain-evm` or from the repository:
 
 ```sh
 cargo install --git https://github.com/backmeupplz/plain
 ```
 
-The same binaries install through [mise](https://mise.jdx.dev), which checks each download against the release, and the repository is a Nix flake that builds from source on Apple silicon Macs and x86_64 Linux:
+On arm64 Linux, solc itself has official builds only from 0.8.31 on, so contracts there need a pragma that allows 0.8.31 or newer.
 
-```sh
-mise use -g github:backmeupplz/plain   # add @<version> on release day: mise hides releases younger than a day
-nix run github:backmeupplz/plain -- test
-```
-
-Releases after 0.3.1 also attach a `.deb` and an `.rpm` for x86_64 Linux (`sudo apt install ./plain_<version>_amd64.deb` or `sudo dnf install ./plain-<version>-1.x86_64.rpm`), and every archive and package (each file listed in `SHA256SUMS`) comes with a build provenance attestation you can check with `gh attestation verify <file> -R backmeupplz/plain`.
-
-To update, run the installer again. To uninstall, delete `~/.plain` and the `# plain` lines the installer added to your shell profile. That folder holds the binary, its caches and your deployer accounts, so move the accounts somewhere safe first.
+To update, run the installer again or upgrade through your package manager. To uninstall, delete `~/.plain` and the `# plain` lines the installer added to your shell profile, or remove the package. That folder holds the installer's binary, plain's caches and your deployer accounts, so move the accounts somewhere safe first.
 
 ## The loop
 
@@ -61,7 +81,7 @@ The sections below go through each step. If you'd rather not remember any of it,
 
 ```
 $ plain
-plain. 0.3.1 · ~/code/my-project
+plain. 0.3.2 · ~/code/my-project
 Contracts live in src/ and tests in test/; each step shows the command it runs.
 ? What next?
 ❯ Build     compile the contracts
