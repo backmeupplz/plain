@@ -50,6 +50,8 @@ pub fn run(root: &Path, files: &[PathBuf], verbose: bool, fork: Option<String>) 
             let out = cmd
                 .arg(f)
                 .current_dir(root)
+                // the project's own code: it gets the project's .env, as it would under dotenv
+                .envs(crate::project::dotenv())
                 .env("PLAIN_RPC_URL", format!("http://127.0.0.1:{port}"))
                 .env("PLAIN_ARTIFACTS", root.join(".plain/out"))
                 .output();

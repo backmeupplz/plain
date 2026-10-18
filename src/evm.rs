@@ -107,6 +107,20 @@ impl Fork {
         self.block.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The forked block's environment (chain id, number, timestamp, fees), as tests on a fork see it.
+    pub fn env(&self) -> Result<Env, DbErr> {
+        let r = crate::rpc::batch(&self.url, &[("eth_chainId", serde_json::json!([])), ("eth_getBlockByNumber", serde_json::json!([format!("0x{:x}", self.block()), false]))]).map_err(DbErr)?;
+        let n = |v: &serde_json::Value| U256::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or_default();
+        let b = &r[1];
+        let mut env = Env::new(n(&r[0]).to());
+        env.block.number = n(&b["number"]);
+        env.block.timestamp = n(&b["timestamp"]);
+        env.block.basefee = n(&b["baseFeePerGas"]).to();
+        env.block.beneficiary = b["miner"].as_str().and_then(|a| a.parse().ok()).unwrap_or_default();
+        env.block.prevrandao = b["mixHash"].as_str().and_then(|h| h.parse().ok()).or(Some(B256::ZERO));
+        Ok(env)
+    }
+
     /// Calls with the fork's block appended to each call's params.
     fn q(&self, calls: &[(&str, serde_json::Value)]) -> Result<Vec<serde_json::Value>, DbErr> {
         use std::sync::atomic::Ordering::Relaxed;
@@ -197,6 +211,10 @@ pub struct Env {
     pub block: BlockEnv,
     pub chain_id: u64,
     pub gas_price: u128,
+    /// the EVM rules: the evm_version the code was compiled for
+    pub spec: SpecId,
+    /// enforce the contract size limits (EIP-170, EIP-3860), as a chain does: deploys, not tests
+    pub strict: bool,
 }
 
 impl Env {
@@ -207,14 +225,36 @@ impl Env {
         block.gas_limit = GAS_LIMIT;
         block.basefee = 0;
         block.prevrandao = Some(B256::ZERO);
-        Env { block, chain_id, gas_price: 0 }
+        Env { block, chain_id, gas_price: 0, spec: SpecId::OSAKA, strict: false }
+    }
+}
+
+/// solc's name for an EVM version to revm's.
+pub fn spec(evm_version: &str) -> SpecId {
+    match evm_version {
+        "homestead" => SpecId::HOMESTEAD,
+        "tangerineWhistle" => SpecId::TANGERINE,
+        "spuriousDragon" => SpecId::SPURIOUS_DRAGON,
+        "byzantium" => SpecId::BYZANTIUM,
+        "constantinople" | "petersburg" => SpecId::PETERSBURG,
+        "istanbul" => SpecId::ISTANBUL,
+        "berlin" => SpecId::BERLIN,
+        "london" => SpecId::LONDON,
+        "paris" => SpecId::MERGE,
+        "shanghai" => SpecId::SHANGHAI,
+        "cancun" => SpecId::CANCUN,
+        "prague" => SpecId::PRAGUE,
+        _ => SpecId::OSAKA,
     }
 }
 
 pub struct Exec {
     pub ok: bool,
     pub output: Bytes,
+    /// gas used, as a receipt reports it (after refunds)
     pub gas: u64,
+    /// gas spent before refunds: what the transaction needs to be given
+    pub spent: u64,
     pub logs: Vec<Log>,
     pub address: Option<Address>,
 }
@@ -241,15 +281,17 @@ pub struct Vm<'c> {
 
 impl<'c> Vm<'c> {
     pub fn new(db: Db, env: &Env, cheats: &'c mut Cheats) -> Vm<'c> {
-        let mut ctx: Ctx = Context::new(db, SpecId::OSAKA);
+        let mut ctx: Ctx = Context::new(db, env.spec);
         ctx.block = env.block.clone();
         ctx.cfg.chain_id = env.chain_id;
         ctx.cfg.disable_nonce_check = true;
         ctx.cfg.disable_block_gas_limit = true;
         ctx.cfg.disable_base_fee = true;
         ctx.cfg.tx_gas_limit_cap = Some(u64::MAX);
-        ctx.cfg.limit_contract_code_size = Some(usize::MAX);
-        ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
+        if !env.strict {
+            ctx.cfg.limit_contract_code_size = Some(usize::MAX);
+            ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
+        }
         ctx.cfg.disable_eip3607 = true; // pranked/broadcast senders may be contracts
         Vm { evm: ctx.build_mainnet_with_inspector(cheats), gas_price: env.gas_price }
     }
@@ -276,13 +318,13 @@ impl<'c> Vm<'c> {
                     Output::Call(o) => (o, None),
                     Output::Create(o, a) => (o, a),
                 };
-                Exec { ok: true, output, gas: gas.tx_gas_used(), logs, address }
+                Exec { ok: true, output, gas: gas.tx_gas_used(), spent: gas.total_gas_spent(), logs, address }
             }
-            Ok(ExecutionResult::Revert { gas, logs, output }) => Exec { ok: false, output, gas: gas.tx_gas_used(), logs, address: None },
+            Ok(ExecutionResult::Revert { gas, logs, output }) => Exec { ok: false, output, gas: gas.tx_gas_used(), spent: gas.total_gas_spent(), logs, address: None },
             Ok(ExecutionResult::Halt { reason, gas, logs }) => {
-                Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {reason:?}")), gas: gas.tx_gas_used(), logs, address: None }
+                Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {reason:?}")), gas: gas.tx_gas_used(), spent: gas.total_gas_spent(), logs, address: None }
             }
-            Err(e) => Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {e}")), gas: 0, logs: vec![], address: None },
+            Err(e) => Exec { ok: false, output: decode::revert_msg(&format!("EvmError: {e}")), gas: 0, spent: 0, logs: vec![], address: None },
         }
     }
 
@@ -319,6 +361,8 @@ struct ExpectRevert {
     data: Option<Vec<u8>>,
     partial: bool,
     depth: usize,
+    /// the contract that has to revert, when given
+    reverter: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -362,6 +406,8 @@ struct Broadcast {
 pub struct Cheats {
     pub artifacts: Arc<Vec<Artifact>>,
     pub root: std::path::PathBuf,
+    /// what tests may reach outside the EVM (ffi, fs_permissions)
+    pub access: Arc<crate::project::Access>,
     pub console: Vec<String>,
     pub labels: HashMap<Address, String>,
     pub broadcasts: Vec<BroadcastTx>,
@@ -377,14 +423,22 @@ pub struct Cheats {
     recorded: Option<Vec<Log>>,
     snapshots: Vec<Option<(revm::state::EvmState, BlockEnv)>>,
     broadcast: Option<Broadcast>,
-    mocks: Vec<(Address, Vec<u8>, Vec<u8>, bool)>,
-    expected_calls: Vec<(Address, Vec<u8>, usize)>,
+    /// (callee, value if given, calldata prefix, return data, reverts)
+    mocks: Vec<(Address, Option<U256>, Vec<u8>, Vec<u8>, bool)>,
+    /// (callee, value if given, calldata prefix, calls seen)
+    expected_calls: Vec<(Address, Option<U256>, Vec<u8>, usize)>,
     last_call_gas: HashMap<usize, u64>,
     gas_snapshot: Option<u64>,
     pub allow_internal_revert: bool,
     cheat_gas: u64,
     /// address -> contract name for contracts created while `track_creates` is on
     pub names: HashMap<Address, String>,
+    /// address -> artifact ("path:Name"), where that's certain
+    pub ids: HashMap<Address, String>,
+    /// the frame a revert came from, and its data: deeper frames bubble the same data up
+    revert_src: Option<(Address, Bytes)>,
+    /// the last frame that failed without reverting (a limit or an invalid operation), to explain a bare revert
+    pub last_halt: Option<InstructionResult>,
     pub track_creates: bool,
     /// deploys: take where contracts land on the fork as empty (`Fork::presume`); tests must see the chain as is
     pub presume_creates: bool,
@@ -416,8 +470,11 @@ pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path) -> Option<
     let (kind, name) = key.split_once(':')?;
     Some(match kind {
         "art" => arts.iter().find(|a| a.shard == 0 && format!("{}:{}", a.file, a.name) == name).map_or("missing".into(), art_hash),
-        "file" => std::fs::read(root.join(name)).map_or("missing".into(), |b| keccak256(b).to_string()),
-        "env" => std::env::var(name).unwrap_or_else(|_| "\0unset".into()),
+        "file" => match root.join(name) {
+            p if p.is_dir() => "dir".into(),
+            p => std::fs::read(p).map_or("missing".into(), |b| keccak256(b).to_string()),
+        },
+        "env" => lookup(name).unwrap_or_else(|| "\0unset".into()),
         "root" => root.to_string_lossy().into(),
         _ => return None,
     })
@@ -538,23 +595,37 @@ pub fn link_code(code: &str, links: &serde_json::Value, libs: &HashMap<String, A
     hex::decode(&code).map_err(|e| format!("bad bytecode: {e}"))
 }
 
-fn find_artifact<'a>(arts: &'a [Artifact], what: &str) -> Option<&'a Artifact> {
+/// The artifact `what` ("path:Name", "File.sol:Name", "File.sol" or "Name") names: the exact path first, then a
+/// path suffix, then the file name. Two matches at the same level are an error, never a guess.
+fn find_artifact<'a>(arts: &'a [Artifact], what: &str) -> Result<&'a Artifact, String> {
     let (file, name) = match what.split_once(':') {
         Some((f, n)) => (f, Some(n)),
         None if what.ends_with(".sol") => (what, None),
         None => ("", Some(what)),
     };
     let fname = file.rsplit('/').next().unwrap_or(file);
-    arts.iter().find(|a| {
-        (file.is_empty() || a.file == file || a.file.ends_with(&format!("/{file}")) || a.file.rsplit('/').next() == Some(fname))
-            && name.is_none_or(|n| a.name == n)
-            && (name.is_some() || Some(a.name.as_str()) == fname.strip_suffix(".sol"))
-            && !a.bytecode.is_empty()
-    })
+    let named: Vec<&Artifact> = arts.iter().filter(|a| a.shard == 0 && !a.bytecode.is_empty() && name.map_or(Some(a.name.as_str()) == fname.strip_suffix(".sol"), |n| a.name == n)).collect();
+    let tiers: [&dyn Fn(&Artifact) -> bool; 3] = [&|a| file.is_empty() || a.file == file, &|a| a.file.ends_with(&format!("/{file}")), &|a| a.file.rsplit('/').next() == Some(fname)];
+    for tier in tiers {
+        match named.iter().filter(|a| tier(a)).collect::<Vec<_>>().as_slice() {
+            [] => continue,
+            [a] => return Ok(a),
+            many => return Err(format!("{what:?} matches several contracts: {}", many.iter().map(|a| format!("{}:{}", a.file, a.name)).collect::<Vec<_>>().join(", "))),
+        }
+    }
+    Err(format!("no artifact for {what:?} (only project src/test/script contracts are compiled to bytecode)"))
+}
+
+/// What tests set with vm.setEnv: process-wide like forge's, without changing the real environment, which other
+/// threads read at the same time.
+static SET_ENV: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
+
+fn lookup(k: &str) -> Option<String> {
+    SET_ENV.lock().unwrap().get(k).cloned().or_else(|| crate::project::var(k))
 }
 
 fn env(k: &str) -> Result<String, String> {
-    std::env::var(k).map_err(|_| format!("environment variable {k:?} not found"))
+    lookup(k).ok_or_else(|| format!("environment variable {k:?} not found"))
 }
 
 /// Parse a string the way forge's env/parse cheatcodes do, according to the target type.
@@ -607,8 +678,32 @@ fn enc(v: DynSolValue) -> Vec<u8> {
 }
 
 impl Cheats {
-    pub fn new(artifacts: Arc<Vec<Artifact>>, root: std::path::PathBuf) -> Cheats {
-        Cheats { artifacts, root, ..Default::default() }
+    pub fn new(artifacts: Arc<Vec<Artifact>>, root: std::path::PathBuf, access: Arc<crate::project::Access>) -> Cheats {
+        Cheats { artifacts, root, access, ..Default::default() }
+    }
+
+    /// The next top-level call comes from `who` (msg.sender and tx.origin), though the transaction stays the original
+    /// sender's: how a script's run() sees its deployer without spending the deployer's nonce.
+    pub fn act_as(&mut self, who: Address) {
+        self.prank = Some(Prank { sender: who, origin: Some(who), depth: 0, single: true });
+    }
+
+    /// Where a file cheatcode may go: inside a path fs_permissions opens for reading (or writing), with `..` and
+    /// symlinks resolved. Nothing is open unless configured, like forge.
+    fn fs(&self, path: &str, write: bool) -> Result<std::path::PathBuf, String> {
+        let p = crate::project::resolve(&self.root.join(path));
+        let open = self.access.fs.iter().any(|(dir, r, w)| (if write { *w } else { *r }) && p.starts_with(dir));
+        if write && self.access.protected.iter().any(|x| p.starts_with(x)) {
+            return Err(format!("{path:?} can't be written from a test or script (plain's state, git's or the config)"));
+        }
+        match open {
+            true => Ok(p),
+            false => Err(format!(
+                "{path:?} isn't open for {} from tests and scripts; allow it in foundry.toml or plain.toml, e.g. fs_permissions = [{{ access = \"{}\", path = \"./\" }}]",
+                if write { "writing" } else { "reading" },
+                if write { "read-write" } else { "read" }
+            )),
+        }
     }
 
     pub fn read(&self, key: String) {
@@ -636,12 +731,16 @@ impl Cheats {
         if self.emits.drain(..).any(|e| !e.found) {
             problems.push("expected an emit that was never made".into());
         }
-        for (addr, data, n) in self.expected_calls.drain(..) {
+        for (addr, value, data, n) in self.expected_calls.drain(..) {
             if n == 0 {
-                problems.push(format!("expected call to {addr} with data 0x{} was not made", hex::encode(data)));
+                let value = value.map(|v| format!(" and value {v}")).unwrap_or_default();
+                problems.push(format!("expected call to {addr} with data 0x{}{value} was not made", hex::encode(data)));
             }
         }
-        self.prank = None;
+        // a vm.prank that no call used ends with its test; a startPrank in setUp lasts into the tests, as in forge
+        if self.prank.as_ref().is_some_and(|p| p.single) {
+            self.prank = None;
+        }
         (!problems.is_empty()).then(|| problems.join("; "))
     }
 
@@ -796,9 +895,9 @@ impl Cheats {
             }
             "expectRevert()" | "expectRevert(bytes4)" | "expectRevert(bytes)" | "expectRevert(address)" | "expectRevert(bytes4,address)"
             | "expectRevert(bytes,address)" | "expectPartialRevert(bytes4)" | "expectPartialRevert(bytes4,address)" => {
-                // ponytail: the optional reverter address is accepted but not checked
                 let data = args.iter().find(|v| !matches!(v, DynSolValue::Address(_))).map(by);
-                self.expect_revert = Some(ExpectRevert { data, partial: s.name == "expectPartialRevert", depth });
+                let reverter = args.iter().find_map(|v| v.as_address());
+                self.expect_revert = Some(ExpectRevert { data, partial: s.name == "expectPartialRevert", depth, reverter });
                 ok
             }
             "expectEmit()" | "expectEmit(address)" | "expectEmit(bool,bool,bool,bool)" | "expectEmit(bool,bool,bool,bool,address)" => {
@@ -856,12 +955,11 @@ impl Cheats {
             }
             "envExists(string)" => {
                 self.read(format!("env:{}", st(&args[0])));
-                Ok(enc(DynSolValue::Bool(std::env::var(st(&args[0])).is_ok())))
+                Ok(enc(DynSolValue::Bool(lookup(&st(&args[0])).is_some())))
             }
             "setEnv(string,string)" => {
                 self.impure();
-                // SAFETY-ish: tests run in threads; forge has the same process-global semantics
-                unsafe { std::env::set_var(st(&args[0]), st(&args[1])) };
+                SET_ENV.lock().unwrap().insert(st(&args[0]), st(&args[1]));
                 ok
             }
             sg if sg.starts_with("env") => {
@@ -879,10 +977,10 @@ impl Cheats {
                         _ => DynSolType::String,
                     },
                 };
-                match (std::env::var(&key), args.get(1)) {
-                    (Ok(v), _) => Ok(enc(parse_as(&ty, &v)?)),
-                    (Err(_), Some(default)) => Ok(enc(default.clone())),
-                    (Err(_), None) => env(&key).map(|_| vec![]),
+                match (lookup(&key), args.get(1)) {
+                    (Some(v), _) => Ok(enc(parse_as(&ty, &v)?)),
+                    (None, Some(default)) => Ok(enc(default.clone())),
+                    (None, None) => env(&key).map(|_| vec![]),
                 }
             }
             sg if sg.starts_with("parse") => {
@@ -899,7 +997,7 @@ impl Cheats {
             sg if sg.starts_with("toString(") => Ok(enc(DynSolValue::String(decode::display(&args[0])))),
             "getCode(string)" | "getDeployedCode(string)" => {
                 let what = st(&args[0]);
-                let art = find_artifact(&self.artifacts, &what).ok_or(format!("no artifact for {what:?} (only project src/test/script contracts are compiled to bytecode)"))?;
+                let art = find_artifact(&self.artifacts, &what)?;
                 self.read(format!("art:{}:{}", art.file, art.name));
                 if s.name == "getCode" {
                     // tests deploy the same contracts run after run: link and decode each once per suite
@@ -917,11 +1015,11 @@ impl Cheats {
                 Ok(enc(DynSolValue::Bytes(hex::decode(&art.deployed).unwrap_or_default())))
             }
             "mockCall(address,bytes,bytes)" | "mockCallRevert(address,bytes,bytes)" => {
-                self.mocks.push((a(&args[0]), by(&args[1]), by(&args[2]), s.name == "mockCallRevert"));
+                self.mocks.push((a(&args[0]), None, by(&args[1]), by(&args[2]), s.name == "mockCallRevert"));
                 ok
             }
             "mockCall(address,uint256,bytes,bytes)" => {
-                self.mocks.push((a(&args[0]), by(&args[2]), by(&args[3]), false));
+                self.mocks.push((a(&args[0]), Some(u(&args[1])), by(&args[2]), by(&args[3]), false));
                 ok
             }
             "clearMockedCalls()" => {
@@ -929,7 +1027,8 @@ impl Cheats {
                 ok
             }
             "expectCall(address,bytes)" | "expectCall(address,uint256,bytes)" => {
-                self.expected_calls.push((a(&args[0]), by(args.last().unwrap()), 0));
+                let value = (args.len() == 3).then(|| u(&args[1]));
+                self.expected_calls.push((a(&args[0]), value, by(args.last().unwrap()), 0));
                 ok
             }
             "pauseGasMetering()" | "resumeGasMetering()" | "allowCheatcodes(address)" | "makePersistent(address)" => ok,
@@ -961,19 +1060,20 @@ impl Cheats {
                 Ok(enc(DynSolValue::String(self.root.to_string_lossy().into())))
             }
             "readFile(string)" => {
+                let p = self.fs(&st(&args[0]), false)?;
                 self.read(format!("file:{}", st(&args[0])));
-                let p = self.root.join(st(&args[0]));
                 Ok(enc(DynSolValue::String(std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)))
             }
             "writeFile(string,string)" => {
+                let p = self.fs(&st(&args[0]), true)?;
                 self.impure();
-                let p = self.root.join(st(&args[0]));
                 std::fs::write(&p, st(&args[1])).map_err(|e| format!("{}: {e}", p.display()))?;
                 ok
             }
             "exists(string)" => {
+                let p = self.fs(&st(&args[0]), false)?;
                 self.read(format!("file:{}", st(&args[0])));
-                Ok(enc(DynSolValue::Bool(self.root.join(st(&args[0])).exists())))
+                Ok(enc(DynSolValue::Bool(p.exists())))
             }
             "unixTime()" => {
                 self.impure();
@@ -1007,11 +1107,17 @@ impl Cheats {
             }
             sg if sg.starts_with("snapshotValue") => ok,
             "ffi(string[])" => {
+                if !self.access.ffi {
+                    return Err("vm.ffi runs commands on this machine, so it's off unless the project enables it: ffi = true in foundry.toml or plain.toml".into());
+                }
                 self.impure();
                 let argv: Vec<String> = args[0].as_array().unwrap_or_default().iter().map(st).collect();
                 let out = std::process::Command::new(argv.first().ok_or("ffi: empty command")?)
                     .args(&argv[1..])
                     .current_dir(&self.root)
+                    // the environment forge would give it: .env and vm.setEnv included
+                    .envs(crate::project::dotenv())
+                    .envs(SET_ENV.lock().unwrap().clone())
                     .output()
                     .map_err(|e| format!("ffi {}: {e}", argv[0]))?;
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1019,8 +1125,8 @@ impl Cheats {
                 Ok(enc(DynSolValue::Bytes(bytes)))
             }
             "readFileBinary(string)" => {
+                let p = self.fs(&st(&args[0]), false)?;
                 self.read(format!("file:{}", st(&args[0])));
-                let p = self.root.join(st(&args[0]));
                 Ok(enc(DynSolValue::Bytes(std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)))
             }
             other => Err(format!("plain: unsupported cheatcode vm.{other}")),
@@ -1030,7 +1136,8 @@ impl Cheats {
 
 fn matches_revert(exp: &ExpectRevert, out: &[u8]) -> bool {
     let Some(d) = &exp.data else { return true };
-    if out == d.as_slice() || ((exp.partial || d.len() == 4) && out.starts_with(d)) {
+    // a bare selector matches only an error without arguments; expectPartialRevert matches any (forge 1.0)
+    if out == d.as_slice() || (exp.partial && out.starts_with(d)) {
         return true;
     }
     // expectRevert("message") matches Error(string)
@@ -1045,9 +1152,16 @@ impl Cheats {
         }
         self.revert_armed = None;
         let exp = self.expect_revert.take().unwrap();
-        if result.result.is_ok() {
+        // failures before any code ran (no balance for the value, a CREATE2 address taken, too deep) aren't reverts
+        let never_ran = matches!(result.result, InstructionResult::OutOfFunds | InstructionResult::CreateCollision | InstructionResult::CallTooDeep | InstructionResult::NonceOverflow);
+        let from = self.revert_src.take().map(|(a, _)| a);
+        if result.result.is_ok() || never_ran {
+            let why = if never_ran { format!("call did not revert as expected (it failed before running: {:?})", result.result) } else { "call did not revert as expected".into() };
             result.result = InstructionResult::Revert;
-            result.output = decode::revert_msg("call did not revert as expected");
+            result.output = decode::revert_msg(&why);
+        } else if let Some(want) = exp.reverter.filter(|w| from != Some(*w)) {
+            result.output = decode::revert_msg(&format!("reverted in {}, expected the revert from {want}", from.map_or("?".into(), |a| a.to_string())));
+            result.result = InstructionResult::Revert;
         } else if !matches_revert(&exp, &result.output) {
             let want = exp.data.as_deref().map(|d| decode::describe_bytes(d)).unwrap_or_default();
             result.output = decode::revert_msg(&format!("reverted with {:?}, expected {:?}", decode::reason(&result.output), want));
@@ -1068,14 +1182,17 @@ impl Cheats {
         if missing && result.result.is_ok() {
             result.result = InstructionResult::Revert;
             result.output = decode::revert_msg("log != expected log");
+        } else if missing {
+            // a reverted call's logs are gone: the expected one wasn't emitted
+            self.failed_expectations.push("expected an emit, but the call reverted".into());
         }
     }
 
     /// Shared pre-call logic for calls and creates made by a frame at `depth`.
-    fn before(&mut self, ctx: &mut Ctx, depth: usize, caller: &mut Address, delegate: bool) -> Option<BroadcastTx> {
+    fn before(&mut self, ctx: &mut Ctx, depth: usize, caller: &mut Address, delegate: bool, view: bool) -> Option<BroadcastTx> {
         let mut bc = None;
         if let Some(b) = self.broadcast.clone() {
-            if b.depth == depth && !delegate {
+            if b.depth == depth && !delegate && !view {
                 *caller = b.sender;
                 if b.single {
                     self.broadcast = None;
@@ -1097,8 +1214,16 @@ impl Cheats {
         }
         if self.expect_revert.as_ref().is_some_and(|e| e.depth == depth) && self.revert_armed.is_none() {
             self.revert_armed = Some(depth);
+            self.revert_src = None;
         }
         bc
+    }
+
+    /// Notes where a revert started: the innermost frame that failed with these bytes.
+    fn note_revert(&mut self, addr: Address, result: &InterpreterResult) {
+        if !result.result.is_ok() && self.revert_src.as_ref().is_none_or(|(_, o)| *o != result.output) {
+            self.revert_src = Some((addr, result.output.clone()));
+        }
     }
 
     fn after(&mut self, ctx: &mut Ctx, depth: usize) {
@@ -1135,13 +1260,18 @@ impl Inspector<Ctx> for Cheats {
         }
         if !self.mocks.is_empty() || !self.expected_calls.is_empty() {
             let data = inputs.input.bytes(ctx);
-            for (addr, d, n) in self.expected_calls.iter_mut() {
-                if *addr == inputs.target_address && data.starts_with(d) {
+            let value = inputs.call_value();
+            for (addr, v, d, n) in self.expected_calls.iter_mut() {
+                if *addr == inputs.target_address && v.is_none_or(|v| v == value) && data.starts_with(d) {
                     *n += 1;
                 }
             }
-            if let Some((_, _, ret, rev)) = self.mocks.iter().rev().find(|(addr, d, _, _)| *addr == inputs.target_address && data.starts_with(d)) {
+            if let Some((_, _, _, ret, rev)) = self.mocks.iter().rev().find(|(addr, v, d, _, _)| *addr == inputs.target_address && v.is_none_or(|v| v == value) && data.starts_with(d)) {
                 let out = outcome(!rev, ret.clone(), inputs);
+                if self.expect_revert.as_ref().is_some_and(|e| e.depth == depth) && self.revert_armed.is_none() {
+                    self.revert_armed = Some(depth);
+                    self.revert_src = None;
+                }
                 if let Some(t) = &mut self.trace {
                     self.trace_stack.push(t.len()); // call_end still runs and pops it
                     t.push(TraceNode { depth, to: inputs.target_address, input: data.clone(), value: inputs.call_value(), create: false, result: None });
@@ -1150,8 +1280,10 @@ impl Inspector<Ctx> for Cheats {
             }
         }
         let delegate = inputs.scheme.is_delegate_call() || inputs.scheme.is_call_code();
+        // a view call (STATICCALL) from a broadcast block reads on chain; forge doesn't send it either
+        let view = inputs.scheme == revm::interpreter::interpreter_action::CallScheme::StaticCall;
         let mut caller = inputs.caller;
-        if let Some(mut bc) = self.before(ctx, depth, &mut caller, delegate) {
+        if let Some(mut bc) = self.before(ctx, depth, &mut caller, delegate, view) {
             bc.to = Some(inputs.target_address);
             bc.value = inputs.call_value();
             bc.data = inputs.input.bytes(ctx);
@@ -1178,6 +1310,12 @@ impl Inspector<Ctx> for Cheats {
         }
         let depth = ctx.journaled_state.depth();
         self.after(ctx, depth);
+        if self.revert_armed.is_some() {
+            self.note_revert(inputs.target_address, &outcome.result);
+        }
+        if !outcome.result.result.is_ok() && outcome.result.result != InstructionResult::Revert {
+            self.last_halt = Some(outcome.result.result);
+        }
         self.last_call_gas.insert(depth, outcome.result.gas.total_gas_spent());
         let traced = if self.trace.is_some() { self.trace_stack.pop() } else { None };
         if self.allow_internal_revert && self.revert_armed.is_none() && self.expect_revert.as_ref().is_some_and(|e| e.depth == depth + 1) {
@@ -1194,7 +1332,7 @@ impl Inspector<Ctx> for Cheats {
     fn create(&mut self, ctx: &mut Ctx, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let depth = ctx.journaled_state.depth();
         let mut caller = inputs.caller();
-        if let Some(mut bc) = self.before(ctx, depth, &mut caller, false) {
+        if let Some(mut bc) = self.before(ctx, depth, &mut caller, false, false) {
             bc.value = inputs.value();
             bc.data = inputs.init_code().clone();
             if let revm::context_interface::CreateScheme::Create2 { salt } = inputs.scheme() {
@@ -1239,6 +1377,12 @@ impl Inspector<Ctx> for Cheats {
     fn create_end(&mut self, ctx: &mut Ctx, inputs: &CreateInputs, outcome: &mut CreateOutcome) {
         let depth = ctx.journaled_state.depth();
         self.after(ctx, depth);
+        if self.revert_armed.is_some() {
+            self.note_revert(outcome.address.unwrap_or_default(), &outcome.result);
+        }
+        if !outcome.result.result.is_ok() && outcome.result.result != InstructionResult::Revert {
+            self.last_halt = Some(outcome.result.result);
+        }
         if let Some(Some(i)) = self.bc_creates.pop() {
             self.broadcasts[i].created = outcome.address;
         }
@@ -1247,6 +1391,9 @@ impl Inspector<Ctx> for Cheats {
                 self.creates.push((a, inputs.init_code().clone()));
                 if let Some(n) = decode::contract_name(inputs.init_code(), &outcome.result.output) {
                     self.names.insert(a, n);
+                }
+                if let Some(id) = decode::contract_id(inputs.init_code(), &outcome.result.output) {
+                    self.ids.insert(a, id);
                 }
             }
         }

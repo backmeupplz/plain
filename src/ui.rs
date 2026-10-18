@@ -146,8 +146,15 @@ fn size() -> (usize, usize) {
     }
 }
 
+/// Text as plain prints it in a list: no control characters, so names from a cloned repo's files can't move the
+/// cursor or repaint the screen.
+fn clean(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Pick one of `items` (label, hint), starting at `start`. None: esc, q or ctrl-c.
 pub fn select(prompt: &str, items: &[(String, String)], start: usize) -> Option<usize> {
+    let items: Vec<(String, String)> = items.iter().map(|(l, h)| (clean(l), clean(h))).collect();
     #[cfg(not(unix))]
     {
         for (i, (l, h)) in items.iter().enumerate() {

@@ -154,6 +154,26 @@ pub enum Scope {
     Deploy(String),
 }
 
+/// A random value of this machine's own in the build cache's key, so that a `.plain/cache.json` committed to a repo
+/// (or copied from anywhere else) can never pass for this machine's compile of the sources it describes.
+fn salt() -> String {
+    let path = home().join("salt");
+    let read = || std::fs::read_to_string(&path).ok().filter(|s| s.len() == 64);
+    if let Some(s) = read() {
+        return s;
+    }
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).unwrap_or_else(|e| crate::die(&format!("no randomness from the OS: {e}")));
+    std::fs::create_dir_all(home()).ok();
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, hex::encode(b)).is_ok() {
+        #[cfg(unix)]
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).ok();
+        std::fs::rename(&tmp, &path).ok();
+    }
+    read().unwrap_or_else(|| hex::encode(b))
+}
+
 pub fn home() -> PathBuf {
     let h = std::env::var("PLAIN_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or(".".into())).join(".plain"));
     h
@@ -166,6 +186,13 @@ fn platform() -> &'static str {
         "windows" => "windows-amd64",
         _ => "linux-amd64",
     }
+}
+
+/// A solc version as a path component can't be anything but digits and dots: versions come from config files and
+/// deploy records, which a cloned repo controls.
+fn valid(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 4 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn solc_path(v: &str) -> PathBuf {
@@ -221,6 +248,9 @@ pub fn long_version(v: &str) -> String {
 }
 
 fn ensure(v: &str) -> PathBuf {
+    if !valid(v) {
+        crate::die(&format!("{v:?} is not a solc version (like 0.8.28)"));
+    }
     let p = solc_path(v);
     if p.exists() {
         return p;
@@ -242,7 +272,8 @@ fn ensure(v: &str) -> PathBuf {
         crate::die(&format!("solc {v}: checksum mismatch"));
     }
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    let tmp = p.with_extension("tmp");
+    // a name of its own: two plain processes may download the same version at once
+    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, bytes).unwrap();
     #[cfg(unix)]
     {
@@ -294,6 +325,36 @@ pub struct Output {
     pub artifacts: Vec<Artifact>,
     pub compiled: usize,
     pub solc: String,
+    /// the EVM version the code targets (and tests run under)
+    pub evm: String,
+}
+
+/// EVM versions as solc names them, oldest first.
+const EVMS: [&str; 14] = ["homestead", "tangerineWhistle", "spuriousDragon", "byzantium", "constantinople", "petersburg", "istanbul", "berlin", "london", "paris", "shanghai", "cancun", "prague", "osaka"];
+
+/// The EVM version builds target, set once the compiler is picked (see `target_evm`).
+static EVM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The EVM version to compile for, as forge picks it: the configured evm_version (forge's default: osaka), lowered
+/// to the newest this solc supports, so the bytecode is what forge would build. Tests run under the configured rules.
+fn target_evm(p: &Project, version: &str) -> String {
+    let want = p.evm_version.clone().unwrap_or("osaka".into());
+    let path = home().join("solc").join(format!("solc-{version}.evms"));
+    let known = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        let help = Command::new(ensure(version)).arg("--help").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let section: String = help.split("--evm-version").nth(1).unwrap_or_default().lines().take_while(|l| !l.trim_start().starts_with("--") || l.contains("Select")).collect::<Vec<_>>().join(" ");
+        let words: Vec<&str> = section.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| EVMS.contains(w)).collect();
+        let list = words.join(" ");
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, &list).ok();
+        list
+    });
+    let newest = EVMS.iter().rev().find(|e| known.split(' ').any(|k| k == **e)).copied().unwrap_or("cancun");
+    let rank = |e: &str| EVMS.iter().position(|x| *x == e);
+    match (rank(&want), rank(newest)) {
+        (Some(w), Some(n)) if w > n => newest.to_string(),
+        _ => want,
+    }
 }
 
 pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
@@ -309,11 +370,12 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     };
     let g = Graph::build(p, &files);
     let version = pick_version(p, &g);
+    let evm = EVM.get_or_init(|| target_evm(p, &version)).clone();
     let settings = settings(p);
     let key = {
         use sha2::Digest;
         // bump the suffix when rewrites change what gets compiled
-        hex::encode(sha2::Sha256::digest(format!("{version}{settings}{:?}rw5", p.dirs).as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings}{:?}rw5", salt(), p.dirs).as_bytes()))
     };
     let cache_path = p.root.join(".plain/cache.json");
     let mut cache: Cache = std::fs::read(&cache_path)
@@ -334,7 +396,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
             // inherited from test files it imports
             let tests_in = |u: &str| -> Vec<String> {
                 let src = &g.files[u].content;
-                crate::rewrite::Unit::parse(src).map(|x| x.funcs.iter().filter(|f| f.name.starts_with("test") || f.name.starts_with("invariant")).map(|f| f.name.clone()).collect()).unwrap_or_default()
+                crate::rewrite::Unit::parse(src).map(|x| x.funcs.iter().filter(|f| crate::rewrite::is_test_name(&f.name)).map(|f| f.name.clone()).collect()).unwrap_or_default()
             };
             let matches = |f: &String, flt: &str| {
                 let own = crate::rewrite::Unit::parse(&g.files[f].content).map(|u| u.contracts.iter().any(|c| format!("{f}:{}", c.name).contains(flt))).unwrap_or(true);
@@ -342,7 +404,8 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
             };
             let mut need: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in files.iter().filter(|f| !f.starts_with(&script)) {
-                if filter.as_deref().is_none_or(|flt| rewritten(p, f) && matches(f, flt)) {
+                // every src file too, filter or not: a test can deploy any contract by name (getCode, deployCode)
+                if !rewritten(p, f) || filter.as_deref().is_none_or(|flt| matches(f, flt)) {
                     need.extend(g.closure(f));
                 }
             }
@@ -378,21 +441,22 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                     }
                 }
             }
+            // and every src file: a script can deploy any contract by name (getCode, deployCode)
+            for f in files.iter().filter(|f| !rewritten(p, f)) {
+                need.extend(g.closure(f));
+            }
             let mut w: Vec<&String> = files.iter().filter(|f| need.contains(*f)).collect();
             w.extend(g.files.keys().filter(|f| roots.contains(*f) && !files.contains(f)));
             w
         }
     };
     let mut iface = std::mem::take(&mut cache.iface);
-    let dirty: Vec<&String> = wanted
-        .into_iter()
-        .filter(|f| {
-            force
-                || cache.files.get(*f).is_none_or(|e| {
-                    if e.code.is_empty() { e.hash != full[*f] } else { !e.code.iter().all(|c| own.contains_key(c)) || e.hash != dep_hash(&g, f, &e.code, &own, &mut iface) }
-                })
-        })
-        .collect();
+    let mut changed = |f: &String| {
+        cache.files.get(f).is_none_or(|e| if e.code.is_empty() { e.hash != full[f] } else { !e.code.iter().all(|c| own.contains_key(c)) || e.hash != dep_hash(&g, f, &e.code, &own, &mut iface) })
+    };
+    // what this scope leaves uncompiled although its sources changed: its old artifacts are never handed out
+    let stale: std::collections::HashSet<String> = cache.files.keys().filter(|f| !wanted.contains(f)).cloned().collect::<Vec<_>>().into_iter().filter(|f| changed(f)).collect();
+    let dirty: Vec<&String> = wanted.into_iter().filter(|f| force || changed(f)).collect();
 
     let store = Store::new(&cache.key);
     let out_dir = p.root.join(".plain/out");
@@ -548,8 +612,10 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     }
     Output {
         compiled: compiled - reused,
-        artifacts: cache.files.into_values().flat_map(|e| e.contracts).collect(),
+        artifacts: cache.files.into_iter().filter(|(f, _)| !stale.contains(f)).flat_map(|(_, e)| e.contracts).collect(),
         solc: version,
+        // tests run under the configured rules, forge's default osaka when there are none
+        evm: p.evm_version.clone().unwrap_or(if evm == "osaka" { evm } else { "osaka".into() }),
     }
 }
 
@@ -653,10 +719,13 @@ impl Plan {
                     }
                     let (Some(u), Some(node)) = (units.get(f.as_str()), g.files.get(&f)) else { continue };
                     let closure = g.closure(&f);
+                    // a name any imported file aliases may not be the contract defined under it (`import {Real as Token}`
+                    // re-exported through a wildcard import): those keep solc's own `new`
+                    let aliased: std::collections::HashSet<&str> = closure.iter().filter_map(|c| units.get(c.as_str())).flat_map(|x| x.aliases.iter().map(String::as_str)).collect();
                     let target = |name: &str| -> Option<&rewrite::Target> {
                         let cands: Vec<&(&str, usize)> = defs.get(name)?.iter().filter(|(df, _)| closure.contains(*df)).collect();
                         let [(df, ci)] = cands.as_slice() else { return None };
-                        (*df != f && !u.aliases.iter().any(|a| a == name)).then(|| targets.get(&(*df, *ci))).flatten()
+                        (*df != f && !aliased.contains(name)).then(|| targets.get(&(*df, *ci))).flatten()
                     };
                     let in_test = |ci: usize| testish.get(&(f.as_str(), ci)).copied().unwrap_or(false);
                     // contracts a script file defines may go on chain: their bytecode (metadata hash) must be
@@ -721,7 +790,7 @@ impl Plan {
                 let code = model.file(f).max(1);
                 let hist = cache.files.get(*f).map_or(0, |e| e.ms);
                 let e = if hist > 0 { hist } else { (code as f64 * per_byte) as u64 };
-                let tests: u64 = model.units.get(f.as_str()).map_or(0, |(u, _)| u.funcs.iter().filter(|x| x.name.starts_with("test") || x.name.starts_with("invariant")).map(|x| x.size as u64).sum());
+                let tests: u64 = model.units.get(f.as_str()).map_or(0, |(u, _)| u.funcs.iter().filter(|x| crate::rewrite::is_test_name(&x.name)).map(|x| x.size as u64).sum());
                 let weighted = if test_file(f) { tests * 3 } else { tests };
                 // timings of a sharded build are mostly test functions already
                 let own = if hist > 0 && cache.files.get(*f).is_some_and(|e| e.shards() > 1) { 0.95 } else { (weighted as f64 / code as f64).min(1.0) };
@@ -874,23 +943,48 @@ impl Plan {
         for f in dirty.iter().filter(|f| is_test(f)) {
             let closure = g.closure(f);
             let mut out = vec![f.to_string()];
-            let mut i = 0;
-            while i < out.len() {
-                let x = out[i].clone();
-                i += 1;
-                let src = sources.get(&x).unwrap_or(&g.files[&x].content);
-                let Some(u) = Unit::parse(src) else {
-                    // unparsable: depend on the whole closure
-                    out = closure.iter().cloned().collect();
-                    break;
-                };
-                for name in u.code_refs(src) {
+            // whatever library, free-function or constant code anywhere in the imports creates is compiled into the
+            // test wherever that code is used (its own changes already change its file's interface hash)
+            let mut whole = false;
+            let mut names: Vec<String> = vec![];
+            for c in &closure {
+                let src = sources.get(c).unwrap_or(&g.files[c].content);
+                match Unit::parse(src) {
+                    Some(u) => {
+                        let loose = u.loose_created(src);
+                        // an alias could name anything: no telling which file its code is in
+                        whole |= !loose.is_empty() && !u.aliases.is_empty();
+                        names.extend(loose);
+                    }
+                    None => whole = true,
+                }
+            }
+            let push = |out: &mut Vec<String>, names: &[String]| {
+                for name in names {
                     for (df, _) in defs.get(name.as_str()).into_iter().flatten() {
                         if closure.contains(*df) && !out.iter().any(|o| o == df) {
                             out.push(df.to_string());
                         }
                     }
                 }
+            };
+            push(&mut out, &names);
+            let mut i = 0;
+            while i < out.len() && !whole {
+                let x = out[i].clone();
+                i += 1;
+                let src = sources.get(&x).unwrap_or(&g.files[&x].content);
+                let Some(u) = Unit::parse(src) else {
+                    whole = true;
+                    break;
+                };
+                // bases or creations under an alias or a namespace (`import * as M`, `is M.Base`) can't be told apart
+                // by name: then every file in the imports counts in full
+                whole |= !u.aliases.is_empty();
+                push(&mut out, &u.code_refs(src));
+            }
+            if whole {
+                out = closure.iter().cloned().collect();
             }
             out.sort();
             code.insert(f.to_string(), out);
@@ -1041,7 +1135,7 @@ pub fn settings(p: &Project) -> Value {
         "optimizer": {"enabled": p.optimizer, "runs": p.runs},
         "viaIR": p.via_ir,
     });
-    if let Some(e) = &p.evm_version {
+    if let Some(e) = EVM.get().or(p.evm_version.as_ref()) {
         s["evmVersion"] = json!(e);
     }
     if let Some(h) = &p.bytecode_hash {
@@ -1079,6 +1173,55 @@ pub fn standard_json(version: &str, input: &Value, root: &std::path::Path) -> Re
         true => Ok(v),
         false => Err(errs.join("\n")),
     }
+}
+
+/// Each contract in `file` as solc compiles the standard JSON input explorers verify against (the file's import
+/// closure and the project's settings, nothing rewritten or cached): name -> (bytecode, deployed bytecode).
+pub fn canonical(p: &Project, version: &str, file: &str) -> Result<HashMap<String, (String, String)>, String> {
+    let mut input = crate::verify::input(p, file);
+    input["settings"]["outputSelection"] = json!({});
+    input["settings"]["outputSelection"][file]["*"] = json!(["evm.bytecode.object", "evm.deployedBytecode.object"]);
+    // remembered by what was compiled (sources, settings, compiler), so a deploy pays for this once per change
+    let key = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(format!("{version}{input}").as_bytes()))
+    };
+    let path = home().join("cache/canonical").join(format!("{key}.json"));
+    if let Some(hit) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+        return Ok(hit);
+    }
+    let out = standard_json(version, &input, &p.root)?;
+    let code = |c: &Value, k: &str| c["evm"][k]["object"].as_str().unwrap_or_default().to_string();
+    let found: HashMap<String, (String, String)> = out["contracts"][file].as_object().into_iter().flatten().map(|(n, c)| (n.clone(), (code(c, "bytecode"), code(c, "deployedBytecode")))).collect();
+    std::fs::create_dir_all(path.parent().unwrap()).ok();
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, serde_json::to_vec(&found).unwrap()).is_ok() {
+        std::fs::rename(&tmp, &path).ok();
+    }
+    Ok(found)
+}
+
+/// Artifacts whose bytecode differs from `canonical`, compiling each file again (in parallel). Test and script
+/// contracts compile from rewritten sources and never go on chain, so they're left out.
+pub fn check(p: &Project, out: &Output) -> Vec<String> {
+    let mut by_file: BTreeMap<&str, Vec<&Artifact>> = BTreeMap::new();
+    for a in out.artifacts.iter().filter(|a| a.shard == 0 && !a.rewritten && !a.bytecode.is_empty() && !rewritten(p, &a.file)) {
+        by_file.entry(a.file.as_str()).or_default().push(a);
+    }
+    by_file
+        .par_iter()
+        .flat_map(|(f, arts)| match canonical(p, &out.solc, f) {
+            Err(e) => vec![format!("{f}: {e}")],
+            Ok(c) => arts
+                .iter()
+                .filter_map(|a| match c.get(&a.name) {
+                    Some((b, d)) if *b == a.bytecode && *d == a.deployed => None,
+                    Some(_) => Some(format!("{}:{} differs from solc's output for its sources", a.file, a.name)),
+                    None => Some(format!("{}:{} isn't in solc's output for its file", a.file, a.name)),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, overrides: &HashMap<String, String>, gen_deps: &HashMap<String, Vec<String>>) -> Result<(Vec<Artifact>, Vec<String>), String> {

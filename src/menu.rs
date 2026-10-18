@@ -177,7 +177,7 @@ fn account(last: &mut Last) -> Option<Option<String>> {
     loop {
         let accounts = crate::account::all();
         let mut list: Vec<(String, String)> = accounts.iter().map(|(n, a, _)| (n.clone(), a.map_or("address shown once unlocked".into(), |a| a.to_checksum(None)))).collect();
-        let env = std::env::var("PRIVATE_KEY").is_ok_and(|k| !k.is_empty());
+        let env = crate::project::var("PRIVATE_KEY").is_some_and(|k| !k.is_empty());
         if env {
             list.push(("$PRIVATE_KEY".into(), "the key in your environment or .env".into()));
         }
@@ -218,20 +218,17 @@ fn args(params: &[Value], me: Option<&str>) -> Option<Vec<String>> {
 }
 
 /// Simulates `cmd` (a deploy or upgrade), then sends it once confirmed; on a local chain, sends right away.
+/// Runs `cmd` (a deploy or upgrade) with --broadcast. On a live network with --confirm: plain simulates, shows every
+/// transaction and the most it can cost, and sends exactly that once you say yes; a local chain sends right away.
 fn send(mut cmd: Vec<String>, net: &str, what: &str) {
+    cmd.push("--broadcast".into());
     if net != "local" {
-        say("First a simulation against the network as it is now; nothing is sent yet.");
-        if !plain(&cmd) {
-            return;
-        }
+        say(&format!("First a simulation of {what} against {net} as it is now; nothing is sent until you confirm."));
         if !is_testnet(net) && crate::rpc::NETWORKS.iter().any(|n| n.0 == net) {
             eprintln!("{}", bold(&format!("{net} is a mainnet: this spends real money.")));
         }
-        if !ui::confirm(&format!("Send {what} to {net}?")) {
-            return;
-        }
+        cmd.push("--confirm".into());
     }
-    cmd.push("--broadcast".into());
     plain(&cmd);
 }
 
@@ -428,6 +425,6 @@ fn rpcs(p: &Project) {
     }
     say(&format!("Saved {var} in .env."));
     if std::env::var_os(&var).is_some() {
-        say("It was already set when this menu started, so the new value applies from the next start.");
+        say(&format!("{var} is also set in your shell's environment, which takes priority over .env."));
     }
 }

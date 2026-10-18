@@ -288,9 +288,19 @@ impl Unit {
 
     /// Contracts whose creation code the unit uses: `new X`, `type(X).creationCode/runtimeCode`.
     pub fn created(&self, src: &str) -> Vec<String> {
+        self.created_where(src, &|_| true)
+    }
+
+    /// Contracts whose creation code the unit's libraries, free functions and constants use: code that other
+    /// files compile in whole, unlike contract function bodies (see `interface_hash`).
+    pub fn loose_created(&self, src: &str) -> Vec<String> {
+        self.created_where(src, &|i| !self.bodies.iter().any(|&(a, b)| i > a && i < b))
+    }
+
+    fn created_where(&self, src: &str, at: &dyn Fn(usize) -> bool) -> Vec<String> {
         let t = |i: usize| self.toks.get(i).map_or("", |x| &src[x.s..x.e]);
         let mut out = vec![];
-        for i in 0..self.toks.len() {
+        for i in (0..self.toks.len()).filter(|i| at(*i)) {
             if t(i) == "new" && self.toks.get(i + 1).is_some_and(|x| x.k == K::Ident) {
                 out.push(t(i + 1).to_string());
             } else if t(i) == "type" && t(i + 1) == "(" && t(i + 3) == ")" && t(i + 4) == "." && matches!(t(i + 5), "creationCode" | "runtimeCode") {
@@ -476,11 +486,20 @@ fn split_args(u: &Unit, src: &str, a: usize, b: usize) -> Vec<(usize, usize)> {
 
 /// Test functions (public/external `test*`/`invariant*`) in contracts `in_test` accepts, by name with total size.
 /// None if the file can't be sharded safely (an `override`n test function).
+/// Test functions as forge finds them: `test*`, and invariants (`invariant*`, `statefulFuzz*`).
+pub fn is_test_name(n: &str) -> bool {
+    n.starts_with("test") || is_invariant_name(n)
+}
+
+pub fn is_invariant_name(n: &str) -> bool {
+    n.starts_with("invariant") || n.starts_with("statefulFuzz")
+}
+
 pub fn test_funcs(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool) -> Option<Vec<(String, usize)>> {
     let mut out: Vec<(String, usize)> = vec![];
     for f in &u.funcs {
         let public = f.vis.is_some_and(|v| matches!(&src[u.toks[v].s..u.toks[v].e], "public" | "external"));
-        if !public || !in_test(f.contract) || !(f.name.starts_with("test") || f.name.starts_with("invariant")) {
+        if !public || !in_test(f.contract) || !is_test_name(&f.name) {
             continue;
         }
         if f.overrides {
@@ -512,7 +531,7 @@ pub fn removable(src: &str, u: &Unit, tests: &[(String, usize)]) -> HashSet<Stri
 pub fn test_hashes(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool) -> std::collections::BTreeMap<String, String> {
     use sha2::Digest;
     let mut h: std::collections::BTreeMap<String, sha2::Sha256> = Default::default();
-    for f in u.funcs.iter().filter(|f| in_test(f.contract) && (f.name.starts_with("test") || f.name.starts_with("invariant"))) {
+    for f in u.funcs.iter().filter(|f| in_test(f.contract) && is_test_name(&f.name)) {
         h.entry(f.name.clone()).or_default().update(&src[u.toks[f.toks.0].s..u.toks[f.toks.1].e]);
     }
     h.into_iter().map(|(n, h)| (n, hex::encode(h.finalize()))).collect()
@@ -526,7 +545,7 @@ pub fn unit_edits(src: &str, u: &Unit, in_test: &dyn Fn(usize) -> bool, keep: &d
     for f in &u.funcs {
         let Some(v) = f.vis else { continue };
         let vis = &src[u.toks[v].s..u.toks[v].e];
-        if !matches!(vis, "public" | "external") || !in_test(f.contract) || !(f.name.starts_with("test") || f.name.starts_with("invariant")) || keep(&f.name) {
+        if !matches!(vis, "public" | "external") || !in_test(f.contract) || !is_test_name(&f.name) || keep(&f.name) {
             continue;
         }
         if removable.contains(&f.name) {
@@ -550,7 +569,7 @@ pub fn assign(tests: &[(String, usize)], k: usize) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for (name, size) in sorted {
         // invariants share one campaign setup: keep them together in shard 0
-        let s = if name.starts_with("invariant") { 0 } else { (0..k).min_by_key(|&i| (load[i], i)).unwrap() };
+        let s = if is_invariant_name(name) { 0 } else { (0..k).min_by_key(|&i| (load[i], i)).unwrap() };
         load[s] += size;
         out.insert(name.clone(), s);
     }

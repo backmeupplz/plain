@@ -1,4 +1,5 @@
-// Runs the binary on tests/fixture: every testBad*/testFailLegacyPassesIsBad must fail, everything else pass.
+// Runs the binary on tests/fixture: every testBad*, invariantBad* and testFail* (gone since forge 1.0) must fail,
+// everything else pass.
 use std::process::Command;
 
 #[test]
@@ -7,10 +8,10 @@ fn fixture() {
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines().filter(|l| l.trim_start().starts_with("pass ") || l.trim_start().starts_with("FAIL ")) {
         let failed = line.trim_start().starts_with("FAIL");
-        let should_fail = line.contains("testBad") || line.contains("PassesIsBad") || line.contains("invariantBad");
+        let should_fail = line.contains("testBad") || line.contains("testFail") || line.contains("invariantBad");
         assert_eq!(failed, should_fail, "{line}\n{text}");
     }
-    assert!(text.contains("15 passed, 8 failed"), "{text}");
+    assert!(text.contains("15 passed, 10 failed"), "{text}");
     assert!(text.contains("Breakable.poke(7)"), "{text}");
     assert!(text.contains("panic: arithmetic underflow"), "{text}");
     assert!(text.contains("log: value is 99"), "{text}");

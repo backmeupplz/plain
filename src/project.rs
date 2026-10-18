@@ -19,6 +19,47 @@ pub struct Project {
     pub networks: BTreeMap<String, String>,
     /// foundry.toml [etherscan]: v2 keys work on every chain, so any entry's key will do
     pub etherscan_key: Option<String>,
+    /// what tests may do outside the EVM (ffi, fs_permissions), as configured
+    pub access: Access,
+    /// run test/**/*.test.ts too (`typescript = true`): they're programs, so only when the project says so
+    pub typescript: bool,
+}
+
+/// What test and script code may reach outside the EVM. Nothing unless the config opens it, like forge:
+/// `ffi = true` for vm.ffi, `fs_permissions` for the file cheatcodes.
+#[derive(Clone, Default, Debug)]
+pub struct Access {
+    pub ffi: bool,
+    /// (path, read, write), resolved
+    pub fs: Vec<(PathBuf, bool, bool)>,
+    /// never writable, whatever fs_permissions says: plain's state, git's, the config (writing foundry.toml
+    /// could turn ffi on), .env
+    pub protected: Vec<PathBuf>,
+}
+
+/// `p` with `.`, `..` and symlinks resolved; for a path that doesn't exist yet, its nearest existing ancestor's.
+pub fn resolve(p: &Path) -> PathBuf {
+    let mut norm = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    let (mut base, mut rest) = (norm, vec![]);
+    while !base.exists() {
+        match base.file_name() {
+            Some(n) => rest.push(n.to_owned()),
+            None => break,
+        }
+        base.pop();
+    }
+    let mut out = std::fs::canonicalize(&base).unwrap_or(base);
+    out.extend(rest.iter().rev());
+    out
 }
 
 type Table = toml::Table;
@@ -38,10 +79,22 @@ pub fn expand_env(s: &str) -> String {
     while let Some(i) = rest.find("${") {
         out.push_str(&rest[..i]);
         let Some(j) = rest[i..].find('}') else { break };
-        out.push_str(&std::env::var(&rest[i + 2..i + j]).unwrap_or_default());
+        out.push_str(&var(&rest[i + 2..i + j]).unwrap_or_default());
         rest = &rest[i + j + 1..];
     }
     out + rest
+}
+
+static DOTENV: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
+/// An environment variable: the process's own, else the project's .env.
+pub fn var(k: &str) -> Option<String> {
+    std::env::var(k).ok().or_else(|| DOTENV.get()?.get(k).cloned())
+}
+
+/// The project's .env, for code that is the project's own anyway (TypeScript tests, vm.ffi).
+pub fn dotenv() -> Vec<(String, String)> {
+    DOTENV.get().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
 }
 
 /// The project root: the nearest folder up with plain.toml or foundry.toml, else the current one.
@@ -50,10 +103,12 @@ pub fn root() -> PathBuf {
     cwd.ancestors().find(|d| d.join("plain.toml").exists() || d.join("foundry.toml").exists()).unwrap_or(&cwd).to_path_buf()
 }
 
-/// Sets what the project's .env has and the environment doesn't, like forge. Runs before any thread starts.
+/// Reads the project's .env, as forge does, but never exports it: a cloned repo's .env can't change how plain or
+/// the programs it starts behave (PLAIN_HOME, PATH, DYLD_INSERT_LIBRARIES, NODE_OPTIONS...). Its values answer
+/// `var`: keys, RPC URLs, `${VAR}` in the config, the env cheatcodes.
 pub fn load_env() {
-    let Ok(s) = std::fs::read_to_string(root().join(".env")) else { return };
-    for line in s.lines() {
+    let mut vars = HashMap::new();
+    for line in std::fs::read_to_string(root().join(".env")).unwrap_or_default().lines() {
         let line = line.trim();
         let Some((k, v)) = line.strip_prefix("export ").unwrap_or(line).split_once('=') else { continue };
         let (k, v) = (k.trim(), v.trim());
@@ -61,11 +116,11 @@ pub fn load_env() {
             Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
             _ => v.split(" #").next().unwrap_or_default().trim_end(),
         };
-        if !k.is_empty() && !k.starts_with('#') && std::env::var_os(k).is_none() {
-            // SAFETY: called first thing in main, before any other thread exists
-            unsafe { std::env::set_var(k, v) };
+        if !k.is_empty() && !k.starts_with('#') {
+            vars.insert(k.to_string(), v.to_string());
         }
     }
+    DOTENV.set(vars).ok();
 }
 
 /// ~/.plain/config.toml: settings for every project, like the Etherscan key the menu saves.
@@ -100,6 +155,22 @@ impl Project {
             }
             if let Some(p) = f.get("profile").and_then(|p| p.get("default")).and_then(|p| p.as_table()) {
                 cfg.extend(p.clone());
+            }
+            // FOUNDRY_PROFILE=ci picks [profile.ci] over the default, as forge does (its fuzz and invariant tables too)
+            if let Some(name) = var("FOUNDRY_PROFILE").filter(|n| !n.is_empty() && n != "default") {
+                match f.get("profile").and_then(|p| p.get(&name)).and_then(|p| p.as_table()) {
+                    Some(p) => {
+                        for (k, v) in p {
+                            match (cfg.get_mut(k).and_then(|c| c.as_table_mut()), v.as_table()) {
+                                (Some(c), Some(t)) => c.extend(t.clone()),
+                                _ => {
+                                    cfg.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    None => crate::die(&format!("FOUNDRY_PROFILE={name}, but foundry.toml has no [profile.{name}]")),
+                }
             }
             for k in ["fuzz", "invariant"] {
                 if let Some(t) = f.get(k).and_then(|p| p.as_table()) {
@@ -211,6 +282,31 @@ impl Project {
             },
             networks,
             etherscan_key,
+            access: Access {
+                ffi: b("ffi").unwrap_or(false),
+                // forge's fs_permissions: [{ access = "read" | "write" | "read-write" | true | false, path = "./x" }]
+                fs: cfg
+                    .get("fs_permissions")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| {
+                        let path = resolve(&root.join(e.get("path")?.as_str()?));
+                        let (read, write) = match e.get("access")? {
+                            toml::Value::Boolean(b) => (*b, *b),
+                            a => match a.as_str()? {
+                                "read" => (true, false),
+                                "write" => (false, true),
+                                "read-write" => (true, true),
+                                _ => (false, false),
+                            },
+                        };
+                        Some((path, read, write))
+                    })
+                    .collect(),
+                protected: [".git", ".plain", "foundry.toml", "plain.toml", ".env"].iter().map(|f| resolve(&root.join(f))).collect(),
+            },
+            typescript: b("typescript").unwrap_or(false),
             root,
         }
     }

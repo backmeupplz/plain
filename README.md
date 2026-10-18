@@ -33,9 +33,9 @@ Or build it from source: `cargo install --git https://github.com/backmeupplz/pla
 
 ```
 plain                       # in a terminal: a menu for everything below
-plain build [--force]
-plain test [filter] [-v] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--rerun] [--force] [--watch]
-plain deploy <Contract|path/Script.s.sol> [args...] [--network <name|id|url>] [--account <name>] [--broadcast] [--proxy] [--no-verify]
+plain build [--force] [--check]     # --check: every contract byte-identical to solc's own compile of its sources
+plain test [filter] [-v] [--mt name] [--mc name] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--rerun] [--force] [--watch]
+plain deploy <Contract|path/Script.s.sol> [args...] [--network <name|id|url>] [--account <name>] [--broadcast] [--confirm] [--proxy] [--no-verify]
 plain upgrade <proxy> [Contract] [--call <function> args...] --network <name|id|url> [--account <name>] [--broadcast]
 plain verify [--network <name|id|url>] [name|address...] [--export]
 plain account [new <name> | import <name>]
@@ -44,7 +44,9 @@ plain init
 plain <anything>            # runs `plain-<anything>` from PATH (plugins)
 ```
 
-`filter` matches suite paths (`test/Vault.t.sol:VaultTest`) and test names, and only the test files it can match get compiled. Exit code is non-zero on any failure.
+`filter` matches suite paths (`test/Vault.t.sol:VaultTest`) and test names, and only the test files it can match get compiled. A filter that matches nothing, or an unknown option, is an error. Exit code is non-zero on any failure.
+
+Semantics follow forge 1.x: `expectRevert(bytes4)` is an exact match (`expectPartialRevert` for selector-only), `testFail*` fails, invariants check the initial state and `afterInvariant()`, tests run under the configured `evm_version` (default: forge's osaka, compiled for the newest EVM the solc supports), `FOUNDRY_PROFILE` selects a profile. `vm.ffi` needs `ffi = true` and file cheatcodes need `fs_permissions`, as in forge; `test/**/*.test.ts` runs only with `typescript = true` in plain.toml.
 
 Test results are cached: a suite reruns only when its compiled bytecode, the test settings, the plain binary, or something it read (contracts it deployed with `getCode`, files, env vars) changed. Cached suites print `(cached)`. Suites that call `ffi`, `writeFile`, `unixTime` or `setEnv`, and every `--fork` run, always rerun. `--rerun` runs every test again, and `--force` also recompiles.
 
@@ -127,6 +129,8 @@ plain deploy Counter 42 0xabc... --network sepolia --account deployer           
 plain deploy script/Deploy.s.sol --network base --account deployer --broadcast         # sends txs, verifies
 ```
 
+Before signing, every contract the deploy creates is compiled again from the standard JSON input explorers will get, and the deploy stops unless the bytecode is identical. The deployer's next nonce must match the simulation's. Scripts see the deployer as `msg.sender`/`tx.origin` in `run()`; the simulation enforces EIP-170/3860 size limits; `--confirm` asks before sending; records of what landed are kept even when a later transaction fails.
+
 The deployer key comes from `--account <name>` (a keystore in `~/.plain/keystores` or Foundry's `~/.foundry/keystores`, unlocked with its password when something is sent), else `$PRIVATE_KEY`. Local chains (chain id 31337) use the first dev account. The project's `.env` is read like forge reads it. A simulation also prints what the deployer holds and the most the deploy can cost.
 
 Scripts are forge-compatible: `run()`, `vm.startBroadcast()` (signing with the deployer), `vm.startBroadcast(pk)`, and `new X{salt: s}()`, which goes through the deterministic CREATE2 deployer. External libraries that the deployed contracts link against are deployed first, from the deployer's address.
@@ -139,7 +143,7 @@ What `--broadcast` does:
 
 What explorers need is kept in `.plain/deploys/<chain id>.json`, so `plain verify --network base` retries whatever didn't verify (an explorer was down, or the key was missing). It doesn't compile anything. To verify only some contracts, pass names or addresses. `--export` writes `verify/<network>/<Contract>.json` (the standard JSON input, libraries linked) and `<Contract>.txt` (address, compiler version, license, constructor arguments and the explorer's verify page) for verifying by hand.
 
-Upgradeable contracts: `plain deploy Box <initialize args> --proxy` deploys the implementation and an OpenZeppelin proxy (`ERC1967Proxy` for UUPS contracts, else `TransparentUpgradeableProxy`) compiled from the project's `@openzeppelin/contracts`, calling `initialize` in the proxy's constructor. `deployments/<network>.json` gets `Box` (the proxy) and `Box_Implementation`. `plain upgrade Box [BoxV2] [--call initializeV2 args...]` reads the current implementation from the ERC-1967 slot, compares solc's storage layouts (variables must keep their slots and types; renames, appends and `__gap` use are fine; ERC-7201 namespaced storage isn't checked), then deploys the new implementation and calls `upgradeToAndCall` (or the ProxyAdmin's `upgradeAndCall`). With an Etherscan key, proxies are also marked as proxies there.
+Upgradeable contracts: `plain deploy Box <initialize args> --proxy` deploys the implementation and an OpenZeppelin proxy (`ERC1967Proxy` for UUPS contracts, else `TransparentUpgradeableProxy`) compiled from the project's `@openzeppelin/contracts`, calling `initialize` in the proxy's constructor. `deployments/<network>.json` gets `Box` (the proxy) and `Box_Implementation`. `plain upgrade Box [BoxV2] [--call initializeV2 args...]` reads the current implementation from the ERC-1967 slot, compares solc's storage layouts (variables must keep their slots and types, down into structs, arrays, enums and user-defined value types; renames, appends and `__gap` use are fine; ERC-7201 namespaces are checked the same way), then deploys the new implementation and calls `upgradeToAndCall` (or the ProxyAdmin's `upgradeAndCall`). With an Etherscan key, proxies are also marked as proxies there.
 
 Networks: any chain on [chainlist.org](https://chainlist.org) by name, short name or chain id (`base`, `base-sepolia`, `arbitrum-sepolia`, `linea`, `monad`, `8453`), plus `local` (127.0.0.1:8545) and any URL. Common chains use their official RPC. For other chains, plain races chainlist's public RPCs that don't track users and takes the first one that answers with the right chain id. `$<NAME>_RPC_URL` picks the RPC for a name (for example `BASE_RPC_URL`), as does a `plain.toml` entry or foundry.toml's `rpc_endpoints`:
 
@@ -223,6 +227,6 @@ Where the speed comes from (solc itself is unchanged: what gets deployed is byte
 
 ## Not included (on purpose)
 
-Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), the `vm.deployCode` cheatcode (use `vm.getCode` + `create`), beacon proxies, and checking ERC-7201 namespaced storage on upgrades. Library linking only works for libraries under `src/`/`test/`/`script/`.
+Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, multiple forks inside one test (`vm.createSelectFork` uses the single `--fork`), the `vm.deployCode` cheatcode (use `vm.getCode` + `create`), `targetArtifacts`/`targetInterfaces` (invariants using them fail rather than pass), OpenZeppelin 4 transparent proxies, and beacon proxies. Library linking only works for libraries under `src/`/`test/`/`script/`.
 
 Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs (more so for tests you just edited, which compile without the optimizer until the file is re-split). Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).

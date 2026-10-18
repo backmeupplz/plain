@@ -413,7 +413,8 @@ pub fn serve(listener: TcpListener, chain: Arc<Mutex<Chain>>) {
                 let mut got_request;
                 loop {
                     line.clear();
-                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    // (bounded: a local client can't make the node buffer gigabytes of header)
+                    if (&mut r).take(64 << 10).read_line(&mut line).unwrap_or(0) == 0 || !line.ends_with('\n') {
                         return;
                     }
                     got_request = true;
@@ -424,7 +425,7 @@ pub fn serve(listener: TcpListener, chain: Arc<Mutex<Chain>>) {
                         len = v.trim().parse().unwrap_or(0);
                     }
                 }
-                if !got_request {
+                if !got_request || len > 256 << 20 {
                     return;
                 }
                 let mut body = vec![0; len];

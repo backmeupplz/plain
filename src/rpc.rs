@@ -42,7 +42,7 @@ pub fn network(p: &Project, name: &str) -> Result<Net, String> {
         return Ok(Net { url: name.into(), chain: None });
     }
     let var = format!("{}_RPC_URL", name.to_uppercase().replace('-', "_"));
-    if let Some(u) = std::env::var(&var).ok().or_else(|| p.networks.get(name).map(|u| expand_env(u))).filter(|u| !u.is_empty()) {
+    if let Some(u) = crate::project::var(&var).or_else(|| p.networks.get(name).map(|u| expand_env(u))).filter(|u| !u.is_empty()) {
         return Ok(Net { url: u, chain: None });
     }
     if name == "local" {
@@ -190,7 +190,13 @@ pub fn batch(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Value>, String> {
 /// JSON-RPC batch with a result per call. Retries what load-balanced public RPCs fail on now and then
 /// (a node behind on blocks, rate limits); falls back to one request per call if the server rejects batches.
 pub fn batch_each(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, String>>, String> {
-    let transient = |e: &str| ["429", "rate limit", "too many requests", "timed out", "timeout"].iter().any(|t| e.to_lowercase().contains(t));
+    // rate limits as public RPCs word them ("25/second request limit reached", "capacity exceeded"), timeouts, gateways
+    let transient = |e: &str| {
+        let e = e.to_lowercase();
+        ["429", "rate limit", "rate-limit", "ratelimit", "too many requests", "request limit", "limit reached", "capacity exceeded", "timed out", "timeout", "502 bad gateway", "503 service", "504 gateway"]
+            .iter()
+            .any(|t| e.contains(t))
+    };
     let mut tries = 0;
     loop {
         let r = batch_once(url, calls);

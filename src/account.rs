@@ -70,12 +70,16 @@ fn decrypt(ks: &Value, pw: &str) -> Result<B256, String> {
     let c = if ks["crypto"].is_object() { &ks["crypto"] } else { &ks["Crypto"] };
     let h = |v: &Value| hex::decode(v.as_str().unwrap_or_default()).map_err(|_| "malformed keystore".to_string());
     let kp = &c["kdfparams"];
-    let n = kp["n"].as_u64().unwrap_or(0);
+    let (n, r, p) = (kp["n"].as_u64().unwrap_or(0), kp["r"].as_u64().unwrap_or(8), kp["p"].as_u64().unwrap_or(1));
     if c["kdf"] != "scrypt" || c["cipher"] != "aes-128-ctr" || !n.is_power_of_two() {
         return Err(format!("unsupported keystore ({} with {})", c["kdf"], c["cipher"]));
     }
+    // geth's strongest standard is N = 2^18 (256 MB); far beyond that a keystore can only mean to exhaust memory
+    if n > 1 << 20 || r > 32 || p > 16 || n * r > 1 << 23 {
+        return Err("the keystore's scrypt parameters are implausibly large".into());
+    }
     let len = kp["dklen"].as_u64().unwrap_or(32) as usize;
-    let params = scrypt::Params::new(n.trailing_zeros() as u8, kp["r"].as_u64().unwrap_or(8) as u32, kp["p"].as_u64().unwrap_or(1) as u32, len).map_err(|e| e.to_string())?;
+    let params = scrypt::Params::new(n.trailing_zeros() as u8, r as u32, p as u32, len).map_err(|e| e.to_string())?;
     let mut dk = vec![0u8; len.max(32)];
     scrypt::scrypt(pw.as_bytes(), &h(&kp["salt"])?, &params, &mut dk[..len]).map_err(|e| e.to_string())?;
     let mut key = h(&c["ciphertext"])?;

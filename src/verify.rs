@@ -76,8 +76,31 @@ fn with_libs(input: &str, r: &Record) -> Value {
     input
 }
 
+/// Whether a record looks like one plain wrote. `.plain/deploys` can arrive with a cloned repo, and these fields
+/// end up in file paths (`input`, `name`), solc versions (`compiler`) and what's uploaded to explorers.
+fn sound(r: &Record) -> bool {
+    let ident = |s: &str| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    let (version, build) = r.compiler.split_once("+commit.").unwrap_or((&r.compiler, "00000000"));
+    r.input.len() == 64
+        && r.input.bytes().all(|b| b.is_ascii_hexdigit())
+        && ident(&r.name)
+        && r.contract.rsplit_once(':').is_some_and(|(f, n)| n == r.name && f.ends_with(".sol"))
+        && version.split('.').count() == 3
+        && version.split('.').all(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()))
+        && build.len() == 8
+        && build.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn load(p: &Project, chain: u64) -> BTreeMap<Address, Record> {
-    std::fs::read(dir(p).join(format!("{chain}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let all: BTreeMap<Address, Record> = std::fs::read(dir(p).join(format!("{chain}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    all.into_iter()
+        .filter(|(a, r)| {
+            if !sound(r) {
+                eprintln!("warning: ignoring a malformed record for {a} in .plain/deploys/{chain}.json");
+            }
+            sound(r)
+        })
+        .collect()
 }
 
 pub fn save(p: &Project, chain: u64, recs: &BTreeMap<Address, Record>) {
@@ -98,11 +121,14 @@ struct Explorer {
     /// minimum time between requests (free Etherscan keys allow 3 per second)
     gap: Duration,
     next: Mutex<Instant>,
+    /// told "too many requests" without a key: hosted Blockscouts allow a few requests an hour, so plain stops
+    /// asking rather than spend what's left
+    throttled: std::sync::atomic::AtomicBool,
 }
 
 impl Explorer {
     fn new(name: &'static str, api: String, key: String, gap_ms: u64) -> Explorer {
-        Explorer { name, api, key, gap: Duration::from_millis(gap_ms), next: Mutex::new(Instant::now()) }
+        Explorer { name, api, key, gap: Duration::from_millis(gap_ms), next: Mutex::new(Instant::now()), throttled: false.into() }
     }
     fn pace(&self) {
         let mut n = self.next.lock().unwrap();
@@ -117,7 +143,7 @@ impl Explorer {
 /// $ETHERSCAN_API_KEY (or the project's .env), foundry.toml's [etherscan], or the one the menu saved.
 pub fn etherscan_key(p: &Project) -> Option<String> {
     let saved = || crate::project::user_config().get("etherscan_api_key").and_then(|k| k.as_str()).map(String::from);
-    std::env::var("ETHERSCAN_API_KEY").ok().or_else(|| p.etherscan_key.clone()).or_else(saved).filter(|k| !k.is_empty())
+    crate::project::var("ETHERSCAN_API_KEY").or_else(|| p.etherscan_key.clone()).or_else(saved).filter(|k| !k.is_empty())
 }
 
 fn explorers(p: &Project, chain: u64, skipped: &mut Vec<String>) -> Vec<Explorer> {
@@ -129,7 +155,9 @@ fn explorers(p: &Project, chain: u64, skipped: &mut Vec<String>) -> Vec<Explorer
     if let Some(c) = rpc::chain_info(chain) {
         for e in &c.explorers {
             if e.contains("blockscout") && !out.iter().any(|x| x.name == "blockscout") {
-                out.push(Explorer::new("blockscout", format!("{e}/api"), String::new(), 200));
+                let saved = || crate::project::user_config().get("blockscout_api_key").and_then(|k| k.as_str()).map(String::from);
+                let key = crate::project::var("BLOCKSCOUT_API_KEY").or_else(saved).unwrap_or_default();
+                out.push(Explorer::new("blockscout", format!("{e}/api"), key, 200));
             } else if e.contains("routescan.io") && !out.iter().any(|x| x.name == "routescan") {
                 let net = if c.testnet { "testnet" } else { "mainnet" };
                 out.push(Explorer::new("routescan", format!("https://api.routescan.io/v2/network/{net}/evm/{chain}/etherscan/api"), "verifyContract".into(), 200));
@@ -209,6 +237,9 @@ fn one(e: &Explorer, chain: u64, addr: Address, r: &Record, input: &str, deadlin
     // explorers index a new contract within seconds; their compile queues can take minutes
     let indexed_by = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline && (ticket.is_some() || Instant::now() < indexed_by) {
+        if e.throttled.load(std::sync::atomic::Ordering::Relaxed) {
+            return limited(e);
+        }
         e.pace();
         let step = match &ticket {
             None => submit(e, chain, addr, r, input),
@@ -276,18 +307,41 @@ fn submit(e: &Explorer, chain: u64, addr: Address, r: &Record, input: &str) -> S
     let v: Value = res.body_mut().read_json().unwrap_or_default();
     debug(e, &format!("submit {} {v}", r.name));
     let msg = v["result"].as_str().unwrap_or_default();
-    let low = msg.to_lowercase();
-    if v["status"] == "1" && !msg.is_empty() {
+    // (some explorers put the reason in "message", with no result: a rate limit says so there)
+    let low = format!("{msg} {}", v["message"].as_str().unwrap_or_default()).to_lowercase();
+    if let Some(stop) = throttled(e, &low) {
+        stop
+    } else if v["status"] == "1" && !msg.is_empty() {
         Step::Ticket(msg.into())
     } else if low.contains("already verified") {
         Step::Done(Outcome::Verified)
-    } else if low.contains("unable to locate") || low.contains("rate limit") || low.contains("not a smart-contract") || low.contains("not a contract") || low.contains("not found") || v.is_null() {
+    } else if busy(&low) || low.contains("unable to locate") || low.contains("not a smart-contract") || low.contains("not a contract") || low.contains("not found") || v.is_null() {
         // not indexed yet
         Step::Retry
     } else if low.contains("chainid") || low.contains("chain not supported") || v["message"].as_str().is_some_and(|m| m.contains("chain not supported")) {
         Step::Done(Outcome::Skipped("chain not supported".into()))
     } else {
         Step::Done(Outcome::Failed(if msg.is_empty() { v.to_string() } else { msg.to_string() }))
+    }
+}
+
+/// An explorer saying "later": rate limits, queues.
+fn busy(low: &str) -> bool {
+    ["rate limit", "too many requests", "pending", "in progress", "in queue", "queued"].iter().any(|t| low.contains(t))
+}
+
+/// A rate limit without a key ends that explorer's turn (with a key it's only a moment's wait).
+fn throttled(e: &Explorer, low: &str) -> Option<Step> {
+    (e.key.is_empty() && (low.contains("too many requests") || low.contains("rate limit"))).then(|| {
+        e.throttled.store(true, std::sync::atomic::Ordering::Relaxed);
+        Step::Done(limited(e))
+    })
+}
+
+fn limited(e: &Explorer) -> Outcome {
+    match e.name {
+        "blockscout" => Outcome::Skipped("rate limited; a free BLOCKSCOUT_API_KEY (dev.blockscout.com) lifts that".into()),
+        _ => Outcome::Skipped("rate limited".into()),
     }
 }
 
@@ -313,13 +367,15 @@ fn check(e: &Explorer, ticket: &str) -> Step {
     let v: Value = res.body_mut().read_json().unwrap_or_default();
     debug(e, &format!("check {v}"));
     let msg = v["result"].as_str().unwrap_or_default();
-    let low = msg.to_lowercase();
-    if low.contains("pending") || low.contains("in progress") || low.contains("rate limit") || v.is_null() {
+    let low = format!("{msg} {}", v["message"].as_str().unwrap_or_default()).to_lowercase();
+    if let Some(stop) = throttled(e, &low) {
+        stop
+    } else if busy(&low) || v.is_null() {
         Step::Retry
-    } else if low.starts_with("pass") || low.contains("already verified") {
+    } else if msg.to_lowercase().starts_with("pass") || low.contains("already verified") {
         Step::Done(Outcome::Verified)
     } else {
-        Step::Done(Outcome::Failed(msg.into()))
+        Step::Done(Outcome::Failed(if msg.is_empty() { v.to_string() } else { msg.into() }))
     }
 }
 
@@ -364,7 +420,12 @@ pub fn link_proxy(p: &Project, chain: u64, proxy: Address) {
 /// Files to verify by hand on any explorer's "verify and publish" page: for each contract, the standard JSON input
 /// to upload (libraries linked in) and a note with every value the form asks for. Returns the folder.
 pub fn export(p: &Project, chain: u64, net: &str, recs: &BTreeMap<Address, Record>) -> std::path::PathBuf {
-    let out = p.root.join("verify").join(net);
+    // a network given as an RPC URL (which may carry an API key) is no name for a folder
+    let net = match net.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)) {
+        true => net.to_string(),
+        false => crate::rpc::name_of(chain).map_or(chain.to_string(), String::from),
+    };
+    let out = p.root.join("verify").join(&net);
     std::fs::create_dir_all(&out).unwrap_or_else(|e| crate::die(&format!("{}: {e}", out.display())));
     // (chainlist files 31337 under another chain; a dev chain has no explorer)
     let explorers = if matches!(chain, 31337 | 1337) { vec![] } else { rpc::chain_info(chain).map(|c| c.explorers).unwrap_or_default() };

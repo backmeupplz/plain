@@ -52,7 +52,7 @@ The sections below go through each step. If you'd rather not remember any of it,
 
 ```
 $ plain
-plain. 0.2.0 · ~/code/my-project
+plain. 0.3.0 · ~/code/my-project
 Contracts live in src/ and tests in test/; each step shows the command it runs.
 ? What next?
 ❯ Build     compile the contracts
@@ -91,8 +91,9 @@ The first build downloads the newest solc that satisfies your pragmas, or reuses
 plain test                     # compile what changed, then run every test
 plain test --watch             # the same, and again whenever you save a file
 plain test Vault               # only test files, suites and tests matching "Vault"
-plain test -v                  # list every test, with gas and fuzz runs
-plain test --fork base         # run against a fork of a live network
+plain test -v                  # list every test, with gas and fuzz runs (-vv, -vvv... work too)
+plain test --mt test_Deposit   # forge's --match-test and --match-contract (--mc) work as filters
+plain test --fork base         # run against a fork of a live network, at its latest block
 plain test --fuzz-runs 1000 --seed 42
 plain test --rerun             # run every suite again, even unchanged ones
 plain test --force             # recompile everything, then run everything
@@ -100,7 +101,9 @@ plain test --force             # recompile everything, then run everything
 
 `--watch` runs the tests, then watches `src/`, `test/`, `script/` and the config, and runs them again as soon as something changes. A compile error doesn't end it: fix the file and the next run starts on its own. Since unchanged suites reuse their results, a rerun after you edit one test usually takes about a second, even on big projects. It takes the other options too, so `plain test Vault --watch` keeps rerunning only the Vault tests.
 
-A filter matches suite paths like `test/Vault.t.sol:VaultTest` and test names, and only the test files it can match get compiled. The exit code is non-zero when anything fails, so plain works in CI and in scripts as it is.
+A filter matches suite paths like `test/Vault.t.sol:VaultTest` and test names, and only the test files it can match get compiled. A filter that matches nothing is an error rather than a pass, and so is an option plain doesn't know, since a mistyped flag would otherwise run fewer tests than you meant. The exit code is non-zero when anything fails, so plain works in CI and in scripts as it is. `FOUNDRY_PROFILE=ci` picks `[profile.ci]` from `foundry.toml`, as with forge.
+
+Tests run under the EVM rules your code is compiled for. That's the `evm_version` you configure; without one, plain follows forge: osaka, compiled for the newest EVM your solc supports, so the bytecode is the same forge would build. Fuzz inputs come partly from a dictionary of the constants in the contracts under test, which finds the magic values that random numbers miss.
 
 ### Writing tests
 
@@ -146,7 +149,16 @@ FAIL test_Deposit(uint96): OutOfFunds
          Vault.deposit() value: 79228162514264337593543950335  ✗ OutOfFunds
 ```
 
-Supported cheatcodes are `prank`/`startPrank`, `deal`, `warp`, `roll`, `fee`, `chainId`, `prevrandao`, `coinbase`, `store`/`load`, `etch`, nonces, `addr`/`sign`/`rememberKey`, `label`, `assume`, `skip`, `expectRevert` in all its forms, `expectEmit`, `expectCall`, `mockCall`, `recordLogs`/`getRecordedLogs`, `snapshotState`/`revertToState`, `env*`, `setEnv`, `toString`, `parse*`, `getCode`, `readFile`/`writeFile`, `ffi`, `computeCreate*Address`, the broadcast cheatcodes, gas snapshots and every `assert*`. Anything else fails with `unsupported cheatcode vm.<name>(...)`. A comment like `/// forge-config: default.fuzz.runs = 10` above a test sets its fuzz runs.
+Supported cheatcodes are `prank`/`startPrank`, `deal`, `warp`, `roll`, `fee`, `chainId`, `prevrandao`, `coinbase`, `store`/`load`, `etch`, nonces, `addr`/`sign`/`rememberKey`, `label`, `assume`, `skip`, `expectRevert` and `expectPartialRevert` in all their forms (with the reverting address too), `expectEmit`, `expectCall` (with value), `mockCall`, `recordLogs`/`getRecordedLogs`, `snapshotState`/`revertToState`, `env*`, `setEnv`, `toString`, `parse*`, `getCode`, `readFile`/`writeFile`/`exists`, `ffi`, `computeCreate*Address`, the broadcast cheatcodes, gas snapshots and every `assert*`. Anything else fails with `unsupported cheatcode vm.<name>(...)`. A comment like `/// forge-config: default.fuzz.runs = 10` above a test sets its fuzz runs, and `invariant.runs`, `invariant.depth` and `invariant.fail-on-revert` work the same way.
+
+plain follows forge 1.0's rules where they changed. `expectRevert(Error.selector)` matches only an error with no arguments, and `expectPartialRevert` is the selector-only match. `testFail*` tests fail with a note, because a test that passes whenever its body fails also passes when it fails for the wrong reason. `vm.ffi` runs only with `ffi = true` in the config, and the file cheatcodes reach only what `fs_permissions` opens, exactly as in forge:
+
+```toml
+ffi = true
+fs_permissions = [{ access = "read", path = "./deployments" }, { access = "read-write", path = "./out-files" }]
+```
+
+Invariant tests (`invariant*`, `statefulFuzz*`) check the state setUp leaves before the first call, call `afterInvariant()` after every run, and honor `targetContracts`, `targetSelectors`, `targetSenders` and their `exclude` forms. An invariant that has nothing to fuzz, or that uses `targetArtifacts` or `targetInterfaces`, fails rather than passing having checked less.
 
 ### Results are reused
 
@@ -154,7 +166,13 @@ A suite runs again only when its compiled code, the test settings, the plain bin
 
 ### TypeScript tests
 
-Any `test/**/*.test.ts` runs with `node --test`, or with `bun test` when it imports `bun:test`. Each file gets its own fresh chain, and files run in parallel. Two environment variables point at it: `PLAIN_RPC_URL`, an anvil-compatible JSON-RPC endpoint on chain 31337 with the ten default anvil accounts funded and unlocked, and `PLAIN_ARTIFACTS`, the folder holding `<Contract>.json` files with `abi` and `bytecode`. With viem:
+TypeScript tests are programs that run with your permissions, so plain runs them only when the project asks for that in `plain.toml`:
+
+```toml
+typescript = true
+```
+
+Then any `test/**/*.test.ts` runs with `node --test`, or with `bun test` when it imports `bun:test`, and gets the project's `.env`. Each file gets its own fresh chain, and files run in parallel. Two environment variables point at it: `PLAIN_RPC_URL`, an anvil-compatible JSON-RPC endpoint on chain 31337 with the ten default anvil accounts funded and unlocked, and `PLAIN_ARTIFACTS`, the folder holding `<Contract>.json` files with `abi` and `bytecode`. With viem:
 
 ```ts
 import { test } from "node:test";
@@ -228,7 +246,7 @@ Constructor arguments follow the contract name. Without `--broadcast`, plain sim
 simulated 1 transaction(s) against base-sepolia; add --broadcast to send
 ```
 
-With `--broadcast`, plain asks for the account's password, sends the transactions, saves the addresses and verifies every contract the deploy created.
+With `--broadcast`, plain asks for the account's password, sends the transactions, saves the addresses and verifies every contract the deploy created. Add `--confirm` to see the transactions and the most they can cost first, and send only when you answer yes; the menu deploys this way.
 
 ### To a local chain
 
@@ -264,14 +282,15 @@ contract Deploy is Script {
 plain deploy script/Deploy.s.sol --network base-sepolia --account deployer --broadcast
 ```
 
-`vm.startBroadcast(pk)` signs with another key, and `new X{salt: s}()` deploys through the deterministic CREATE2 deployer, like forge. External libraries the contracts link against are deployed first, from the deployer's address.
+In `run()`, `msg.sender` and `tx.origin` are the deployer, as with forge, so `new Vault(msg.sender)` makes the deployer the owner. `vm.startBroadcast(pk)` signs with another key, and `new X{salt: s}()` deploys through the deterministic CREATE2 deployer, like forge. External libraries the contracts link against are deployed first, from the deployer's address. A script runs `run()` with no arguments.
 
 ### What --broadcast does
 
-1. While solc compiles, plain connects to the network and reads the chain id, the latest block and the fees in one round trip. It compiles only the target and what it deploys.
-2. It runs the script against a fork of that block, then replays each transaction on its own, in order, the way the chain will run it. That gives each transaction's exact gas (sent with 30% headroom). Nothing is sent if a transaction would revert on chain or the account can't pay.
-3. It signs everything up front, sends the first transaction alone so a fee or balance problem stops the deploy early, sends the rest in one batch, and waits for the receipts.
-4. It saves the addresses and verifies every contract it created.
+1. While solc compiles, plain connects to the network and reads the chain id, the latest block and the fees in one round trip.
+2. It runs the script against a fork of that block under the EVM rules the code was compiled for, with the contract size limits chains enforce, then replays each transaction on its own, in order, the way the chain will run it. That gives each transaction's gas, sent with 30% headroom over what it needs before refunds. Nothing is sent if a transaction would revert on chain or the account can't pay.
+3. It compiles every contract the transactions create again, from exactly the sources and settings explorers will get, and sends nothing unless the bytecode is identical to what it's about to put on chain. A stale or tampered cache can't deploy anything your sources don't say.
+4. It checks that the account's next nonce is the one the simulation used, since later transactions call contracts at addresses that follow from it. It signs everything up front, sends the first transaction alone so a fee or balance problem stops the deploy early, sends the rest in one batch, and waits for the receipts.
+5. It saves the addresses and the verification records of what landed, even when something after it failed, and verifies every contract it created. A node on your machine (`plain node`, anvil, or a fork of a live chain) is never verified.
 
 ### Addresses
 
@@ -413,7 +432,7 @@ error: BoxBad can't take over Box's storage:
 fix the order of the variables, or --unsafe-skip-storage-check if this is intended
 ```
 
-The check compares solc's storage layout for the deployed implementation, compiled from the sources plain saved when it deployed it, with the layout of the new contract. It doesn't cover ERC-7201 namespaced storage, which is where OpenZeppelin 5's own contracts keep their state, so leave those structs alone or check them with OpenZeppelin's tools. A proxy plain didn't deploy has no saved layout to compare with, so check its layout yourself and upgrade it with `--unsafe-skip-storage-check`. The simulation also catches an upgrade from the wrong account before anything is sent:
+The check compares solc's storage layout for the deployed implementation, compiled from the sources plain saved when it deployed it, with the layout of the new contract. It goes into structs, arrays and mappings, compares what a user-defined value type wraps and an enum's members (which may only be added at the end), and checks every ERC-7201 namespace the same way, which is where OpenZeppelin 5's own contracts keep their state. A proxy plain didn't deploy has no saved layout to compare with, so check its layout yourself and upgrade it with `--unsafe-skip-storage-check`. A UUPS proxy can only be upgraded to a contract that can upgrade again, and the simulation checks that the proxy really points at the new implementation afterwards. It also catches an upgrade from the wrong account before anything is sent:
 
 ```
 error: upgrading Box reverted: OwnableUnauthorizedAccount(0x70997970C51812dc3A010C7d01b50e0d17dc79C8) (may 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 upgrade it?)
@@ -435,7 +454,7 @@ RPC URLs from providers like Alchemy or Infura contain your API key, so keep the
 
 ### Foundry projects
 
-Run plain in the project root as it is. It reads `foundry.toml`'s `[profile.default]` (solc version, optimizer, via-IR, remappings, fuzz and invariant settings, `rpc_endpoints` and `[etherscan]` keys), `remappings.txt`, `lib/` and `.env`, so nothing needs to change. Add `.plain/` to your `.gitignore`.
+Run plain in the project root as it is. It reads `foundry.toml`'s `[profile.default]` (or `FOUNDRY_PROFILE`'s: solc version, optimizer, via-IR, EVM version, remappings, fuzz and invariant settings, `ffi`, `fs_permissions`, `rpc_endpoints` and `[etherscan]` keys), `remappings.txt`, `lib/` and `.env`, so nothing needs to change. Add `.plain/` to your `.gitignore`.
 
 plain and forge can share a project. plain writes only to `.plain/`, plus `deployments/` when you deploy and `verify/` when you export, and forge keeps using `out/` and `cache/`, so you can keep both and switch whenever you like. Keystores from `cast wallet import` work with `--account`, and forge scripts deploy with `plain deploy` unchanged.
 
@@ -447,7 +466,7 @@ forge-std is built in, so a project works even when `lib/forge-std` isn't checke
 
 ### Hardhat projects
 
-Contracts in `contracts/` and imports from `node_modules` compile as they are. plain runs Solidity tests and plain TypeScript tests (see above), so tests written for Hardhat's own runner keep running under Hardhat.
+Contracts in `contracts/` and imports from `node_modules` compile as they are. plain runs Solidity tests, and plain TypeScript tests once `typescript = true` is set (see above), so tests written for Hardhat's own runner keep running under Hardhat.
 
 ## Dependencies
 
@@ -466,9 +485,12 @@ solc = "0.8.28"          # default: newest version satisfying every pragma
 optimizer = true         # default: true (Foundry projects: on only if optimizer_runs is set, like forge)
 optimizer_runs = 200
 via_ir = false
-evm_version = "cancun"   # default: solc's default
+evm_version = "cancun"   # default: as forge: osaka, compiled for the newest your solc supports
 remappings = ["@x/=lib/x/src/"]
 src = "src"              # default: src, or contracts if there is no src
+ffi = false              # vm.ffi runs commands: off unless set, as in forge
+fs_permissions = []      # what the file cheatcodes may read or write, as in forge
+typescript = false       # run test/**/*.test.ts (plain.toml only)
 [fuzz]
 runs = 256
 [invariant]
@@ -476,7 +498,17 @@ runs = 256
 depth = 500
 ```
 
-Secrets stay out of these files. plain reads the project's `.env` the way forge does, filling in only the variables your environment doesn't already set, so `PRIVATE_KEY`, `ETHERSCAN_API_KEY` and `<NAME>_RPC_URL` can live there. Settings for every project, like the Etherscan key the menu saves, live in `~/.plain/config.toml`.
+Secrets stay out of these files. plain reads the project's `.env` for `PRIVATE_KEY`, `ETHERSCAN_API_KEY`, `<NAME>_RPC_URL`, `${VAR}` in the config and the `vm.env*` cheatcodes, after your environment's own variables. It never puts `.env` into its environment or that of the programs it starts, so a cloned repository's `.env` can't change how plain or solc runs. Settings for every project, like the Etherscan key the menu saves, live in `~/.plain/config.toml`.
+
+## Security
+
+Building and testing a repository with plain stays inside the EVM and the repository's own folder unless its config asks for more, as with forge. That config can ask, so read a `foundry.toml` or `plain.toml` you don't trust like code (it can also name the RPCs your deploys go through):
+
+- `plain build` runs nothing but solc. Solc versions come checksummed from soliditylang.org, or from Foundry's own cache, and a repository's `.env` can't point plain at another one.
+- Tests run in the EVM. `vm.ffi` needs `ffi = true`, the file cheatcodes reach only what `fs_permissions` opens (never `.git`, `.plain`, the config or `.env`), and TypeScript tests need `typescript = true`.
+- The build cache is keyed with a secret of your machine's own, so a `.plain/` folder that comes with a repository can't stand in for compiling it. Deploy records in `.plain/deploys` are checked before plain reads files or uploads anything they name.
+- A deploy sends only bytecode that solc produces from your sources: everything it creates is compiled again, from the exact input explorers verify, and compared before signing. `plain build --check` runs the same comparison over every contract, for CI or before an audit.
+- Keys stay in encrypted keystores, and a key is unlocked only when a transaction is about to be signed.
 
 ## Plugins
 
@@ -484,4 +516,4 @@ Secrets stay out of these files. plain reads the project's `.env` the way forge 
 
 ## What plain doesn't do yet
 
-Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, more than one fork inside a test (`vm.createSelectFork` uses the single `--fork`), the `vm.deployCode` cheatcode (use `vm.getCode` with `create`), beacon proxies, and checking ERC-7201 namespaced storage during upgrades. Library linking only works for libraries under `src/`, `test/` or `script/`. If you need one of these, [open an issue](https://github.com/backmeupplz/plain/issues).
+Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, more than one fork inside a test (`vm.createSelectFork` uses the single `--fork`), the `vm.deployCode` cheatcode (forge-std's `deployCode` works), `targetArtifacts`/`targetInterfaces` in invariant tests, OpenZeppelin 4's transparent proxies, beacon proxies, and Windows. Library linking only works for libraries under `src/`, `test/` or `script/`. If you need one of these, [open an issue](https://github.com/backmeupplz/plain/issues).

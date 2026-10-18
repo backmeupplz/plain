@@ -35,19 +35,37 @@ fn switch(args: &mut Vec<String>, names: &[&str]) -> bool {
     n != args.len()
 }
 
+/// What's left after the known options must not be an option: a mistyped or unsupported flag would otherwise
+/// pass for an argument, or be dropped, and change what runs.
+fn no_options(args: &[String]) {
+    if let Some(a) = args.iter().find(|a| a.starts_with('-') && a.len() > 1 && a.parse::<f64>().is_err()) {
+        let hint = match a.as_str() {
+            "--rpc-url" | "-r" => " (plain takes --network <name|chain id|url>)",
+            "--private-key" | "--mnemonic" | "--keystore" | "--ledger" | "--trezor" => " (plain signs with --account <name> or $PRIVATE_KEY)",
+            "--sig" | "-s" => " (plain runs a script's run(), which takes no arguments)",
+            "--verify" => " (plain verifies after every broadcast; --no-verify turns it off)",
+            "--gas-report" | "--match-path" | "--mp" | "--no-match-test" | "--nmt" | "--no-match-contract" | "--nmc" | "--no-match-path" | "--nmp" => " (not supported yet)",
+            _ => "",
+        };
+        die(&format!("unknown option {a}{hint}; see plain help"));
+    }
+}
+
 const USAGE: &str = "plain: compile, test and deploy EVM contracts
 
 usage:
   plain                                      in a terminal: a menu for everything below
   plain init                                 scaffold src/Counter.sol + test/Counter.t.sol
-  plain build [--force]                      compile src/, test/, script/ (solc auto-selected from pragmas)
+  plain build [--force] [--check]            compile src/, test/, script/ (solc auto-selected from pragmas);
+                                             --check: confirm each contract matches solc's own compile
   plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts;
              [--fuzz-runs N] [--seed N]      unchanged suites reuse their results (--rerun: run them anyway,
              [--rerun] [--force] [--watch]   --force: also recompile, --watch: again on every save)
   plain deploy <Contract|script.s.sol> [args] [--network name|id|url] [--account name] [--broadcast]
-             [--proxy] [--no-verify]         simulate, then send with --broadcast and verify on Sourcify,
-                                             Blockscout and Etherscan; --proxy: behind an OpenZeppelin proxy,
-                                             args going to initialize()
+             [--confirm] [--proxy] [--no-verify]
+                                             simulate, then send with --broadcast (--confirm: ask first) and
+                                             verify on Sourcify, Blockscout and Etherscan; --proxy: behind an
+                                             OpenZeppelin proxy, args going to initialize()
   plain upgrade <proxy> [Contract] [--call fn args...] --network net [--account name] [--broadcast]
                                              check the storage layout, then point the proxy at a new
                                              implementation (default: its contract as the source is now)
@@ -62,7 +80,9 @@ usage:
 networks: any chain on chainlist.org by name or id (base, base-sepolia, arbitrum, linea, 8453, ...),
           local, or a URL; $<NAME>_RPC_URL or plain.toml [networks] picks the RPC
 keys:     --account, or $PRIVATE_KEY (local chains use their first dev account); $ETHERSCAN_API_KEY for
-          Etherscan; the project's .env is read too
+          Etherscan; the project's .env is read for these, never exported to other programs
+outside the EVM: vm.ffi needs ffi = true, file cheatcodes need fs_permissions (as in forge), and
+          test/**/*.test.ts run only with typescript = true (they're programs with your permissions)
 ";
 
 pub fn init() {
@@ -124,7 +144,11 @@ fn watch(p: &project::Project, args: &[String]) -> ! {
 
 fn main() {
     project::load_env();
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // --flag=value is --flag value
+    let mut args: Vec<String> = std::env::args().skip(1).flat_map(|a| match a.split_once('=').filter(|_| a.starts_with("--")) {
+        Some((k, v)) => vec![k.to_string(), v.to_string()],
+        None => vec![a],
+    }).collect();
     if args.is_empty() && ui::tty() {
         return menu::run();
     }
@@ -133,22 +157,48 @@ fn main() {
     match cmd.as_str() {
         "build" => {
             let p = project::Project::load();
-            let out = solc::build(&p, switch(&mut args, &["--force"]), solc::Scope::All);
+            let check = switch(&mut args, &["--check"]);
+            let force = switch(&mut args, &["--force"]);
+            no_options(&args);
+            let out = solc::build(&p, force, solc::Scope::All);
             eprintln!("compiled {} files with solc {} in {:.2?} ({} contracts)", out.compiled, out.solc, t.elapsed(), out.artifacts.len());
+            if check {
+                let t = Instant::now();
+                let bad = solc::check(&p, &out);
+                for b in &bad {
+                    eprintln!("MISMATCH {b}");
+                }
+                if !bad.is_empty() {
+                    die(&format!("{} contract(s) differ from solc's own compile of their sources", bad.len()));
+                }
+                eprintln!("checked: every deployable contract is byte-identical to solc's compile of its standard JSON input ({:.2?})", t.elapsed());
+            }
         }
         "test" => {
             let p = project::Project::load();
             if switch(&mut args, &["--watch", "-w"]) {
                 watch(&p, &args);
             }
-            let verbose = switch(&mut args, &["-v", "--verbose"]);
+            let verbose = switch(&mut args, &["-v", "-vv", "-vvv", "-vvvv", "-vvvvv", "--verbose"]);
             let force = switch(&mut args, &["--force"]);
             let rerun = switch(&mut args, &["--rerun"]);
-            let fork = flag(&mut args, "--fork").map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
+            let fork = flag(&mut args, "--fork").or_else(|| flag(&mut args, "--fork-url")).map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
-            let seed = flag(&mut args, "--seed").map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
+            let seed = flag(&mut args, "--seed").or_else(|| flag(&mut args, "--fuzz-seed")).map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
+            // forge's filters are regexes; plain's is one substring of a suite or test name, which these become
+            for f in ["--match-test", "--mt", "--match-contract", "--mc"] {
+                if let Some(v) = flag(&mut args, f) {
+                    args.push(v);
+                }
+            }
+            no_options(&args);
+            if args.len() > 1 {
+                die(&format!("plain test takes one filter, got {}", args.join(" ")));
+            }
             let filter = args.first().cloned();
-            let ts_files = ts::files(&p.root, &p.dirs[1], filter.as_deref());
+            let mut ts_files = ts::files(&p.root, &p.dirs[1], filter.as_deref());
+            // TypeScript tests are programs with your permissions: only when the project's config asks for them
+            let skipped_ts = if p.typescript { 0 } else { std::mem::take(&mut ts_files).len() };
             // a filter compiles only the test files it can match; TypeScript tests need every artifact
             let scope = solc::Scope::Tests(filter.clone().filter(|_| ts_files.is_empty()));
             let out = solc::build(&p, force, scope);
@@ -156,13 +206,23 @@ fn main() {
                 eprintln!("compiled {} files in {:.2?}", out.compiled, t.elapsed());
             }
             let has_sol = out.artifacts.iter().any(test::is_test_contract);
+            // a filter that matches nothing is a typo, not a pass
+            if let Some(f) = filter.as_deref().filter(|f| ts_files.is_empty() && !out.artifacts.iter().any(|a| test::is_test_contract(a) && test::matches(a, f))) {
+                die(&format!("no test matches {f:?}"));
+            }
             let mut ok = true;
             if has_sol || ts_files.is_empty() {
-                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none() };
+                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none(), access: std::sync::Arc::new(p.access.clone()), spec: evm::spec(&out.evm) };
                 ok &= test::run(out.artifacts, &p.root, &opts);
             }
             if !ts_files.is_empty() {
                 ok &= ts::run(&p.root, &ts_files, verbose, fork);
+            }
+
+            if skipped_ts > 0 {
+                eprintln!("skipped {skipped_ts} TypeScript test file(s): they run as programs on this machine, so plain runs them only with `typescript = true` in plain.toml");
+                // a project whose only tests were skipped hasn't passed anything
+                ok &= has_sol;
             }
             if !ok {
                 std::process::exit(1);
@@ -175,6 +235,8 @@ fn main() {
             let broadcast = switch(&mut args, &["--broadcast"]);
             let verify = !switch(&mut args, &["--no-verify"]);
             let proxy = switch(&mut args, &["--proxy"]);
+            let confirm = switch(&mut args, &["--confirm"]);
+            no_options(&args);
             if args.is_empty() {
                 die("usage: plain deploy <Contract|script.s.sol> [args...] [--network name|id|url] [--account name] [--broadcast] [--proxy] [--no-verify]");
             }
@@ -191,7 +253,7 @@ fn main() {
                     std::thread::spawn(move || rpc::chain_info(c));
                 }
             }
-            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify, account, proxy, upgrade: None });
+            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify, account, proxy, upgrade: None, confirm });
         }
         "upgrade" => {
             let p = project::Project::load();
@@ -201,6 +263,8 @@ fn main() {
             let broadcast = switch(&mut args, &["--broadcast"]);
             let verify = !switch(&mut args, &["--no-verify"]);
             let unchecked = switch(&mut args, &["--unsafe-skip-storage-check"]);
+            let confirm = switch(&mut args, &["--confirm"]);
+            no_options(&args);
             if args.is_empty() {
                 die("usage: plain upgrade <proxy name|address> [Contract] [--call function args...] --network net [--account name] [--broadcast]");
             }
@@ -217,12 +281,13 @@ fn main() {
                 let c = conn.chain;
                 std::thread::spawn(move || rpc::chain_info(c));
             }
-            deploy::run(&p, out, Some(conn), deploy::Opts { target: plan.target.clone(), args, broadcast, verify, account, proxy: false, upgrade: Some(plan) });
+            deploy::run(&p, out, Some(conn), deploy::Opts { target: plan.target.clone(), args, broadcast, verify, account, proxy: false, upgrade: Some(plan), confirm });
         }
         "verify" => {
             let p = project::Project::load();
             let export = switch(&mut args, &["--export"]);
             let network = flag(&mut args, "--network");
+            no_options(&args);
             let chain = match &network {
                 Some(n) => match n.parse::<u64>().ok().or_else(|| rpc::NETWORKS.iter().find(|x| x.0 == n).map(|x| x.1)) {
                     Some(c) => c,
@@ -240,7 +305,10 @@ fn main() {
             let mut all = verify::load(&p, chain);
             let mut recs: std::collections::BTreeMap<_, _> = all.iter().filter(|(a, r)| args.is_empty() || args.iter().any(|x| x.eq_ignore_ascii_case(&a.to_string()) || *x == r.name || *x == r.contract)).map(|(a, r)| (*a, r.clone())).collect();
             if recs.is_empty() {
-                die(&format!("no deploy recorded on chain {chain} matches {}", args.join(" ")));
+                match args.is_empty() {
+                    true => die(&format!("nothing plain deployed is recorded for chain {chain}")),
+                    false => die(&format!("no deploy recorded on chain {chain} matches {}", args.join(" "))),
+                }
             }
             if export {
                 let net = network.unwrap_or_else(|| rpc::name_of(chain).map_or(chain.to_string(), String::from));

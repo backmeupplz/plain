@@ -9,6 +9,7 @@ interface Vm {
     function warp(uint256) external;
     function expectRevert(bytes calldata) external;
     function expectRevert(bytes4) external;
+    function expectPartialRevert(bytes4) external;
     function expectEmit(bool, bool, bool, bool) external;
     function assume(bool) external;
     function addr(uint256) external returns (address);
@@ -40,7 +41,9 @@ contract CounterTest {
         vm.expectRevert(abi.encodeWithSelector(Counter.NotOwner.selector, address(0xBEEF)));
         c.set(1);
     }
-    function testSelectorRevert() public { vm.prank(address(1)); vm.expectRevert(Counter.NotOwner.selector); c.set(1); }
+    function testSelectorRevert() public { vm.prank(address(1)); vm.expectPartialRevert(Counter.NotOwner.selector); c.set(1); }
+    function testExactRevert() public { vm.prank(address(1)); vm.expectRevert(abi.encodeWithSelector(Counter.NotOwner.selector, address(1))); c.set(1); }
+    function testBadSelectorOnly() public { vm.prank(address(1)); vm.expectRevert(Counter.NotOwner.selector); c.set(1); }
     function testStringRevert() public { vm.expectRevert(bytes("boom")); c.boom(); }
     function testEmit() public { vm.expectEmit(true, false, false, true); emit Set(address(this), 7); c.set(7); }
     function testDealWarp() public {

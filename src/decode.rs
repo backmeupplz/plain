@@ -7,11 +7,22 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub struct Tables {
-    /// (name, sorted selectors, creation code) for every contract with runtime code
-    pub contracts: Vec<(String, Vec<[u8; 4]>, Vec<u8>)>,
+    /// every contract with runtime code
+    pub contracts: Vec<Known>,
     pub errors: HashMap<[u8; 4], alloy_json_abi::Error>,
     pub functions: HashMap<[u8; 4], alloy_json_abi::Function>,
     pub events: HashMap<alloy_primitives::B256, alloy_json_abi::Event>,
+}
+
+pub struct Known {
+    /// "path:Name"
+    pub id: String,
+    pub name: String,
+    /// sorted function selectors
+    pub sels: Vec<[u8; 4]>,
+    /// creation code, with where its library placeholders are
+    pub code: Vec<u8>,
+    pub holes: Vec<usize>,
 }
 
 static TABLES: OnceLock<Tables> = OnceLock::new();
@@ -24,7 +35,8 @@ pub fn init(arts: &[Artifact]) {
             if !a.deployed.is_empty() && a.shard == 0 {
                 let mut sels: Vec<[u8; 4]> = abi.functions().map(|f| f.selector().0).collect();
                 sels.sort();
-                t.contracts.push((a.name.clone(), sels, hex::decode(&a.bytecode).unwrap_or_default()));
+                let (code, holes) = unlinked(&a.bytecode);
+                t.contracts.push(Known { id: format!("{}:{}", a.file, a.name), name: a.name.clone(), sels, code, holes });
             }
             for e in abi.errors() {
                 t.errors.insert(e.selector().0, e.clone());
@@ -40,16 +52,53 @@ pub fn init(arts: &[Artifact]) {
     });
 }
 
+/// Creation code with each library placeholder (`__$…$__`, 20 bytes) zeroed, and the byte offsets of those.
+fn unlinked(code: &str) -> (Vec<u8>, Vec<usize>) {
+    let mut s = code.to_string();
+    let mut holes = vec![];
+    while let Some(i) = s.find("__$") {
+        let end = (i + 40).min(s.len());
+        s.replace_range(i..end, &"0".repeat(end - i));
+        holes.push(i / 2);
+    }
+    (hex::decode(&s).unwrap_or_default(), holes)
+}
+
+/// Whether `init` starts with `code`, whatever addresses the libraries were linked at.
+fn fits(init: &[u8], code: &[u8], holes: &[usize]) -> bool {
+    if init.len() < code.len() {
+        return false;
+    }
+    let mut at = 0;
+    for &h in holes.iter().filter(|h| **h + 20 <= code.len()) {
+        if init[at..h] != code[at..h] {
+            return false;
+        }
+        at = h + 20;
+    }
+    init[at..code.len()] == code[at..]
+}
+
 pub fn tables() -> Option<&'static Tables> {
     TABLES.get()
 }
 
-/// Name a deployed contract by matching its dispatcher's PUSH4 selectors against known ABIs.
-/// (Exact bytecode comparison fails under via-IR, whose output depends on the compilation unit.)
+/// A deployed contract's name.
 pub fn contract_name(init: &[u8], runtime: &[u8]) -> Option<String> {
+    identify(init, runtime).map(|k| k[0].name.clone())
+}
+
+/// A deployed contract's artifact ("path:Name"), when that's certain.
+pub fn contract_id(init: &[u8], runtime: &[u8]) -> Option<String> {
+    identify(init, runtime).filter(|k| k.len() == 1).map(|k| k[0].id.clone())
+}
+
+/// The contracts a deployment could be, all with one name: by its creation code, else by matching its dispatcher's
+/// PUSH4 selectors against known ABIs (creation code embedded in another contract can differ under via-IR).
+fn identify(init: &[u8], runtime: &[u8]) -> Option<Vec<&'static Known>> {
     let t = tables()?;
-    if let Some((n, _, _)) = t.contracts.iter().filter(|(_, _, c)| !c.is_empty() && init.starts_with(c)).max_by_key(|(_, _, c)| c.len()) {
-        return Some(n.clone());
+    if let Some(k) = t.contracts.iter().filter(|k| !k.code.is_empty() && fits(init, &k.code, &k.holes)).max_by_key(|k| k.code.len()) {
+        return Some(vec![k]);
     }
     let mut pushed = std::collections::HashSet::new();
     let mut i = 0;
@@ -66,11 +115,11 @@ pub fn contract_name(init: &[u8], runtime: &[u8]) -> Option<String> {
         }
         i += if (0x60..=0x7f).contains(&op) { (op - 0x5f) as usize + 1 } else { 1 };
     }
-    let hits: Vec<_> = t.contracts.iter().filter(|(_, sels, _)| !sels.is_empty() && sels.iter().all(|s| pushed.contains(s))).collect();
-    let best = hits.iter().map(|(_, s, _)| s.len()).max()?;
-    let top: Vec<_> = hits.iter().filter(|(_, s, _)| s.len() == best).collect();
+    let hits: Vec<&Known> = t.contracts.iter().filter(|k| !k.sels.is_empty() && k.sels.iter().all(|s| pushed.contains(s))).collect();
+    let best = hits.iter().map(|k| k.sels.len()).max()?;
+    let top: Vec<&Known> = hits.into_iter().filter(|k| k.sels.len() == best).collect();
     // identical ABIs of differently named contracts are ambiguous: no name beats a wrong one
-    top.iter().all(|t| t.0 == top[0].0).then(|| top[0].0.clone())
+    top.iter().all(|k| k.name == top[0].name).then_some(top)
 }
 
 pub fn revert_msg(msg: &str) -> Bytes {
@@ -197,8 +246,10 @@ pub fn assertion(name: &str, ty: &DynSolType, data: &[u8]) -> Result<(), String>
         "assertGe" => cmp(&v[0], &v[1]) != Some(Less),
         "assertApproxEqAbs" => delta(&v[0], &v[1]).zip(num(&v[2])).is_some_and(|(d, (_, max))| d <= max),
         "assertApproxEqRel" => match (delta(&v[0], &v[1]), num(&v[1]), num(&v[2])) {
+            // in 512 bits: a big delta times 1e18 must not saturate into a pass
             (Some(d), Some((_, b)), Some((_, max))) => {
-                if b.is_zero() { d.is_zero() } else { d.saturating_mul(U256::from(10).pow(U256::from(18))) / b <= max }
+                use alloy_primitives::U512;
+                if b.is_zero() { d.is_zero() } else { U512::from(d) * U512::from(10u64.pow(18)) / U512::from(b) <= U512::from(max) }
             }
             _ => false,
         },

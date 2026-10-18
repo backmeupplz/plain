@@ -24,6 +24,19 @@ pub struct Opts {
     pub quiet_if_empty: bool,
     /// reuse results of suites whose bytecode, settings and inputs haven't changed (not with --force or --fork)
     pub cache: bool,
+    /// what tests may reach outside the EVM
+    pub access: Arc<crate::project::Access>,
+    /// the EVM rules the code was compiled for
+    pub spec: revm::primitives::hardfork::SpecId,
+}
+
+/// `/// forge-config:` settings above a test function.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Inline {
+    fuzz_runs: Option<u32>,
+    inv_runs: Option<u32>,
+    inv_depth: Option<u32>,
+    fail_on_revert: Option<bool>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -61,7 +74,7 @@ struct Entry {
 
 /// Results are deterministic given the test contract's bytecode, the settings, this binary and what the
 /// suite read (artifacts it deployed, files, env vars): the key covers the first three, `Entry::deps` the rest.
-fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, u32>) -> String {
+fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, Inline>) -> String {
     use sha2::Digest;
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let exe = EXE.get_or_init(|| {
@@ -70,7 +83,7 @@ fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, u32>) -> Stri
     });
     let mut inline: Vec<_> = inline.iter().collect();
     inline.sort();
-    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{}|{inline:?}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.seed, opts.allow_internal_revert);
+    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{}|{inline:?}|{:?}|{:?}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.seed, opts.allow_internal_revert, opts.access, opts.spec);
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
@@ -127,16 +140,27 @@ pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artif
     db
 }
 
+/// Whether a filter selects anything in a test contract: its id or one of its tests.
+pub fn matches(a: &Artifact, filter: &str) -> bool {
+    format!("{}:{}", a.file, a.name).contains(filter) || a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["name"].as_str().is_some_and(|n| crate::rewrite::is_test_name(n) && n.contains(filter))))
+}
+
 pub fn is_test_contract(a: &Artifact) -> bool {
-    !a.bytecode.is_empty()
-        && a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["type"] == "function" && x["name"].as_str().is_some_and(|n| n.starts_with("test") || n.starts_with("invariant"))))
+    !a.bytecode.is_empty() && a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["type"] == "function" && x["name"].as_str().is_some_and(crate::rewrite::is_test_name)))
 }
 
 pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     let t0 = Instant::now();
     decode::init(&arts);
     let arts = Arc::new(arts);
-    let remote = evm::Remote(opts.fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None))), None);
+    let fork = opts.fork.as_ref().map(|u| Arc::new(evm::Fork::new(u, None)));
+    // on a fork, tests see the forked block: its chain id, number, timestamp and fees, as forge does
+    let mut env = match &fork {
+        Some(f) => f.env().unwrap_or_else(|e| crate::die(&format!("fork: {e}"))),
+        None => Env::new(31337),
+    };
+    env.spec = opts.spec;
+    let remote = evm::Remote(fork, None);
     let suites: Vec<&Artifact> = arts.iter().filter(|a| is_test_contract(a)).collect();
     // a sharded test contract has one artifact per unit: a test runs on the unit that owns it; tests no unit
     // owns but every unit has (inherited from other files) run on unit 0
@@ -167,7 +191,7 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     let mut results: Vec<Suite> = suites
         .par_iter()
         .zip(skips.par_iter())
-        .filter_map(|(art, skip)| run_suite(art, &arts, root, opts, &remote, filter, skip))
+        .filter_map(|(art, skip)| run_suite(art, &arts, root, opts, &remote, &env, filter, skip))
         .collect();
     results.sort_by(|a, b| a.id.cmp(&b.id));
     results.dedup_by(|b, a| {
@@ -242,12 +266,13 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
     fail == 0
 }
 
-fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, filter: Option<&str>, skip: &std::collections::HashSet<[u8; 4]>) -> Option<Suite> {
+#[allow(clippy::too_many_arguments)]
+fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, env: &Env, filter: Option<&str>, skip: &std::collections::HashSet<[u8; 4]>) -> Option<Suite> {
     let id = format!("{}:{}", art.file, art.name);
     let abi: JsonAbi = serde_json::from_value(art.abi.clone()).ok()?;
     let mut tests: Vec<&Function> = abi
         .functions()
-        .filter(|f| f.name.starts_with("test") || f.name.starts_with("invariant"))
+        .filter(|f| crate::rewrite::is_test_name(&f.name))
         .filter(|f| !skip.contains(&f.selector().0))
         .filter(|f| filter.is_none_or(|flt| id.contains(flt) || f.name.contains(flt)))
         .collect();
@@ -256,7 +281,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     }
     tests.sort_by(|a, b| a.name.cmp(&b.name));
     let t0 = Instant::now();
-    let inline = inline_runs(&root.join(&art.file));
+    let inline = inline_config(&root.join(&art.file));
     // results of an unchanged suite come from its last run
     let key = opts.cache.then(|| cache_key(art, opts, &inline));
     let old: Option<Entry> = key
@@ -278,7 +303,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
         return Some(Suite { id, results: cached, elapsed: t0.elapsed(), cached: n });
     }
     let reads = key.as_ref().map(|_| Arc::new(std::sync::Mutex::new(evm::Reads::default())));
-    let mut results = execute(art, arts, root, opts, remote, &id, &abi, tests, &inline, reads.clone());
+    let mut results = execute(art, arts, root, opts, remote, env, &id, &abi, tests, &inline, reads.clone());
     if let (Some(k), Some(r)) = (key, reads) {
         let r = r.lock().unwrap();
         if !r.impure {
@@ -301,13 +326,13 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
 
 /// Deploys the suite, runs setUp, then `tests` on copies of the post-setUp state.
 #[allow(clippy::too_many_arguments)]
-fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, id: &str, abi: &JsonAbi, tests: Vec<&Function>, inline: &HashMap<String, u32>, reads: Option<Arc<std::sync::Mutex<evm::Reads>>>) -> Vec<TestResult> {
-    let mut cheats = Cheats::new(arts.clone(), root.to_path_buf());
+fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, env: &Env, id: &str, abi: &JsonAbi, tests: Vec<&Function>, inline: &HashMap<String, Inline>, reads: Option<Arc<std::sync::Mutex<evm::Reads>>>) -> Vec<TestResult> {
+    let mut cheats = Cheats::new(arts.clone(), root.to_path_buf(), opts.access.clone());
     cheats.reads = reads;
     cheats.fork_url = opts.fork.clone();
     cheats.track_creates = true;
     cheats.allow_internal_revert = opts.allow_internal_revert;
-    let mut env = Env::new(31337);
+    let mut env = env.clone();
     let db = evm::base_db(remote.clone());
     let mut libs = HashMap::new();
     let (db, r) = deploy(db, &mut env, &mut cheats, arts, art, &[], &mut libs);
@@ -330,6 +355,9 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
         let r;
         (db, r) = evm::transact(db, &mut env, &mut cheats, SENDER, TxKind::Call(addr), Bytes::from_static(&[0x0a, 0x92, 0x54, 0xe4]), U256::ZERO, true);
         let pending = cheats.finish();
+        if r.output.as_ref() == SKIP_MAGIC {
+            return tests.iter().map(|f| TestResult { name: sig(f), status: Status::Skip("skipped in setUp".into()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }).collect();
+        }
         if !r.ok || pending.is_some() {
             let why = if r.ok { pending.unwrap() } else { decode::reason(&r.output) };
             return fail_all(format!("setUp() failed: {why}"), cheats.console);
@@ -338,14 +366,18 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
     cheats.console.clear();
     cheats.track_creates = false;
     cheats.names.insert(addr, art.name.clone());
+    cheats.ids.insert(addr, format!("{}:{}", art.file, art.name));
     // the post-setUp state, shared read-only: each test/run executes on an overlay of it
     let db = Arc::new(db);
-    let (invariants, tests): (Vec<&Function>, Vec<&Function>) = tests.into_iter().partition(|f| f.name.starts_with("invariant"));
+    // the fuzzer's dictionary: constants in the code of the contracts setUp made, and of the test itself
+    let dict = Dict { targets: constants(&db, cheats.names.keys().copied().filter(|a| *a != addr)), own: constants(&db, std::iter::once(addr)) };
+    let (invariants, tests): (Vec<&Function>, Vec<&Function>) = tests.into_iter().partition(|f| crate::rewrite::is_invariant_name(&f.name));
     let mut results: Vec<TestResult> = tests
         .par_iter()
         .map(|f| {
             let t = Instant::now();
-            let r = invert_fail(run_test(f, addr, &db, &env, &cheats, inline.get(&f.name).copied().unwrap_or(opts.fuzz_runs), opts), f);
+            let runs = inline.get(&f.name).and_then(|i| i.fuzz_runs).unwrap_or(opts.fuzz_runs);
+            let r = legacy_fail(run_test(f, addr, &db, &env, &cheats, runs, opts, &dict), f);
             if std::env::var_os("PLAIN_DEBUG").is_some() {
                 eprintln!("test {:.1?} {}:{}", t.elapsed(), id, r.name);
             }
@@ -353,29 +385,89 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
         })
         .collect();
     if !invariants.is_empty() {
-        results.extend(run_invariants(&invariants, addr, &db, &env, &cheats, opts));
+        // invariants with the same settings share their call sequences
+        let mut groups: Vec<((u32, u32, bool), Vec<&Function>)> = vec![];
+        for f in invariants {
+            let i = inline.get(&f.name).copied().unwrap_or_default();
+            let (runs, depth, revert) = opts.invariant;
+            let key = (i.inv_runs.unwrap_or(runs), i.inv_depth.unwrap_or(depth), i.fail_on_revert.unwrap_or(revert));
+            match groups.iter_mut().find(|g| g.0 == key) {
+                Some(g) => g.1.push(f),
+                None => groups.push((key, vec![f])),
+            }
+        }
+        for (key, invs) in groups {
+            results.extend(run_invariants(&invs, key, addr, &db, &env, &cheats, opts, abi, &dict));
+        }
         results.sort_by(|a, b| a.name.cmp(&b.name));
     }
     results
 }
 
-/// `/// forge-config: default.fuzz.runs = N` natspec above a test function.
-fn inline_runs(path: &std::path::Path) -> HashMap<String, u32> {
+/// Values for the fuzzer to try, from bytecode: the code under test, and the test's own (forge's dictionary).
+#[derive(Default)]
+struct Dict {
+    targets: Vec<U256>,
+    own: Vec<U256>,
+}
+
+/// The values PUSHed by the code at `addrs`, less what every contract pushes: function selectors, event topics,
+/// the cheatcode and console addresses.
+fn constants(db: &Db, addrs: impl Iterator<Item = Address>) -> Vec<U256> {
+    let noise: std::collections::HashSet<U256> = decode::tables()
+        .map(|t| t.functions.keys().chain(t.errors.keys()).map(|s| U256::from_be_slice(s)).chain(t.events.keys().map(|e| U256::from_be_bytes(e.0))).collect())
+        .unwrap_or_default();
+    let skip = |v: &U256| noise.contains(v) || [evm::CHEATS, evm::CONSOLE, evm::CREATE2_DEPLOYER].iter().any(|a| U256::from_be_slice(a.as_slice()) == *v);
+    let mut out = std::collections::BTreeSet::new();
+    for a in addrs {
+        let Some(code) = db.cache.accounts.get(&a).and_then(|acc| acc.info.code.as_ref()).map(|c| c.original_bytes()) else { continue };
+        let mut i = 0;
+        while i < code.len() {
+            let op = code[i];
+            if (0x60..=0x7f).contains(&op) {
+                let n = (op - 0x5f) as usize;
+                if let Some(b) = code.get(i + 1..i + 1 + n) {
+                    let v = U256::from_be_slice(b);
+                    // most pushes are jump targets: offsets of a JUMPDEST in this very code, not constants
+                    let target = n <= 2 && v < U256::from(code.len()) && code[v.to::<usize>()] == 0x5b;
+                    if !skip(&v) && !target {
+                        out.insert(v);
+                    }
+                }
+                i += n;
+            }
+            i += 1;
+            if out.len() >= 8192 {
+                break;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `/// forge-config: default.fuzz.runs = N` (and `invariant.runs`, `invariant.depth`, `invariant.fail-on-revert`)
+/// natspec above a test function.
+fn inline_config(path: &std::path::Path) -> HashMap<String, Inline> {
     let mut out = HashMap::new();
     let Ok(src) = std::fs::read_to_string(path) else { return out };
-    let mut pending = None;
+    let mut pending: Option<Inline> = None;
     for line in src.lines() {
         let t = line.trim();
         if let Some(cfg) = t.split("forge-config:").nth(1) {
             if let Some((k, v)) = cfg.split_once('=') {
-                let k = k.trim();
-                if k == "default.fuzz.runs" || k == "fuzz.runs" {
-                    pending = v.trim().parse().ok();
+                let (k, v) = (k.trim().trim_start_matches("default."), v.trim());
+                let p = pending.get_or_insert_default();
+                match k {
+                    "fuzz.runs" => p.fuzz_runs = v.parse().ok(),
+                    "invariant.runs" => p.inv_runs = v.parse().ok(),
+                    "invariant.depth" => p.inv_depth = v.parse().ok(),
+                    "invariant.fail-on-revert" | "invariant.fail_on_revert" => p.fail_on_revert = v.parse().ok(),
+                    _ => {}
                 }
             }
         } else if let Some(rest) = t.strip_prefix("function ") {
-            if let Some(n) = pending.take() {
-                out.insert(rest.split('(').next().unwrap_or_default().trim().to_string(), n);
+            if let Some(i) = pending.take() {
+                out.insert(rest.split('(').next().unwrap_or_default().trim().to_string(), i);
             }
         } else if !t.is_empty() && !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*") {
             pending = None;
@@ -403,13 +495,14 @@ fn exec_once(data: Bytes, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
         why = Some(decode::reason(&r.output));
     } else if let Some(p) = c.finish() {
         why = Some(p);
-    } else if failed_slot(&db) {
+    } else if failed_slot(&db) || c.failed {
         why = Some("assertion failed".into());
     }
     (r, c, why)
 }
 
-fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, fuzz_runs: u32, opts: &Opts) -> TestResult {
+#[allow(clippy::too_many_arguments)]
+fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, fuzz_runs: u32, opts: &Opts, dict: &Dict) -> TestResult {
     let name = sig(f);
     let mut res = TestResult { name, status: Status::Pass, gas: 0, runs: None, logs: vec![], args: None, trace: vec![] };
     let sel = f.selector();
@@ -419,7 +512,8 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
         res.gas = r.gas;
         res.logs = c.console;
         res.status = match why {
-            _ if r.output.as_ref() == SKIP_MAGIC || r.output.as_ref() == ASSUME_MAGIC => Status::Skip("skipped".into()),
+            _ if r.output.as_ref() == SKIP_MAGIC => Status::Skip("skipped".into()),
+            _ if r.output.as_ref() == ASSUME_MAGIC => Status::Fail("vm.assume rejected the inputs of a test that takes none".into()),
             Some(w) => Status::Fail(w),
             None => Status::Pass,
         };
@@ -450,8 +544,10 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 return None;
             }
             let mut rng = Rng((base_seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) | 1);
+            // runs seeded side by side start out correlated: a few steps in, they aren't
+            (0..4).for_each(|_| _ = rng.next());
             loop {
-                let vals: Vec<DynSolValue> = types.iter().map(|t| fuzz_value(t, &mut rng)).collect();
+                let vals: Vec<DynSolValue> = types.iter().map(|t| fuzz_value(t, &mut rng, dict)).collect();
                 let data = f.abi_encode_input(&vals).unwrap();
                 let (r, c, why) = exec_once(data.clone().into(), addr, db, env, cheats);
                 if r.output.as_ref() == ASSUME_MAGIC {
@@ -472,9 +568,9 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
         .collect();
     let runs = outcomes.len() as u32;
     let gas_sum: u64 = outcomes.iter().map(|o| o.1).sum();
-    if outcomes.iter().any(|o| o.3) {
-        res.status = Status::Skip("skipped".into());
-    } else if let Some((_, _, Some((why, args, logs, data)), _)) = outcomes.into_iter().filter(|o| o.2.is_some()).min_by_key(|o| o.0) {
+    let skipped = outcomes.iter().any(|o| o.3);
+    // a run that failed fails the test, whatever other runs did
+    if let Some((_, _, Some((why, args, logs, data)), _)) = outcomes.into_iter().filter(|o| o.2.is_some()).min_by_key(|o| o.0) {
         res.status = Status::Fail(why);
         res.args = Some(args).filter(|a| !a.is_empty());
         res.logs = logs;
@@ -487,21 +583,21 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 }
             }
         }
+    } else if skipped {
+        res.status = Status::Skip("skipped".into());
     }
     res.runs = Some(runs);
     res.gas = gas_sum / runs.max(1) as u64;
     res
 }
 
-/// Legacy `testFail*` (removed in forge 1.0): passes iff the body fails.
-fn invert_fail(mut r: TestResult, f: &Function) -> TestResult {
+/// `testFail*`: forge 1.0 dropped it, because a test that passes whenever its body fails also passes when it
+/// fails for the wrong reason. It fails, as in forge, with what to use instead.
+fn legacy_fail(mut r: TestResult, f: &Function) -> TestResult {
     if f.name.starts_with("testFail") {
-        r.status = match r.status {
-            Status::Fail(_) => Status::Pass,
-            Status::Pass => Status::Fail("testFail* test did not fail".into()),
-            s => s,
-        };
+        r.status = Status::Fail("testFail* isn't supported (forge 1.0 removed it, since it passes whenever the body fails, for any reason): name it test_… and use vm.expectRevert".into());
         r.args = None;
+        r.trace.clear();
     }
     r
 }
@@ -523,8 +619,27 @@ impl Rng {
     }
 }
 
-/// Random value biased towards edge cases.
-fn fuzz_value(ty: &DynSolType, r: &mut Rng) -> DynSolValue {
+/// Random value biased towards edge cases and, half the time, a constant from the code (mostly the code under test).
+fn fuzz_value(ty: &DynSolType, r: &mut Rng, dict: &Dict) -> DynSolValue {
+    if (!dict.targets.is_empty() || !dict.own.is_empty()) && r.next() % 2 == 0 {
+        let pool = if !dict.targets.is_empty() && (dict.own.is_empty() || r.next() % 3 != 0) { &dict.targets } else { &dict.own };
+        let v = pool[(r.next() % pool.len() as u64) as usize];
+        let v = match r.next() % 8 {
+            0 => v.wrapping_add(U256::from(1)),
+            1 => v.wrapping_sub(U256::from(1)),
+            _ => v,
+        };
+        match ty {
+            DynSolType::Uint(bits) => return DynSolValue::Uint(if *bits == 256 { v } else { v & ((U256::from(1) << *bits) - U256::from(1)) }, *bits),
+            DynSolType::Int(bits) => {
+                let raw = I256::from_raw(v << (256 - *bits));
+                return DynSolValue::Int(if *bits == 256 { raw } else { raw.asr(256 - *bits) }, *bits);
+            }
+            DynSolType::Address => return DynSolValue::Address(Address::from_word(v.into())),
+            DynSolType::FixedBytes(32) => return DynSolValue::FixedBytes(v.into(), 32),
+            _ => {}
+        }
+    }
     match ty {
         DynSolType::Uint(bits) => {
             let max = if *bits == 256 { U256::MAX } else { (U256::from(1) << *bits) - U256::from(1) };
@@ -574,10 +689,10 @@ fn fuzz_value(ty: &DynSolType, r: &mut Rng) -> DynSolValue {
         }
         DynSolType::Array(t) => {
             let n = (r.next() % 5) as usize;
-            DynSolValue::Array((0..n).map(|_| fuzz_value(t, r)).collect())
+            DynSolValue::Array((0..n).map(|_| fuzz_value(t, r, dict)).collect())
         }
-        DynSolType::FixedArray(t, n) => DynSolValue::FixedArray((0..*n).map(|_| fuzz_value(t, r)).collect()),
-        DynSolType::Tuple(ts) => DynSolValue::Tuple(ts.iter().map(|t| fuzz_value(t, r)).collect()),
+        DynSolType::FixedArray(t, n) => DynSolValue::FixedArray((0..*n).map(|_| fuzz_value(t, r, dict)).collect()),
+        DynSolType::Tuple(ts) => DynSolValue::Tuple(ts.iter().map(|t| fuzz_value(t, r, dict)).collect()),
         _ => DynSolValue::Bool(false),
     }
 }
@@ -686,49 +801,86 @@ fn view(addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, sig: &str, ty: 
     }
 }
 
-/// forge-style invariant testing: random call sequences against targets, invariants checked after every call.
-fn run_invariants(invs: &[&Function], addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts) -> Vec<TestResult> {
-    let (runs, depth, fail_on_revert) = opts.invariant;
+/// forge-style invariant testing: random call sequences against targets, invariants checked before the first call
+/// and after every call. What plain can't target as forge would (artifact- or interface-based targeting, targets
+/// without a compiled ABI) fails the invariant rather than silently fuzzing less.
+#[allow(clippy::too_many_arguments)]
+fn run_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
+    let result = |status: Status, trace: Vec<String>| -> Vec<TestResult> {
+        invs.iter().map(|f| TestResult { name: sig(f), status: status.clone(), gas: 0, runs: Some(runs), logs: vec![], args: None, trace: trace.clone() }).collect()
+    };
+    let fail = |why: String| result(Status::Fail(why), vec![]);
+    // the ABI of what's at an address: the artifact it was deployed from, never one that merely shares its name
     let abi_of = |a: &Address| -> Option<JsonAbi> {
-        let name = cheats.names.get(a)?;
-        let art = cheats.artifacts.iter().find(|x| &x.name == name)?;
+        let id = cheats.ids.get(a)?;
+        let art = cheats.artifacts.iter().find(|x| x.shard == 0 && format!("{}:{}", x.file, x.name) == *id)?;
         serde_json::from_value(art.abi.clone()).ok()
     };
+    let has = |name: &str| abi.functions().any(|f| f.name == name && f.inputs.is_empty());
+    for (getter, ty) in [("targetArtifacts", "string[]"), ("targetArtifactSelectors", "(string,bytes4[])[]"), ("targetInterfaces", "(address,string[])[]"), ("excludeArtifacts", "string[]")] {
+        if has(getter) && !view(addr, db, env, cheats, &format!("{getter}()"), ty).is_empty() {
+            return fail(format!("{getter}() isn't supported yet, so this invariant can't be fuzzed as written"));
+        }
+    }
     let addrs = |sig: &str| view(addr, db, env, cheats, sig, "address[]").into_iter().filter_map(|v| v.as_address()).collect::<Vec<_>>();
     let excluded = addrs("excludeContracts()");
-    let mut targets: Vec<Address> = addrs("targetContracts()");
+    let explicit = addrs("targetContracts()");
+    let mut targets = explicit.clone();
     if targets.is_empty() {
         targets = cheats.names.keys().copied().filter(|a| *a != addr).collect();
         targets.sort();
     }
     targets.retain(|a| !excluded.contains(a));
-    let selected: Vec<(Address, Vec<[u8; 4]>)> = view(addr, db, env, cheats, "targetSelectors()", "(address,bytes4[])[]")
-        .into_iter()
-        .filter_map(|v| match v {
-            DynSolValue::Tuple(t) => Some((t[0].as_address()?, t[1].as_array()?.iter().filter_map(|s| s.as_fixed_bytes().map(|(b, _)| b[..4].try_into().unwrap())).collect())),
-            _ => None,
-        })
-        .collect();
+    let selectors = |sig: &str| -> Vec<(Address, Vec<[u8; 4]>)> {
+        view(addr, db, env, cheats, sig, "(address,bytes4[])[]")
+            .into_iter()
+            .filter_map(|v| match v {
+                DynSolValue::Tuple(t) => Some((t[0].as_address()?, t[1].as_array()?.iter().filter_map(|s| s.as_fixed_bytes().map(|(b, _)| b[..4].try_into().unwrap())).collect())),
+                _ => None,
+            })
+            .collect()
+    };
+    let selected = selectors("targetSelectors()");
+    let unselected = selectors("excludeSelectors()");
     let mut calls: Vec<(Address, Function)> = vec![];
     for t in &targets {
-        let Some(abi) = abi_of(t) else { continue };
+        let Some(abi) = abi_of(t) else {
+            if explicit.contains(t) {
+                return fail(format!("target {t} has no compiled ABI here (only src/, test/ and script/ are compiled to artifacts)"));
+            }
+            continue;
+        };
         let only = selected.iter().find(|(a, _)| a == t).map(|(_, s)| s);
+        let not = unselected.iter().find(|(a, _)| a == t).map(|(_, s)| s);
         for f in abi.functions() {
             let mutating = !matches!(f.state_mutability, alloy_json_abi::StateMutability::View | alloy_json_abi::StateMutability::Pure);
-            if only.map_or(mutating, |s| s.contains(&f.selector().0)) {
+            let sel = f.selector().0;
+            if only.map_or(mutating, |s| s.contains(&sel)) && not.is_none_or(|s| !s.contains(&sel)) {
                 calls.push((*t, f.clone()));
             }
         }
     }
     let senders = addrs("targetSenders()");
     let excluded_senders = addrs("excludeSenders()");
-    let skip = |why: &str| invs.iter().map(|f| TestResult { name: sig(f), status: Status::Skip(why.into()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }).collect();
     if calls.is_empty() {
-        return skip("no target contracts with known ABIs");
+        return fail("nothing to fuzz: no target contract with functions to call (forge: \"No contracts to fuzz\")".into());
     }
+    // the state setUp left has to satisfy the invariants too
+    for f in invs {
+        let (r, c, why) = exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats);
+        if let Some(why) = why.filter(|_| r.output.as_ref() != SKIP_MAGIC) {
+            let mut out = fail(String::new());
+            for (res, g) in out.iter_mut().zip(invs) {
+                res.status = if g.name == f.name { Status::Fail(format!("invariant broken before any call: {why}")) } else { Status::Skip("not checked (another invariant broke)".into()) };
+                res.logs = c.console.clone();
+            }
+            return out;
+        }
+    }
+    let after = has("afterInvariant");
     let types: Vec<Vec<DynSolType>> = calls.iter().map(|(_, f)| f.inputs.iter().filter_map(|p| p.resolve().ok()).collect()).collect();
     let stop = std::sync::atomic::AtomicBool::new(false);
-    // each run: Some((invariant index, reason, calls made, the last calls)) on failure
+    // each run: Some((run, invariant index or MAX for all, reason, calls made, the last calls)) on failure
     let failures: Vec<(u32, usize, String, usize, Vec<String>)> = (0..runs)
         .into_par_iter()
         .filter_map(|run| {
@@ -736,6 +888,7 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Arc<Db>, env: &Env, ch
                 return None;
             }
             let mut rng = Rng((opts.seed ^ (run as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)) | 1);
+            (0..4).for_each(|_| _ = rng.next());
             let mut c = cheats.clone();
             let mut vm = evm::Vm::new(evm::overlay(db), env, &mut c);
             // (call index, args, sender, ok): formatted only if the run fails
@@ -754,7 +907,7 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Arc<Db>, env: &Env, ch
             for _ in 0..depth {
                 let i = (rng.next() % calls.len() as u64) as usize;
                 let (target, f) = &calls[i];
-                let vals: Vec<DynSolValue> = types[i].iter().map(|t| fuzz_value(t, &mut rng)).collect();
+                let vals: Vec<DynSolValue> = types[i].iter().map(|t| fuzz_value(t, &mut rng, dict)).collect();
                 let Ok(data) = f.abi_encode_input(&vals) else { continue };
                 let sender = if senders.is_empty() {
                     let mut s = Address::from_slice(&rng.bytes(20));
@@ -765,9 +918,16 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Arc<Db>, env: &Env, ch
                 } else {
                     senders[(rng.next() % senders.len() as u64) as usize]
                 };
+                vm.cheats().failed = false;
                 let r = vm.call(sender, TxKind::Call(*target), data.into(), U256::ZERO, true);
                 vm.cheats().finish();
                 seq.push((i, vals, sender, r.ok));
+                // a handler that calls fail() (the global failure flag) breaks the run as an assertion would
+                if vm.cheats().failed {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let (n, lines) = tail(&seq, vm.cheats());
+                    return Some((run, usize::MAX, "a call failed an assertion (fail())".into(), n, lines));
+                }
                 if fail_on_revert && !r.ok && r.output.as_ref() != ASSUME_MAGIC {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let (n, lines) = tail(&seq, vm.cheats());
@@ -782,6 +942,17 @@ fn run_invariants(invs: &[&Function], addr: Address, db: &Arc<Db>, env: &Env, ch
                         let (n, lines) = tail(&seq, vm.cheats());
                         return Some((run, k, why, n, lines));
                     }
+                }
+            }
+            // forge's afterInvariant(): checked at the end of every run
+            if after {
+                vm.cheats().failed = false;
+                let r = vm.call(SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&alloy_primitives::keccak256("afterInvariant()")[..4]), U256::ZERO, false);
+                if !r.ok || vm.cheats().failed {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let why = if r.ok { "assertion failed".into() } else { decode::reason(&r.output) };
+                    let (n, lines) = tail(&seq, vm.cheats());
+                    return Some((run, usize::MAX, format!("afterInvariant(): {why}"), n, lines));
                 }
             }
             None

@@ -1,0 +1,2 @@
+# the fixture runs its TypeScript test too (test/counter.test.ts)
+typescript = true
