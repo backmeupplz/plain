@@ -1,6 +1,6 @@
 [package]
 name = "plain"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Compile, test and deploy EVM smart contracts. One binary, zero setup."
 license = "MIT"

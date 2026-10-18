@@ -241,7 +241,10 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         return;
     }
     if !o.verify || matches!(conn.chain, 31337 | 1337) {
-        println!("not verifying{}; later: plain verify --network {}", if o.verify { " on a dev chain" } else { "" }, conn.name);
+        match o.verify {
+            true => println!("not verifying on a dev chain"),
+            false => println!("not verifying; later: plain verify --network {}", conn.name),
+        }
         return;
     }
     let ok = crate::verify::run(p, conn.chain, &mut recs);

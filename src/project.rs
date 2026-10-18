@@ -146,6 +146,9 @@ impl Project {
                 t.push('/');
             }
         }
+        // a remapping into a submodule that isn't checked out can't resolve anything, and it would shadow
+        // node_modules/, lib/ and the built-in forge-std (OpenZeppelin's own maps forge-std to its lib/)
+        remappings.retain(|(_, t)| root.join(t).exists());
 
         Project {
             dirs: vec![src, test, script],
