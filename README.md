@@ -11,7 +11,7 @@ plain deploy Counter --network base-sepolia --account deployer --broadcast   # d
 plain                      # or do all of it from a menu
 ```
 
-Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`. The [docs](https://getplain.org/docs/) walk through new and existing projects, testing and deploying.
+Or build it from source: `cargo install --git https://github.com/backmeupplz/plain`. It also installs with `mise use -g github:backmeupplz/plain` or `nix run github:backmeupplz/plain`, and releases after 0.3.1 carry a `.deb` and an `.rpm`. The [docs](https://getplain.org/docs/) walk through new and existing projects, testing and deploying.
 
 | On real projects ([details](#benchmarks)) | Foundry | Hardhat 3 | plain |
 |---|---|---|---|

@@ -18,13 +18,22 @@ description: "How to install plain and go from an empty folder to a verified, up
 curl -fsSL https://getplain.org/install | sh
 ```
 
-The installer puts the latest release in `~/.plain/bin` and adds that folder to your shell's `PATH`, so `plain` works in any new terminal. Set `PLAIN_DIR` to install it somewhere else. Prebuilt binaries cover macOS on Apple silicon and Intel, and Linux on x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later).
+The installer puts the latest release in `~/.plain/bin` and adds that folder to your shell's `PATH`, so `plain` works in any new terminal. Set `PLAIN_DIR` to install it somewhere else. Prebuilt binaries cover macOS on Apple silicon and Intel, and Linux on x86_64 with glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9, Amazon Linux 2023 and later).
 
 On any other platform, or to build from source with Rust:
 
 ```sh
 cargo install --git https://github.com/backmeupplz/plain
 ```
+
+The same binaries install through [mise](https://mise.jdx.dev), which checks each download against the release, and the repository is a Nix flake that builds from source on Apple silicon Macs and x86_64 Linux:
+
+```sh
+mise use -g github:backmeupplz/plain   # add @<version> on release day: mise hides releases younger than a day
+nix run github:backmeupplz/plain -- test
+```
+
+Releases after 0.3.1 also attach a `.deb` and an `.rpm` for x86_64 Linux (`sudo apt install ./plain_<version>_amd64.deb` or `sudo dnf install ./plain-<version>-1.x86_64.rpm`), and every archive and package (each file listed in `SHA256SUMS`) comes with a build provenance attestation you can check with `gh attestation verify <file> -R backmeupplz/plain`.
 
 To update, run the installer again. To uninstall, delete `~/.plain` and the `# plain` lines the installer added to your shell profile. That folder holds the binary, its caches and your deployer accounts, so move the accounts somewhere safe first.
 
