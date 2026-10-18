@@ -68,20 +68,21 @@ nav a:hover { color: var(--fg); }
 .hero { padding: 64px 0 40px; }
 h1 { font-size: clamp(34px, 6vw, 54px); line-height: 1.08; letter-spacing: -1.5px; margin: 0 0 22px; font-weight: 750; }
 h1 em { font-style: normal; color: var(--accent); }
-.lead { font-size: 20px; color: var(--muted); max-width: 680px; margin: 0 0 34px; }
+.lead { font-size: 20px; color: var(--muted); max-width: 720px; margin: 0 0 34px; }
 .install { display: flex; align-items: center; gap: 12px; background: var(--code); border: 1px solid var(--line);
-  border-radius: 12px; padding: 14px 14px 14px 18px; max-width: 640px; }
+  border-radius: 12px; padding: 14px 14px 14px 18px; max-width: 720px; }
 .install code { flex: 1; font-size: 16px; overflow-x: auto; white-space: nowrap; }
 .install code::before { content: "$ "; color: var(--muted); }
 button.copy { font: 600 14px var(--sans); border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer;
   background: var(--accent); color: var(--accent-fg); }
-.note { font-size: 14px; color: var(--muted); margin: 12px 0 0; }
+.note { font-size: 14px; color: var(--muted); margin: 12px 0 0; max-width: 720px; }
+.note code { white-space: nowrap; }
 pre { background: var(--code); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
-  font-size: 14.5px; line-height: 1.7; overflow-x: auto; margin: 26px 0 0; max-width: 640px; }
+  font-size: 14.5px; line-height: 1.7; overflow-x: auto; margin: 26px 0 0; max-width: 720px; }
 pre .c { color: var(--muted); }
 section { padding: 56px 0; border-top: 1px solid var(--line); }
 h2 { font-size: clamp(26px, 4vw, 34px); line-height: 1.15; letter-spacing: -0.8px; margin: 0 0 14px; }
-.sub { color: var(--muted); max-width: 700px; margin: 0 0 34px; }
+.sub { color: var(--muted); max-width: 720px; margin: 0 0 34px; }
 .rows { display: grid; gap: 26px; }
 .row h3 { font-size: 17px; margin: 0 0 10px; font-weight: 600; }
 .row h3 b { color: var(--accent); font-weight: 700; margin-left: 6px; }
@@ -109,7 +110,7 @@ ol.loop div > code, .menu { display: block; font: 13.5px var(--mono); background
   border-radius: 8px; padding: 8px 12px; overflow-wrap: anywhere; }
 ol.loop div > code::before { content: "$ "; color: var(--muted); }
 ol.loop p code { font-size: 14px; color: var(--fg); }
-.menu { white-space: pre; overflow-x: auto; overflow-wrap: normal; line-height: 1.55; padding: 14px 16px; margin: 0 0 22px; max-width: 640px; }
+.menu { white-space: pre; overflow-x: auto; overflow-wrap: normal; line-height: 1.55; padding: 14px 16px; margin: 0 0 22px; max-width: 720px; }
 .menu .g { color: var(--accent); font-weight: 650; }
 .menu .d { color: var(--muted); }
 ul.why li { margin: 0 0 12px; }
@@ -122,6 +123,7 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
   .bar { grid-template-columns: 64px 1fr 56px; gap: 8px; }
   nav a { margin-left: 14px; }
   .install code { font-size: 14px; white-space: normal; word-break: break-all; }
+  .note code { white-space: normal; overflow-wrap: anywhere; }
 }
 </style>
 </head>
@@ -136,7 +138,7 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
     <h1>Compile, test and deploy Solidity in <em>seconds</em>, not minutes</h1>
     <p class="lead">plain is one small binary that compiles, tests, deploys, verifies and upgrades your contracts. It runs your Foundry project as it is, needs nothing else installed, and turns the minute-long edit-and-test loop into about a second.</p>
     <div class="install"><code>curl -fsSL https://getplain.org/install | sh</code><button class="copy" data-copy="curl -fsSL https://getplain.org/install | sh" aria-label="Copy the install command">Copy</button></div>
-    <p class="note">The installer works on macOS and Linux. With Rust installed, <code>cargo install --git https://github.com/backmeupplz/plain</code> builds it from source.</p>
+    <p class="note">The installer works on macOS and Linux. To build from source with Rust instead:<br><code>cargo install --git https://github.com/backmeupplz/plain</code></p>
 <pre><span class="c"># a Counter contract and its test, in an empty folder</span>
 plain init
 <span class="c"># run every test, then again whenever you save</span>
