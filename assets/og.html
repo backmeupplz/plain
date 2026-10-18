@@ -1,0 +1,48 @@
+<!doctype html>
+<!-- The social card (docs/og.png, 1200x630). Regenerate after editing:
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --hide-scrollbars --force-device-scale-factor=1 --window-size=1200,630 --screenshot=docs/og.png assets/og.html -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 1200px; height: 630px; overflow: hidden; }
+body {
+  background: radial-gradient(900px 520px at 100% 0%, rgba(76, 195, 138, 0.16), transparent 60%), #111110;
+  color: #ecebe5; font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  padding: 56px 72px; display: flex; flex-direction: column;
+}
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.top { display: flex; justify-content: space-between; align-items: baseline; }
+.mark { font-size: 44px; font-weight: 700; letter-spacing: -1px; }
+.mark span, em { color: #4cc38a; font-style: normal; }
+.url { font-size: 26px; color: #9a9991; }
+h1 { font-size: 82px; line-height: 1.02; letter-spacing: -2.5px; font-weight: 750; margin: 46px 0 0; }
+.bars { margin-top: 44px; display: grid; gap: 22px; }
+.row .label { font-size: 26px; font-weight: 600; margin-bottom: 10px; }
+.row .label b { color: #4cc38a; margin-left: 10px; }
+.bar { display: grid; grid-template-columns: 110px 1fr 120px; align-items: center; gap: 16px; font-size: 22px; height: 30px; }
+.bar .who { color: #9a9991; }
+.bar .fill { height: 14px; border-radius: 7px; background: #3a3a35; min-width: 14px; }
+.bar.plain .fill { background: #4cc38a; }
+.bar.plain .who, .bar.plain .t { color: #ecebe5; font-weight: 700; }
+.bar .t { text-align: right; color: #9a9991; }
+</style>
+</head>
+<body>
+  <div class="top"><div class="mark mono">plain<span>.</span></div><div class="url mono">getplain.org</div></div>
+  <h1>Solidity in <em>seconds</em>,<br>not minutes</h1>
+  <div class="bars">
+    <div class="row">
+      <div class="label">Edit a test, then rerun the whole suite<b>56× faster</b></div>
+      <div class="bar"><span class="who">Foundry</span><div class="fill" style="width:100%"></div><span class="t mono">56 s</span></div>
+      <div class="bar plain"><span class="who">plain</span><div class="fill" style="width:1.8%"></div><span class="t mono">0.99 s</span></div>
+    </div>
+    <div class="row">
+      <div class="label">Build everything from scratch<b>8× faster</b></div>
+      <div class="bar"><span class="who">Foundry</span><div class="fill" style="width:100%"></div><span class="t mono">116 s</span></div>
+      <div class="bar plain"><span class="who">plain</span><div class="fill" style="width:12.9%"></div><span class="t mono">15 s</span></div>
+    </div>
+  </div>
+</body>
+</html>

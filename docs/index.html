@@ -3,13 +3,45 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>plain: Solidity in seconds</title>
+<title>plain: compile, test and deploy Solidity in seconds</title>
 <meta name="description" content="plain is one small binary that compiles, tests, deploys and verifies Solidity contracts. It runs Foundry projects as they are and turns the minute-long edit-and-test loop into about a second.">
-<meta property="og:title" content="plain: Solidity in seconds">
-<meta property="og:description" content="One binary that compiles, tests, deploys and verifies Solidity. Edit a test and rerun the suite in 1 s where Foundry takes 56 s.">
-<meta property="og:url" content="https://getplain.org">
+<link rel="canonical" href="https://getplain.org/">
 <meta name="color-scheme" content="light dark">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f7a4d'/%3E%3Ctext x='16' y='22.5' font-family='ui-monospace,Menlo,monospace' font-size='19' font-weight='700' text-anchor='middle' fill='%23fff'%3Ep%3C/text%3E%3C/svg%3E">
+<meta name="theme-color" content="#fbfbf8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111110" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="plain">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://getplain.org/">
+<meta property="og:title" content="plain: compile, test and deploy Solidity in seconds">
+<meta property="og:description" content="One binary that compiles, tests, deploys and verifies Solidity and runs Foundry projects as they are. Editing a test and rerunning the suite takes 1 s where Foundry takes 56 s.">
+<meta property="og:image" content="https://getplain.org/og.png">
+<meta property="og:image:secure_url" content="https://getplain.org/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="plain: Solidity in seconds, not minutes. Editing a test and rerunning the suite takes 0.99 s with plain and 56 s with Foundry, and a build from scratch takes 15 s against 116 s.">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@backmeupplz">
+<meta name="twitter:creator" content="@backmeupplz">
+<meta name="twitter:title" content="plain: compile, test and deploy Solidity in seconds">
+<meta name="twitter:description" content="One binary that compiles, tests, deploys and verifies Solidity and runs Foundry projects as they are. Editing a test and rerunning the suite takes 1 s where Foundry takes 56 s.">
+<meta name="twitter:image" content="https://getplain.org/og.png">
+<meta name="twitter:image:alt" content="plain: Solidity in seconds, not minutes. Editing a test and rerunning the suite takes 0.99 s with plain and 56 s with Foundry, and a build from scratch takes 15 s against 116 s.">
+
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "plain", "url": "https://getplain.org/",
+ "description": "One binary that compiles, tests, deploys and verifies Solidity contracts and runs Foundry projects as they are.",
+ "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS, Linux", "softwareVersion": "0.1.0",
+ "downloadUrl": "https://github.com/backmeupplz/plain/releases/latest", "codeRepository": "https://github.com/backmeupplz/plain",
+ "license": "https://opensource.org/licenses/MIT", "image": "https://getplain.org/og.png",
+ "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+ "author": {"@type": "Person", "name": "backmeupplz", "url": "https://github.com/backmeupplz"}}
+</script>
 <style>
 :root {
   --bg: #fbfbf8; --fg: #1b1b19; --muted: #66665f; --line: #e4e3dc; --card: #f3f2ec;
