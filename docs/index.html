@@ -114,6 +114,16 @@ ol.loop p code { font-size: 14px; color: var(--fg); }
 .menu .g { color: var(--accent); font-weight: 650; }
 .menu .d { color: var(--muted); }
 ul.why li { margin: 0 0 12px; }
+.pms { display: grid; gap: 14px; max-width: 720px; }
+.pm { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 16px; align-items: start; }
+.pm h3 { margin: 0; padding-top: 16px; font-size: 17px; font-weight: 600; line-height: 1.4; }
+.pm h3 span { display: block; font-size: 13.5px; font-weight: 400; color: var(--muted); }
+.pm .install code { font-size: 14.5px; }
+.install.multi { align-items: flex-start; }
+.install.multi code { white-space: normal; }
+.install.multi code::before { content: none; }
+.install.multi code span { display: block; padding-left: 2ch; text-indent: -2ch; overflow-wrap: anywhere; }
+.install.multi code span::before { content: "$ "; color: var(--muted); }
 footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--muted); font-size: 15px; }
 @media (max-width: 640px) {
   body { font-size: 16px; }
@@ -124,6 +134,8 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
   nav a { margin-left: 14px; }
   .install code { font-size: 14px; white-space: normal; word-break: break-all; }
   .note code { white-space: normal; overflow-wrap: anywhere; }
+  .pm { grid-template-columns: 1fr; gap: 8px; }
+  .pm h3 { padding-top: 0; }
 }
 </style>
 </head>
@@ -138,7 +150,7 @@ footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--m
     <h1>Compile, test and deploy Solidity in <em>seconds</em>, not minutes</h1>
     <p class="lead">plain is one small binary that compiles, tests, deploys, verifies and upgrades your contracts. It runs your Foundry project as it is, needs nothing else installed, and turns the minute-long edit-and-test loop into about a second.</p>
     <div class="install"><code>curl -fsSL https://getplain.org/install | sh</code><button class="copy" data-copy="curl -fsSL https://getplain.org/install | sh" aria-label="Copy the install command">Copy</button></div>
-    <p class="note">The installer works on macOS and Linux. plain is also on Homebrew, apt, dnf, Nix, mise and crates.io, as the <a href="/docs/#install">install guide</a> shows.</p>
+    <p class="note">The installer works on macOS and Linux, and plain is also on Homebrew, npm, apt, dnf, the AUR, mise, Nix and crates.io, with the commands for each <a href="#install">further down</a>.</p>
 <pre><span class="c"># a Counter contract and its test, in an empty folder</span>
 plain init
 <span class="c"># run every test, then again whenever you save</span>
@@ -223,6 +235,22 @@ plain</pre>
       <li>Big test files compile in parallel, and solc jobs are scheduled from the timings of your previous build, with a cache that every clone and worktree shares.</li>
       <li>Deploys batch their network round trips, so a 40-transaction deploy makes 13 requests to the RPC where sending and checking one at a time would take 77.</li>
     </ul>
+  </section>
+
+  <section id="install">
+    <h2>Install it with the package manager you already use</h2>
+    <p class="sub">Homebrew, npm, apt, dnf, the AUR and mise install the same release binaries as the script at the top, while Nix and Cargo build plain from source, which also covers Linux on arm64.</p>
+    <div class="pms">
+      <div class="pm"><h3>Homebrew</h3><div class="install"><code>brew install backmeupplz/tap/plain</code><button class="copy" data-copy="brew install backmeupplz/tap/plain" aria-label="Copy the Homebrew command">Copy</button></div></div>
+      <div class="pm"><h3>npm</h3><div class="install"><code>npm install -g plain-evm</code><button class="copy" data-copy="npm install -g plain-evm" aria-label="Copy the npm command">Copy</button></div></div>
+      <div class="pm"><h3>apt<span>Debian and Ubuntu</span></h3><div class="install multi"><code><span>sudo install -d -m 0755 /etc/apt/keyrings</span><span>sudo curl -fsSLo /etc/apt/keyrings/plain.asc https://pkg.getplain.org/plain.asc</span><span>sudo curl -fsSLo /etc/apt/sources.list.d/plain.sources https://pkg.getplain.org/plain.sources</span><span>sudo apt update &amp;&amp; sudo apt install plain</span></code><button class="copy" data-copy="sudo install -d -m 0755 /etc/apt/keyrings&#10;sudo curl -fsSLo /etc/apt/keyrings/plain.asc https://pkg.getplain.org/plain.asc&#10;sudo curl -fsSLo /etc/apt/sources.list.d/plain.sources https://pkg.getplain.org/plain.sources&#10;sudo apt update &amp;&amp; sudo apt install plain" aria-label="Copy the apt commands">Copy</button></div></div>
+      <div class="pm"><h3>dnf<span>Fedora, RHEL and Amazon Linux</span></h3><div class="install multi"><code><span>sudo curl -fsSLo /etc/yum.repos.d/plain.repo https://pkg.getplain.org/plain.repo</span><span>sudo dnf install plain</span></code><button class="copy" data-copy="sudo curl -fsSLo /etc/yum.repos.d/plain.repo https://pkg.getplain.org/plain.repo&#10;sudo dnf install plain" aria-label="Copy the dnf commands">Copy</button></div></div>
+      <div class="pm"><h3>AUR<span>Arch Linux</span></h3><div class="install"><code>yay -S plain-bin</code><button class="copy" data-copy="yay -S plain-bin" aria-label="Copy the AUR command">Copy</button></div></div>
+      <div class="pm"><h3>mise</h3><div class="install"><code>mise use -g github:backmeupplz/plain</code><button class="copy" data-copy="mise use -g github:backmeupplz/plain" aria-label="Copy the mise command">Copy</button></div></div>
+      <div class="pm"><h3>Nix</h3><div class="install"><code>nix profile install github:backmeupplz/plain</code><button class="copy" data-copy="nix profile install github:backmeupplz/plain" aria-label="Copy the Nix command">Copy</button></div></div>
+      <div class="pm"><h3>Cargo</h3><div class="install"><code>cargo install plain-evm</code><button class="copy" data-copy="cargo install plain-evm" aria-label="Copy the Cargo command">Copy</button></div></div>
+    </div>
+    <p class="note">The <a href="/docs/#install">install guide</a> covers updating and uninstalling, the <code>.deb</code> and <code>.rpm</code> files attached to every release, and checking any download's build provenance with <code>gh attestation verify</code>.</p>
   </section>
 
   <footer>plain is MIT licensed. Start with the <a href="/docs/">docs</a>, or read the source and the full benchmarks on <a href="https://github.com/backmeupplz/plain">GitHub</a>.</footer>
