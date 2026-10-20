@@ -23,6 +23,41 @@ pub struct Project {
     pub access: Access,
     /// run test/**/*.test.ts too (`typescript = true`): they're programs, so only when the project says so
     pub typescript: bool,
+    /// forge's `additional_compiler_profiles`: settings a file compiles with instead, when `restrictions` rule
+    /// the default ones out for it (each unset setting is the default's)
+    pub profiles: Vec<Profile>,
+    /// forge's `compilation_restrictions`
+    pub restrictions: Vec<Restriction>,
+    /// forge's `isolate`: each call a test makes is a transaction of its own
+    pub isolate: bool,
+    /// forge's `gas_limit` (or `block_gas_limit`): the gas a test gets, and the block's limit
+    pub gas_limit: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Profile {
+    pub optimizer: bool,
+    pub runs: u64,
+    pub via_ir: bool,
+    pub evm_version: Option<String>,
+}
+
+/// What a file (and every file importing it) may compile with: via-IR or not, a range of optimizer runs.
+#[derive(Clone, Debug)]
+pub struct Restriction {
+    /// a glob, as forge's --match-path
+    pub paths: String,
+    pub via_ir: Option<bool>,
+    pub min_runs: Option<u64>,
+    pub max_runs: Option<u64>,
+}
+
+impl Restriction {
+    pub fn allows(&self, p: &Profile) -> bool {
+        self.via_ir.is_none_or(|v| v == p.via_ir)
+            && self.min_runs.is_none_or(|m| p.runs >= m && (m == 0 || p.optimizer))
+            && self.max_runs.is_none_or(|m| p.runs <= m)
+    }
 }
 
 /// What test and script code may reach outside the EVM. Nothing unless the config opens it, like forge:
@@ -259,14 +294,17 @@ impl Project {
         // node_modules/, lib/ and the built-in forge-std (OpenZeppelin's own maps forge-std to its lib/)
         remappings.retain(|(_, t)| root.join(t).exists());
 
+        // forge: off unless optimizer_runs is set; without foundry.toml: on
+        let optimizer = b("optimizer").unwrap_or(!root.join("foundry.toml").exists() || cfg.contains_key("optimizer_runs"));
+        let runs = cfg.get("optimizer_runs").and_then(|v| v.as_integer()).unwrap_or(200) as u64;
+        let via_ir = b("via_ir").unwrap_or(false);
         Project {
             dirs: vec![src, test, script],
             remappings,
             solc: s("solc_version").or(s("solc")).filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())),
-            // forge: off unless optimizer_runs is set; without foundry.toml: on
-            optimizer: b("optimizer").unwrap_or(!root.join("foundry.toml").exists() || cfg.contains_key("optimizer_runs")),
-            runs: cfg.get("optimizer_runs").and_then(|v| v.as_integer()).unwrap_or(200) as u64,
-            via_ir: b("via_ir").unwrap_or(false),
+            optimizer,
+            runs,
+            via_ir,
             evm_version: s("evm_version"),
             bytecode_hash: s("bytecode_hash"),
             cbor_metadata: b("cbor_metadata"),
@@ -307,6 +345,45 @@ impl Project {
                 protected: [".git", ".plain", "foundry.toml", "plain.toml", ".env"].iter().map(|f| resolve(&root.join(f))).collect(),
             },
             typescript: b("typescript").unwrap_or(false),
+            profiles: cfg.get("additional_compiler_profiles").and_then(|v| v.as_array()).into_iter().flatten().map(|t| {
+                let t = t.as_table().unwrap_or_else(|| crate::die("additional_compiler_profiles: each entry is a table"));
+                if let Some(k) = t.keys().find(|k| !["name", "optimizer", "optimizer_runs", "via_ir", "evm_version"].contains(&k.as_str())) {
+                    crate::die(&format!("additional_compiler_profiles: plain doesn't support {k:?} yet"));
+                }
+                if !t.contains_key("name") {
+                    crate::die("additional_compiler_profiles: a profile needs a name");
+                }
+                Profile {
+                    optimizer: t.get("optimizer").and_then(|v| v.as_bool()).unwrap_or(optimizer),
+                    runs: t.get("optimizer_runs").and_then(|v| v.as_integer()).map_or(runs, |n| n as u64),
+                    via_ir: t.get("via_ir").and_then(|v| v.as_bool()).unwrap_or(via_ir),
+                    evm_version: t.get("evm_version").and_then(|v| v.as_str()).map(String::from).or_else(|| s("evm_version")),
+                }
+            }).collect(),
+            restrictions: cfg.get("compilation_restrictions").and_then(|v| v.as_array()).into_iter().flatten().map(|t| {
+                let t = t.as_table().unwrap_or_else(|| crate::die("compilation_restrictions: each entry is a table"));
+                if let Some(k) = t.keys().find(|k| !["paths", "via_ir", "optimizer_runs", "min_optimizer_runs", "max_optimizer_runs"].contains(&k.as_str())) {
+                    crate::die(&format!("compilation_restrictions: plain doesn't support {k:?} yet"));
+                }
+                let n = |k: &str| t.get(k).and_then(|v| v.as_integer()).map(|n| n as u64);
+                Restriction {
+                    paths: t.get("paths").and_then(|v| v.as_str()).unwrap_or_else(|| crate::die("compilation_restrictions: each needs paths")).into(),
+                    via_ir: t.get("via_ir").and_then(|v| v.as_bool()),
+                    min_runs: n("min_optimizer_runs").or(n("optimizer_runs")),
+                    max_runs: n("max_optimizer_runs").or(n("optimizer_runs")),
+                }
+            }).collect(),
+            isolate: b("isolate").unwrap_or(false),
+            // a number, or a string holding one (toml has no u64)
+            gas_limit: ["block_gas_limit", "gas_limit"]
+                .iter()
+                .find_map(|k| match cfg.get(*k)? {
+                    toml::Value::Integer(n) => u64::try_from(*n).ok(),
+                    toml::Value::String(s) if s == "max" => Some(i64::MAX as u64),
+                    toml::Value::String(s) => s.parse().ok(),
+                    _ => None,
+                })
+                .unwrap_or(crate::evm::GAS_LIMIT),
             root,
         }
     }

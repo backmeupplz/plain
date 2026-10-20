@@ -8,7 +8,7 @@ fn which(bin: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
 }
 
-pub fn files(root: &Path, test_dir: &str, filter: Option<&str>) -> Vec<PathBuf> {
+pub fn files(root: &Path, test_dir: &str, filter: &crate::test::Filter) -> Vec<PathBuf> {
     fn walk(d: &Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
             let p = e.path();
@@ -22,7 +22,11 @@ pub fn files(root: &Path, test_dir: &str, filter: Option<&str>) -> Vec<PathBuf> 
     }
     let mut out = vec![];
     walk(&root.join(test_dir), &mut out);
-    out.retain(|p| filter.is_none_or(|f| p.to_string_lossy().contains(f)));
+    // no suites or tests to match in TypeScript files, only their paths
+    out.retain(|p| {
+        let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy();
+        filter.contract.is_none() && filter.test.is_none() && filter.file(&rel) && filter.any.as_deref().is_none_or(|f| rel.contains(f))
+    });
     out.sort();
     out
 }

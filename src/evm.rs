@@ -20,6 +20,9 @@ pub const CHEATS: Address = address!("7109709ECfa91a80626fF3989D68f67F5b1DD12D")
 pub const CONSOLE: Address = address!("000000000000000000636F6e736F6c652e6c6f67");
 pub const SENDER: Address = address!("1804c8AB1F12E6bbf3894d4083f33e07309d1f38");
 pub const CREATE2_DEPLOYER: Address = address!("4e59b44847b379578588920cA78FbF26c0B4956C");
+/// where forge's test contract lands (SENDER's nonce 1), and the account forge deploys libraries from
+pub const TEST_CONTRACT: Address = address!("7FA9385bE102ac3EAc297483Dd6233D62b3e1496");
+pub const LIBRARY_DEPLOYER: Address = address!("1F95D37F27EA0dEA9C252FC09D5A6eaA97647353");
 const CREATE2_DEPLOYER_CODE: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
 pub const GAS_LIMIT: u64 = 1 << 30;
 pub const ASSUME_MAGIC: &[u8] = b"FOUNDRY::ASSUME";
@@ -333,7 +336,8 @@ impl<'c> Vm<'c> {
         let commit = commit.into();
         let mut tx = TxEnv::default();
         tx.caller = from;
-        tx.gas_limit = GAS_LIMIT;
+        // a test's gas is the block's (forge's gas_limit, --gas-limit)
+        tx.gas_limit = self.evm.ctx.block.gas_limit;
         tx.gas_price = self.gas_price;
         tx.kind = to;
         tx.data = data;
@@ -460,8 +464,22 @@ pub struct Cheats {
     mocks: Vec<(Address, Option<U256>, Vec<u8>, Vec<u8>, bool)>,
     /// (callee, value if given, calldata prefix, calls seen)
     expected_calls: Vec<(Address, Option<U256>, Vec<u8>, usize)>,
-    last_call_gas: HashMap<usize, u64>,
+    /// the gas of the last call that ended (any depth), for vm.lastCallGas and snapshotGasLastCall
+    last_gas: Option<Gas>,
     gas_snapshot: Option<u64>,
+    /// vm.pauseGasMetering: the gas each running frame had when metering paused, which its steps keep going back to
+    paused: Option<Vec<Gas>>,
+    /// vm.resetGasMetering: the running frame's gas goes back to its limit at its next step
+    reset_gas: bool,
+    /// vm.serialize*: the objects so far, by key (sorted, as forge's)
+    json: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// the solc version the project compiles with, which artifact ids may name ("File.sol:Name:0.8.28")
+    pub solc: String,
+    /// forge's --isolate: every call the test contract makes is a transaction of its own (see `isolated`)
+    pub isolate: bool,
+    /// inside one of those transactions, and the outer transaction's origin, which it keeps
+    in_inner: bool,
+    inner_origin: Address,
     pub allow_internal_revert: bool,
     cheat_gas: u64,
     /// address -> contract name for contracts created while `track_creates` is on
@@ -567,6 +585,20 @@ const SUPPORTED: &[&str] = sigs![
     "stopSnapshotGas()", "stopSnapshotGas(string)", "stopSnapshotGas(string,string)", "snapshotValue(string,uint256)",
     "snapshotValue(string,string,uint256)", "ffi(string[])", "readFileBinary(string)",
     "parseUint(string)", "parseInt(string)", "parseAddress(string)", "parseBool(string)", "parseBytes32(string)", "parseBytes(string)",
+    "cool(address)", "coolSlot(address,bytes32)", "lastCallGas()", "resetGasMetering()", "removeFile(string)", "dumpState(string)",
+    "parseJson(string)", "parseJson(string,string)", "parseJsonUint(string,string)", "parseJsonUintArray(string,string)",
+    "parseJsonInt(string,string)", "parseJsonIntArray(string,string)", "parseJsonBool(string,string)", "parseJsonBoolArray(string,string)",
+    "parseJsonAddress(string,string)", "parseJsonAddressArray(string,string)", "parseJsonString(string,string)",
+    "parseJsonStringArray(string,string)", "parseJsonBytes(string,string)", "parseJsonBytesArray(string,string)",
+    "parseJsonBytes32(string,string)", "parseJsonBytes32Array(string,string)", "parseJsonType(string,string)",
+    "parseJsonType(string,string,string)", "parseJsonTypeArray(string,string,string)", "parseJsonKeys(string,string)",
+    "keyExists(string,string)", "keyExistsJson(string,string)", "serializeJson(string,string)", "serializeBool(string,string,bool)",
+    "serializeUint(string,string,uint256)", "serializeInt(string,string,int256)", "serializeAddress(string,string,address)",
+    "serializeBytes32(string,string,bytes32)", "serializeString(string,string,string)", "serializeBytes(string,string,bytes)",
+    "serializeBool(string,string,bool[])", "serializeUint(string,string,uint256[])", "serializeInt(string,string,int256[])",
+    "serializeAddress(string,string,address[])", "serializeBytes32(string,string,bytes32[])", "serializeString(string,string,string[])",
+    "serializeBytes(string,string,bytes[])", "serializeUintToHex(string,string,uint256)", "writeJson(string,string)",
+    "writeJson(string,string,string)",
 ];
 
 pub struct Sig {
@@ -628,14 +660,23 @@ pub fn link_code(code: &str, links: &serde_json::Value, libs: &HashMap<String, A
     hex::decode(&code).map_err(|e| format!("bad bytecode: {e}"))
 }
 
-/// The artifact `what` ("path:Name", "File.sol:Name", "File.sol" or "Name") names: the exact path first, then a
-/// path suffix, then the file name. Two matches at the same level are an error, never a guess.
-fn find_artifact<'a>(arts: &'a [Artifact], what: &str) -> Result<&'a Artifact, String> {
-    let (file, name) = match what.split_once(':') {
-        Some((f, n)) => (f, Some(n)),
-        None if what.ends_with(".sol") => (what, None),
-        None => ("", Some(what)),
+/// The artifact `what` ("path:Name", "File.sol:Name", "File.sol" or "Name", each optionally followed by
+/// ":<solc version>" and a compiler profile, as forge writes them) names: the exact path first, then a path suffix,
+/// then the file name. Two matches at the same level are an error, never a guess. Like forge, the profile isn't
+/// read: plain compiles each contract once.
+fn find_artifact<'a>(arts: &'a [Artifact], what: &str, solc: &str) -> Result<&'a Artifact, String> {
+    let mut parts = what.split(':');
+    let first = parts.next().unwrap_or_default();
+    let (file, name, version) = match first.contains('.') {
+        true => match parts.next() {
+            Some(v) if v.contains('.') => (first, None, Some(v)),
+            n => (first, n, parts.next()),
+        },
+        false => ("", Some(first), parts.next()),
     };
+    if let Some(v) = version.filter(|v| !solc.is_empty() && v != &solc) {
+        return Err(format!("no artifact for {what:?}: this project compiles with solc {solc}, not {v}"));
+    }
     let fname = file.rsplit('/').next().unwrap_or(file);
     let named: Vec<&Artifact> = arts.iter().filter(|a| a.shard == 0 && !a.bytecode.is_empty() && name.map_or(Some(a.name.as_str()) == fname.strip_suffix(".sol"), |n| a.name == n)).collect();
     let tiers: [&dyn Fn(&Artifact) -> bool; 3] = [&|a| file.is_empty() || a.file == file, &|a| a.file.ends_with(&format!("/{file}")), &|a| a.file.rsplit('/').next() == Some(fname)];
@@ -649,6 +690,16 @@ fn find_artifact<'a>(arts: &'a [Artifact], what: &str) -> Result<&'a Artifact, S
     Err(format!("no artifact for {what:?} (only project src/test/script contracts are compiled to bytecode)"))
 }
 
+/// The structs of the sources the artifacts come from, which order the members of objects vm.parseJson decodes.
+fn json_defs(arts: &[Artifact], root: &std::path::Path) -> &'static std::collections::BTreeMap<String, Vec<String>> {
+    static DEFS: OnceLock<std::collections::BTreeMap<String, Vec<String>>> = OnceLock::new();
+    DEFS.get_or_init(|| {
+        let files: std::collections::BTreeSet<&str> = arts.iter().map(|a| a.file.as_str()).collect();
+        let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(root.join(f)).ok()).collect();
+        crate::json::struct_defs(texts.iter().map(String::as_str))
+    })
+}
+
 /// What tests set with vm.setEnv: process-wide like forge's, without changing the real environment, which other
 /// threads read at the same time.
 static SET_ENV: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
@@ -659,33 +710,6 @@ fn lookup(k: &str) -> Option<String> {
 
 fn env(k: &str) -> Result<String, String> {
     lookup(k).ok_or_else(|| format!("environment variable {k:?} not found"))
-}
-
-/// Parse a string the way forge's env/parse cheatcodes do, according to the target type.
-fn parse_as(ty: &DynSolType, s: &str) -> Result<DynSolValue, String> {
-    let s = s.trim();
-    let bad = || format!("failed parsing {s:?} as {ty}");
-    Ok(match ty {
-        DynSolType::Uint(_) => DynSolValue::Uint(
-            if let Some(h) = s.strip_prefix("0x") { U256::from_str_radix(h, 16) } else { U256::from_str_radix(s, 10) }.map_err(|_| bad())?,
-            256,
-        ),
-        DynSolType::Int(_) => DynSolValue::Int(s.parse::<I256>().map_err(|_| bad())?, 256),
-        DynSolType::Address => DynSolValue::Address(s.parse().map_err(|_| bad())?),
-        DynSolType::Bool => DynSolValue::Bool(match s.to_ascii_lowercase().as_str() {
-            "true" | "1" => true,
-            "false" | "0" => false,
-            _ => return Err(bad()),
-        }),
-        DynSolType::FixedBytes(32) => {
-            let b = hex::decode(s.trim_start_matches("0x")).map_err(|_| bad())?;
-            let mut w = [0u8; 32];
-            w[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
-            DynSolValue::FixedBytes(B256::from(w), 32)
-        }
-        DynSolType::Bytes => DynSolValue::Bytes(hex::decode(s.trim_start_matches("0x")).map_err(|_| bad())?),
-        _ => DynSolValue::String(s.to_string()),
-    })
 }
 
 fn u(v: &DynSolValue) -> U256 {
@@ -1010,11 +1034,129 @@ impl Cheats {
                         _ => DynSolType::String,
                     },
                 };
-                match (lookup(&key), args.get(1)) {
-                    (Some(v), _) => Ok(enc(parse_as(&ty, &v)?)),
-                    (None, Some(default)) => Ok(enc(default.clone())),
-                    (None, None) => env(&key).map(|_| vec![]),
+                // envOr: the default when the variable is unset or doesn't parse, as in forge
+                match (env(&key).and_then(|v| crate::json::parse_value(&v, &ty)), args.get(1)) {
+                    (Ok(v), _) => Ok(enc(v)),
+                    (Err(_), Some(default)) => Ok(enc(default.clone())),
+                    (Err(e), None) => Err(e),
                 }
+            }
+            sg if sg.starts_with("parseJson") || sg.starts_with("keyExists") => {
+                let json: serde_json::Value = serde_json::from_str(&st(&args[0])).map_err(|e| format!("failed parsing JSON: {e}"))?;
+                // the key: none for parseJson(json) and parseJsonType(json, type), the second argument otherwise
+                let path = if args.len() == 1 || s.sig == "parseJsonType(string,string)" { "$".into() } else { st(&args[1]) };
+                let found = crate::json::select(&json, &path)?;
+                let ty = |t: &str| DynSolType::parse(t).map_err(|e| format!("{t}: {e}"));
+                let want = match s.name.as_str() {
+                    "keyExists" | "keyExistsJson" => return Ok(enc(DynSolValue::Bool(!found.is_empty()))),
+                    "parseJsonKeys" => {
+                        let [serde_json::Value::Object(o)] = found.as_slice() else { return Err(format!("key {path:?} must return exactly one JSON object")) };
+                        return Ok(enc(DynSolValue::Array(o.keys().map(|k| DynSolValue::String(k.clone())).collect())));
+                    }
+                    "parseJson" => {
+                        let defs = json_defs(&self.artifacts, &self.root);
+                        let values = found.iter().map(|v| crate::json::token(v, defs)).collect::<Result<Vec<_>, _>>()?;
+                        return Ok(enc(DynSolValue::Bytes(crate::json::encode(values))));
+                    }
+                    "parseJsonType" if args.len() == 2 => ty(&st(&args[1]))?,
+                    "parseJsonType" => ty(&st(&args[2]))?,
+                    "parseJsonTypeArray" => DynSolType::Array(Box::new(ty(&st(&args[2]))?)),
+                    n => {
+                        let base = n.trim_start_matches("parseJson").trim_end_matches("Array");
+                        let t = match base {
+                            "Uint" => DynSolType::Uint(256),
+                            "Int" => DynSolType::Int(256),
+                            "Bool" => DynSolType::Bool,
+                            "Address" => DynSolType::Address,
+                            "String" => DynSolType::String,
+                            "Bytes" => DynSolType::Bytes,
+                            _ => DynSolType::FixedBytes(32),
+                        };
+                        if n.ends_with("Array") { DynSolType::Array(Box::new(t)) } else { t }
+                    }
+                };
+                let [v] = found.as_slice() else { return Err(format!("path {path:?} must return exactly one JSON value")) };
+                let value = crate::json::coerce(v, &want)?.abi_encode();
+                // the typed getters return the value itself; parseJsonType returns it ABI-encoded, as bytes
+                Ok(if s.name.starts_with("parseJsonType") { enc(DynSolValue::Bytes(value)) } else { value })
+            }
+            sg if sg.starts_with("serialize") => {
+                let obj = st(&args[0]);
+                if s.name == "serializeJson" {
+                    let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&st(&args[1])).map_err(|e| format!("failed parsing JSON: {e}"))?;
+                    self.json.insert(obj, v.into_iter().collect());
+                    return Ok(enc(args[1].clone()));
+                }
+                let value = match s.name.as_str() {
+                    "serializeUintToHex" => serde_json::Value::String(format!("0x{:x}", u(&args[2]))),
+                    _ => crate::json::to_json(args[2].clone()),
+                };
+                let map = self.json.entry(obj).or_default();
+                map.insert(st(&args[1]), value);
+                Ok(enc(DynSolValue::String(serde_json::to_string(map).unwrap())))
+            }
+            "writeJson(string,string)" | "writeJson(string,string,string)" => {
+                let path = st(&args[1]);
+                let data = match args.get(2) {
+                    None => serde_json::from_str(&st(&args[0])).unwrap_or_else(|_| serde_json::Value::String(st(&args[0]))),
+                    Some(key) => {
+                        // the file's JSON with the value put in at the key; a file that isn't there yet starts empty
+                        let p = self.fs(&path, false)?;
+                        let mut data = match std::fs::read_to_string(&p) {
+                            Ok(t) => serde_json::from_str(&t).unwrap_or(serde_json::Value::String(t)),
+                            Err(_) => serde_json::json!({}),
+                        };
+                        crate::json::upsert(&mut data, &st(&args[0]), &st(key))?;
+                        data
+                    }
+                };
+                let p = self.fs(&path, true)?;
+                self.impure();
+                std::fs::write(&p, serde_json::to_string_pretty(&data).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
+                ok
+            }
+            "removeFile(string)" => {
+                let p = self.fs(&st(&args[0]), true)?;
+                self.impure();
+                std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                ok
+            }
+            "dumpState(string)" => {
+                // what this transaction has loaded, as genesis allocs; not the system accounts, nor empty ones (forge's)
+                let skip = [CHEATS, SENDER, CONSOLE, TEST_CONTRACT, caller];
+                let alloc: std::collections::BTreeMap<String, serde_json::Value> = j
+                    .inner
+                    .state
+                    .iter()
+                    .filter(|(a, acc)| !skip.contains(a) && !acc.is_empty())
+                    .map(|(a, acc)| {
+                        let code = acc.info.code.as_ref().map(|c| c.original_bytes()).unwrap_or_default();
+                        let mut slots: Vec<(U256, U256)> = acc.storage.iter().map(|(k, v)| (*k, v.present_value())).collect();
+                        slots.sort();
+                        let storage: serde_json::Map<String, serde_json::Value> = slots.into_iter().map(|(k, v)| (B256::from(k).to_string(), B256::from(v).to_string().into())).collect();
+                        (a.to_string().to_lowercase(), serde_json::json!({"nonce": format!("0x{:x}", acc.info.nonce), "balance": format!("0x{:x}", acc.info.balance), "code": format!("0x{}", hex::encode(&code)), "storage": storage}))
+                    })
+                    .collect();
+                let p = self.fs(&st(&args[0]), true)?;
+                self.impure();
+                std::fs::write(&p, serde_json::to_string(&alloc).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
+                ok
+            }
+            "cool(address)" | "coolSlot(address,bytes32)" => {
+                // forge's: storage cold again (and the account untouched), as if a new transaction read it
+                if let Some(acc) = j.inner.state.get_mut(&a(&args[0])) {
+                    acc.unmark_touch();
+                    match args.get(1) {
+                        Some(k) => acc.storage.get_mut(&b32(k).into()).into_iter().for_each(|v| v.mark_cold()),
+                        None => acc.storage.values_mut().for_each(|v| v.mark_cold()),
+                    }
+                }
+                ok
+            }
+            "lastCallGas()" => {
+                let g = self.last_gas.ok_or("no external call was made yet")?;
+                let w = |n: u64| DynSolValue::Uint(U256::from(n), 64);
+                Ok(DynSolValue::Tuple(vec![w(g.limit()), w(g.total_gas_spent()), w(0), DynSolValue::Int(I256::try_from(g.refunded()).unwrap_or_default(), 64), w(g.remaining())]).abi_encode())
             }
             sg if sg.starts_with("parse") => {
                 let ty = match s.name.as_str() {
@@ -1025,12 +1167,12 @@ impl Cheats {
                     "parseBytes32" => DynSolType::FixedBytes(32),
                     _ => DynSolType::Bytes,
                 };
-                Ok(enc(parse_as(&ty, &st(&args[0]))?))
+                Ok(enc(crate::json::parse_value(&st(&args[0]), &ty)?))
             }
             sg if sg.starts_with("toString(") => Ok(enc(DynSolValue::String(decode::display(&args[0])))),
             "getCode(string)" | "getDeployedCode(string)" => {
                 let what = st(&args[0]);
-                let art = find_artifact(&self.artifacts, &what)?;
+                let art = find_artifact(&self.artifacts, &what, &self.solc)?;
                 self.read(format!("art:{}:{}", art.file, art.name));
                 if s.name == "getCode" {
                     // tests deploy the same contracts run after run: link and decode each once per suite
@@ -1042,10 +1184,15 @@ impl Cheats {
                     self.code_memo.lock().unwrap().insert(id, code.clone());
                     return Ok(enc(DynSolValue::Bytes(code)));
                 }
-                if art.deployed.contains("__$") {
-                    return Err(format!("{what} needs library linking, unsupported in getDeployedCode"));
+                // libraries by their placeholders, "__$" + keccak256("file:Name")[..17] + "$__", as solc writes them
+                let mut code = art.deployed.clone();
+                for (id, addr) in &self.libs {
+                    code = code.replace(&format!("__${}$__", &hex::encode(keccak256(id.as_bytes()))[..34]), &hex::encode(addr));
                 }
-                Ok(enc(DynSolValue::Bytes(hex::decode(&art.deployed).unwrap_or_default())))
+                if code.contains("__$") {
+                    return Err(format!("{what} links a library that isn't deployed"));
+                }
+                Ok(enc(DynSolValue::Bytes(hex::decode(&code).map_err(|e| format!("{what}: {e}"))?)))
             }
             "mockCall(address,bytes,bytes)" | "mockCallRevert(address,bytes,bytes)" => {
                 self.mocks.push((a(&args[0]), None, by(&args[1]), by(&args[2]), s.name == "mockCallRevert"));
@@ -1064,7 +1211,20 @@ impl Cheats {
                 self.expected_calls.push((a(&args[0]), value, by(args.last().unwrap()), 0));
                 ok
             }
-            "pauseGasMetering()" | "resumeGasMetering()" | "allowCheatcodes(address)" | "makePersistent(address)" => ok,
+            "pauseGasMetering()" => {
+                // the frames running now keep their gas from here (see `step`)
+                self.paused.get_or_insert_default();
+                ok
+            }
+            "resumeGasMetering()" => {
+                self.paused = None;
+                ok
+            }
+            "resetGasMetering()" => {
+                self.reset_gas = true;
+                ok
+            }
+            "allowCheatcodes(address)" | "makePersistent(address)" => ok,
             "isPersistent(address)" => Ok(enc(DynSolValue::Bool(true))),
             "startBroadcast()" | "startBroadcast(address)" | "startBroadcast(uint256)" | "broadcast()" | "broadcast(address)" | "broadcast(uint256)" => {
                 let sender = match args.first() {
@@ -1128,7 +1288,7 @@ impl Cheats {
                     None => Err("forking inside tests is unsupported; run with `plain test --fork <url|network>`".into()),
                 }
             }
-            sg if sg.starts_with("snapshotGasLastCall") => Ok(enc(DynSolValue::Uint(U256::from(self.last_call_gas.get(&depth).copied().unwrap_or(0)), 256))),
+            sg if sg.starts_with("snapshotGasLastCall") => Ok(enc(DynSolValue::Uint(U256::from(self.last_gas.map_or(0, |g| g.total_gas_spent())), 256))),
             sg if sg.starts_with("startSnapshotGas") => {
                 self.gas_snapshot = Some(gas_left);
                 ok
@@ -1185,13 +1345,11 @@ impl Cheats {
         }
         self.revert_armed = None;
         let exp = self.expect_revert.take().unwrap();
-        // failures before any code ran (no balance for the value, a CREATE2 address taken, too deep) aren't reverts
-        let never_ran = matches!(result.result, InstructionResult::OutOfFunds | InstructionResult::CreateCollision | InstructionResult::CallTooDeep | InstructionResult::NonceOverflow);
+        // any failure counts, as in forge: a revert, a halt, or one before any code ran (no balance for the value)
         let from = self.revert_src.take().map(|(a, _)| a);
-        if result.result.is_ok() || never_ran {
-            let why = if never_ran { format!("call did not revert as expected (it failed before running: {:?})", result.result) } else { "call did not revert as expected".into() };
+        if result.result.is_ok() {
             result.result = InstructionResult::Revert;
-            result.output = decode::revert_msg(&why);
+            result.output = decode::revert_msg("call did not revert as expected");
         } else if let Some(want) = exp.reverter.filter(|w| from != Some(*w)) {
             result.output = decode::revert_msg(&format!("reverted in {}, expected the revert from {want}", from.map_or("?".into(), |a| a.to_string())));
             result.result = InstructionResult::Revert;
@@ -1252,6 +1410,97 @@ impl Cheats {
         bc
     }
 
+    /// forge's --isolate: a call or create the test contract makes runs as a transaction of its own, on the state so
+    /// far with every account and slot cold again (each slot's original value its current one) and no transient
+    /// storage. The frame making it pays what the transaction used: 21000 and calldata included, refunds taken off.
+    fn isolated(&mut self, ctx: &mut Ctx, caller: Address, kind: TxKind, data: Bytes, value: U256, gas_limit: u64) -> (InterpreterResult, Option<Address>) {
+        let mut state = ctx.journaled_state.inner.state.clone();
+        for (a, acc) in state.iter_mut() {
+            if ctx.journaled_state.inner.warm_addresses.is_cold(a) {
+                acc.mark_cold();
+            }
+            for v in acc.storage.values_mut() {
+                v.is_cold = true;
+                v.original_value = v.present_value;
+            }
+        }
+        let db = std::mem::replace(&mut ctx.journaled_state.database, Db::new(Remote::default()));
+        let mut inner: Ctx = Context::new(db, ctx.cfg.spec);
+        inner.cfg = ctx.cfg.clone();
+        inner.block = ctx.block.clone();
+        inner.block.basefee = 0;
+        inner.journaled_state.inner.state = state;
+        // the inner frames run at the depths they'd have in place, so cheatcode depths still match
+        inner.journaled_state.inner.depth = 1;
+        let mut tx = TxEnv::default();
+        tx.caller = caller;
+        tx.kind = kind;
+        tx.data = data;
+        tx.value = value;
+        tx.gas_price = 0;
+        tx.chain_id = Some(ctx.cfg.chain_id);
+        tx.gas_limit = (gas_limit + 21_000).min(ctx.block.gas_limit);
+        let origin = std::mem::replace(&mut self.inner_origin, ctx.tx.caller);
+        self.in_inner = true;
+        let mut evm = inner.build_mainnet_with_inspector(&mut *self);
+        let res = evm.inspect_tx(tx);
+        ctx.journaled_state.database = std::mem::replace(&mut evm.ctx.journaled_state.database, Db::new(Remote::default()));
+        // cheatcodes inside it (warp, roll, ...) still count
+        let basefee = ctx.block.basefee;
+        ctx.block = evm.ctx.block.clone();
+        ctx.block.basefee = basefee;
+        ctx.cfg.chain_id = evm.ctx.cfg.chain_id;
+        drop(evm);
+        self.in_inner = false;
+        self.inner_origin = origin;
+        let mut gas = Gas::new(gas_limit);
+        // a transaction the chain wouldn't take (no balance for the value, gas under the intrinsic cost) reverts empty
+        let Ok(res) = res else { return (InterpreterResult { result: InstructionResult::Revert, output: Bytes::new(), gas }, None) };
+        let outer = &mut ctx.journaled_state.inner.state;
+        for (a, mut acc) in res.state {
+            let Some(o) = outer.get_mut(&a) else {
+                outer.insert(a, acc);
+                continue;
+            };
+            // what was warm before stays warm
+            if acc.status.contains(revm::state::AccountStatus::Cold) && !o.status.contains(revm::state::AccountStatus::Cold) {
+                acc.status -= revm::state::AccountStatus::Cold;
+            }
+            o.info = acc.info;
+            o.status |= acc.status;
+            for (k, v) in acc.storage {
+                match o.storage.get_mut(&k) {
+                    Some(slot) => {
+                        slot.present_value = v.present_value;
+                        slot.is_cold &= v.is_cold;
+                    }
+                    None => {
+                        o.storage.insert(k, v);
+                    }
+                }
+            }
+        }
+        match res.result {
+            ExecutionResult::Success { reason, gas: g, output, .. } => {
+                gas.set_refund(g.final_refunded() as i64);
+                let _ = gas.record_regular_cost(g.tx_gas_used());
+                let (out, address) = match output {
+                    Output::Call(o) => (o, None),
+                    Output::Create(o, a) => (o, a),
+                };
+                (InterpreterResult { result: reason.into(), output: out, gas }, address)
+            }
+            ExecutionResult::Revert { gas: g, output, .. } => {
+                let _ = gas.record_regular_cost(g.tx_gas_used());
+                (InterpreterResult { result: InstructionResult::Revert, output, gas }, None)
+            }
+            ExecutionResult::Halt { reason, gas: g, .. } => {
+                let _ = gas.record_regular_cost(g.tx_gas_used());
+                (InterpreterResult { result: reason.into(), output: Bytes::new(), gas }, None)
+            }
+        }
+    }
+
     /// Notes where a revert started: the innermost frame that failed with these bytes.
     fn note_revert(&mut self, addr: Address, result: &InterpreterResult) {
         if !result.result.is_ok() && self.revert_src.as_ref().is_none_or(|(_, o)| *o != result.output) {
@@ -1270,8 +1519,47 @@ impl Cheats {
 }
 
 impl Inspector<Ctx> for Cheats {
+    fn initialize_interp(&mut self, interp: &mut revm::interpreter::Interpreter, _: &mut Ctx) {
+        if let Some(frames) = &mut self.paused {
+            frames.push(interp.gas);
+        }
+    }
+
+    fn step(&mut self, interp: &mut revm::interpreter::Interpreter, _: &mut Ctx) {
+        // vm.pauseGasMetering: every step goes back to the frame's gas from when it paused (memory still grows)
+        if let Some(frames) = &mut self.paused {
+            match frames.last() {
+                Some(g) => {
+                    let memory = *interp.gas.memory();
+                    interp.gas = *g;
+                    *interp.gas.memory_mut() = memory;
+                }
+                None => frames.push(interp.gas),
+            }
+        }
+        if self.reset_gas {
+            let memory = *interp.gas.memory();
+            interp.gas = Gas::new(interp.gas.limit());
+            *interp.gas.memory_mut() = memory;
+            self.reset_gas = false;
+        }
+    }
+
+    fn step_end(&mut self, interp: &mut revm::interpreter::Interpreter, _: &mut Ctx) {
+        if let Some(frames) = &mut self.paused {
+            if interp.bytecode.action.as_ref().is_some_and(|a| a.is_return()) {
+                frames.pop();
+            }
+        }
+    }
+
     fn call(&mut self, ctx: &mut Ctx, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let depth = ctx.journaled_state.depth();
+        if self.in_inner && depth == 1 {
+            // the top frame of an isolated transaction: everything for this call was done in the outer one
+            ctx.tx.caller = self.inner_origin;
+            return None;
+        }
         if inputs.target_address == CHEATS {
             self.cheat_gas = inputs.gas_limit;
             let data = inputs.input.bytes(ctx);
@@ -1334,14 +1622,39 @@ impl Inspector<Ctx> for Cheats {
             self.trace_stack.push(t.len());
             t.push(TraceNode { depth, to: inputs.target_address, input: inputs.input.bytes(ctx), value: inputs.call_value(), create: false, result: None });
         }
+        if self.isolate && depth == 1 {
+            use revm::interpreter::interpreter_action::CallScheme;
+            match inputs.scheme {
+                CallScheme::Call => {
+                    let data = inputs.input.bytes(ctx);
+                    let (result, _) = self.isolated(ctx, caller, TxKind::Call(inputs.target_address), data, inputs.call_value(), inputs.gas_limit);
+                    return Some(CallOutcome::new(result, inputs.return_memory_offset.clone()));
+                }
+                // a view call starts cold too, though it runs in place (forge's)
+                CallScheme::StaticCall => {
+                    let inner = &mut ctx.journaled_state.inner;
+                    for (a, acc) in inner.state.iter_mut() {
+                        if inner.warm_addresses.is_cold(a) {
+                            acc.mark_cold();
+                        }
+                        acc.storage.values_mut().for_each(|v| v.mark_cold());
+                    }
+                }
+                _ => {}
+            }
+        }
         None
     }
 
     fn call_end(&mut self, ctx: &mut Ctx, inputs: &CallInputs, outcome: &mut CallOutcome) {
-        if inputs.target_address == CHEATS || inputs.target_address == CONSOLE {
+        let depth = ctx.journaled_state.depth();
+        if inputs.target_address == CHEATS || (self.in_inner && depth == 1) {
             return;
         }
-        let depth = ctx.journaled_state.depth();
+        self.last_gas = Some(outcome.result.gas);
+        if inputs.target_address == CONSOLE {
+            return;
+        }
         self.after(ctx, depth);
         if self.revert_armed.is_some() {
             self.note_revert(inputs.target_address, &outcome.result);
@@ -1349,7 +1662,6 @@ impl Inspector<Ctx> for Cheats {
         if !outcome.result.result.is_ok() && outcome.result.result != InstructionResult::Revert {
             self.last_halt = Some(outcome.result.result);
         }
-        self.last_call_gas.insert(depth, outcome.result.gas.total_gas_spent());
         let traced = if self.trace.is_some() { self.trace_stack.pop() } else { None };
         if self.allow_internal_revert && self.revert_armed.is_none() && self.expect_revert.as_ref().is_some_and(|e| e.depth == depth + 1) {
             // the frame that called expectRevert reverted itself (internal call)
@@ -1364,6 +1676,10 @@ impl Inspector<Ctx> for Cheats {
 
     fn create(&mut self, ctx: &mut Ctx, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let depth = ctx.journaled_state.depth();
+        if self.in_inner && depth == 1 {
+            ctx.tx.caller = self.inner_origin;
+            return None;
+        }
         let mut caller = inputs.caller();
         if let Some(mut bc) = self.before(ctx, depth, &mut caller, false, false) {
             bc.value = inputs.value();
@@ -1404,11 +1720,18 @@ impl Inspector<Ctx> for Cheats {
             self.trace_stack.push(t.len());
             t.push(TraceNode { depth, to: Address::ZERO, input: inputs.init_code().clone(), value: inputs.value(), create: true, result: None });
         }
+        if self.isolate && depth == 1 && !matches!(inputs.scheme(), revm::context_interface::CreateScheme::Create2 { .. }) {
+            let (result, address) = self.isolated(ctx, caller, TxKind::Create, inputs.init_code().clone(), inputs.value(), inputs.gas_limit());
+            return Some(CreateOutcome::new(result, address));
+        }
         None
     }
 
     fn create_end(&mut self, ctx: &mut Ctx, inputs: &CreateInputs, outcome: &mut CreateOutcome) {
         let depth = ctx.journaled_state.depth();
+        if self.in_inner && depth == 1 {
+            return;
+        }
         self.after(ctx, depth);
         if self.revert_armed.is_some() {
             self.note_revert(outcome.address.unwrap_or_default(), &outcome.result);

@@ -150,7 +150,7 @@ fn dep_hash(g: &Graph, f: &str, code: &[String], own: &HashMap<String, String>, 
 pub enum Scope {
     All,
     /// what `plain test [filter]` runs: with a filter, only test files with a matching suite or test
-    Tests(Option<String>),
+    Tests(crate::test::Filter),
     Deploy(String),
 }
 
@@ -377,11 +377,11 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let g = Graph::build(p, &files);
     let version = pick_version(p, &g);
     let evm = EVM.get_or_init(|| target_evm(p, &version)).clone();
-    let settings = settings(p);
+    let settings: Vec<Value> = (0..=p.profiles.len()).map(|i| settings(p, i)).collect();
     let key = {
         use sha2::Digest;
         // bump the suffix when rewrites change what gets compiled
-        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings}{:?}rw5", salt(), p.dirs).as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings:?}{:?}{:?}rw5", salt(), p.restrictions, p.dirs).as_bytes()))
     };
     let cache_path = p.root.join(".plain/cache.json");
     let mut cache: Cache = std::fs::read(&cache_path)
@@ -404,14 +404,19 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 let src = &g.files[u].content;
                 crate::rewrite::Unit::parse(src).map(|x| x.funcs.iter().filter(|f| crate::rewrite::is_test_name(&f.name)).map(|f| f.name.clone()).collect()).unwrap_or_default()
             };
-            let matches = |f: &String, flt: &str| {
-                let own = crate::rewrite::Unit::parse(&g.files[f].content).map(|u| u.contracts.iter().any(|c| format!("{f}:{}", c.name).contains(flt))).unwrap_or(true);
-                own || g.closure(f).iter().filter(|u| rewritten(p, u)).any(|u| tests_in(u).iter().any(|t| t.contains(flt)))
+            // a suite of the file (or, unparsed, any) with a test of its own or of the test files it imports
+            let matches = |f: &String| {
+                let contracts: Vec<String> = crate::rewrite::Unit::parse(&g.files[f].content).map_or(vec![String::new()], |u| u.contracts.iter().map(|c| c.name.clone()).collect());
+                let tests: Vec<String> = g.closure(f).iter().filter(|u| rewritten(p, u)).flat_map(|u| tests_in(u)).collect();
+                contracts.iter().any(|c| {
+                    let id = format!("{f}:{c}");
+                    filter.wants(&id, None) && (filter.test.is_none() && filter.any.as_deref().is_none_or(|a| id.contains(a)) || tests.iter().any(|t| filter.wants(&id, Some(t))))
+                })
             };
             let mut need: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in files.iter().filter(|f| !f.starts_with(&script)) {
                 // every src file too, filter or not: a test can deploy any contract by name (getCode, deployCode)
-                if !rewritten(p, f) || filter.as_deref().is_none_or(|flt| matches(f, flt)) {
+                if !rewritten(p, f) || filter.is_empty() || matches(f) {
                     need.extend(g.closure(f));
                 }
             }
@@ -520,7 +525,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 eprintln!("rewrite fallback: {broken:?}");
             }
             results.retain(|r| !r.0.files.iter().any(|f| broken.contains(f)));
-            let jobs: Vec<Job> = broken.iter().map(|f| Job { files: vec![f.clone()], shard: None, test: false, est: 0, fast: false, only: vec![] }).collect();
+            let jobs: Vec<Job> = broken.iter().map(|f| Job { files: vec![f.clone()], shard: None, test: false, est: 0, fast: false, only: vec![], profile: profile_of(p, &g, f) }).collect();
             results.extend(run_jobs(&solc, &g, &jobs, &settings, p, &HashMap::new(), &HashMap::new()));
         }
         let mut warnings = std::collections::BTreeSet::new();
@@ -637,6 +642,8 @@ struct Job {
     fast: bool,
     /// contracts to compile, when not every contract in `files` (units after the first: the test contracts)
     only: Vec<String>,
+    /// the compiler profile (see `profile_of`)
+    profile: usize,
 }
 
 struct Plan {
@@ -812,7 +819,7 @@ impl Plan {
         let total: u64 = est.values().sum();
         let slot = (total / workers as u64).max(1);
         let mut jobs = vec![];
-        let mut small: [Vec<(String, u64)>; 2] = [vec![], vec![]];
+        let mut small: BTreeMap<(bool, usize), Vec<(String, u64)>> = BTreeMap::new();
         let mut unit_plans = HashMap::new();
         for f in dirty {
             let (e, own, test_bytes) = est_own[f.as_str()];
@@ -900,7 +907,7 @@ impl Plan {
                             sources.insert(format!("{f}#{i}"), src);
                             // unit 0 also compiles the file's other contracts (mocks, harnesses); the rest only the tests
                             let only = if i == 0 { vec![] } else { cu.contracts.iter().enumerate().filter(|(ci, c)| in_test(*ci) && !c.is_abstract && c.kind == "contract").map(|(_, c)| c.name.clone()).collect() };
-                            jobs.push(Job { files: vec![f.to_string()], shard: Some((i, n)), test: true, est: e - split + split * sz(&u.owns) as u64 / total as u64, fast, only });
+                            jobs.push(Job { files: vec![f.to_string()], shard: Some((i, n)), test: true, est: e - split + split * sz(&u.owns) as u64 / total as u64, fast, only, profile: profile_of(p, g, f) });
                         }
                         unit_plans.insert(f.to_string(), (shared, units));
                         continue;
@@ -911,19 +918,21 @@ impl Plan {
                     unit_plans.insert(f.to_string(), (shared, vec![(meta(all, false), None)]));
                 }
             }
+            let profile = profile_of(p, g, f);
             if e > slot / 4 {
-                jobs.push(Job { files: vec![f.to_string()], shard: None, test, est: e, fast: false, only: vec![] });
+                jobs.push(Job { files: vec![f.to_string()], shard: None, test, est: e, fast: false, only: vec![], profile });
             } else {
-                small[test as usize].push((f.to_string(), e));
+                small.entry((test, profile)).or_default().push((f.to_string(), e));
             }
         }
         // pack small files into jobs of about a quarter share each (fewer processes, shared analysis)
-        for (test, mut list) in small.into_iter().enumerate() {
+        for ((test, profile), mut list) in small {
             list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let mut cur = Job { files: vec![], shard: None, test: test == 1, est: 0, fast: false, only: vec![] };
+            let empty = || Job { files: vec![], shard: None, test, est: 0, fast: false, only: vec![], profile };
+            let mut cur = empty();
             for (f, e) in list {
                 if cur.est + e > slot / 4 && !cur.files.is_empty() {
-                    jobs.push(std::mem::replace(&mut cur, Job { files: vec![], shard: None, test: test == 1, est: 0, fast: false, only: vec![] }));
+                    jobs.push(std::mem::replace(&mut cur, empty()));
                 }
                 cur.files.push(f);
                 cur.est += e;
@@ -1103,7 +1112,7 @@ impl<'a> Cost<'a> {
 }
 
 /// Runs jobs on a pool of workers, biggest first; results with solc wall time (ms).
-fn run_jobs(solc: &PathBuf, g: &Graph, jobs: &[Job], settings: &Value, p: &Project, sources: &HashMap<String, String>, gen_deps: &HashMap<String, Vec<String>>) -> Vec<(Job, Result<(Vec<Artifact>, Vec<String>), String>, u64)> {
+fn run_jobs(solc: &PathBuf, g: &Graph, jobs: &[Job], settings: &[Value], p: &Project, sources: &HashMap<String, String>, gen_deps: &HashMap<String, Vec<String>>) -> Vec<(Job, Result<(Vec<Artifact>, Vec<String>), String>, u64)> {
     let workers = std::env::var("PLAIN_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out = std::sync::Mutex::new(Vec::new());
@@ -1114,7 +1123,7 @@ fn run_jobs(solc: &PathBuf, g: &Graph, jobs: &[Job], settings: &Value, p: &Proje
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(job) = jobs.get(i) else { break };
                 let t = std::time::Instant::now();
-                let r = compile(solc, g, job, settings, p, sources, gen_deps);
+                let r = compile(solc, g, job, &settings[job.profile], p, sources, gen_deps);
                 let ms = t.elapsed().as_millis() as u64;
                 if std::env::var_os("PLAIN_DEBUG").is_some() {
                     eprintln!("job {:.1}s at {:.1}s est {} {:?}{}{}", ms as f64 / 1000.0, (t0.elapsed().as_millis() as u64 - ms) as f64 / 1000.0, job.est, job.files, job.shard.map(|(k, n)| format!(" shard {k}/{n}")).unwrap_or_default(), if job.fast { " fast" } else { "" });
@@ -1125,7 +1134,7 @@ fn run_jobs(solc: &PathBuf, g: &Graph, jobs: &[Job], settings: &Value, p: &Proje
     });
     let mut res = out.into_inner().unwrap();
     res.sort_by_key(|r| r.0);
-    res.into_iter().map(|(i, r, ms)| (Job { files: jobs[i].files.clone(), shard: jobs[i].shard, test: jobs[i].test, est: jobs[i].est, fast: jobs[i].fast, only: jobs[i].only.clone() }, r, ms)).collect()
+    res.into_iter().map(|(i, r, ms)| (Job { files: jobs[i].files.clone(), only: jobs[i].only.clone(), ..jobs[i] }, r, ms)).collect()
 }
 
 fn gitignore(p: &Project) {
@@ -1135,13 +1144,18 @@ fn gitignore(p: &Project) {
     }
 }
 
-pub fn settings(p: &Project) -> Value {
+/// solc's settings for compiler profile `profile` (0: the default, then foundry.toml's additional_compiler_profiles).
+pub fn settings(p: &Project, profile: usize) -> Value {
+    let (optimizer, runs, via_ir, evm) = match profile.checked_sub(1).and_then(|i| p.profiles.get(i)) {
+        Some(x) => (x.optimizer, x.runs, x.via_ir, x.evm_version.as_ref().filter(|e| p.evm_version.as_ref() != Some(*e))),
+        None => (p.optimizer, p.runs, p.via_ir, None),
+    };
     let mut s = json!({
         "remappings": p.remappings.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>(),
-        "optimizer": {"enabled": p.optimizer, "runs": p.runs},
-        "viaIR": p.via_ir,
+        "optimizer": {"enabled": optimizer, "runs": runs},
+        "viaIR": via_ir,
     });
-    if let Some(e) = EVM.get().or(p.evm_version.as_ref()) {
+    if let Some(e) = evm.or(EVM.get()).or(p.evm_version.as_ref()) {
         s["evmVersion"] = json!(e);
     }
     if let Some(h) = &p.bytecode_hash {
@@ -1151,6 +1165,18 @@ pub fn settings(p: &Project) -> Value {
         s["metadata"]["appendCBOR"] = json!(c);
     }
     s
+}
+
+/// The compiler profile `file` compiles with, as forge picks it: the first (the default, then the additional ones in
+/// order) that every compilation_restriction on the file and on the files it imports allows.
+pub fn profile_of(p: &Project, g: &Graph, file: &str) -> usize {
+    if p.restrictions.is_empty() {
+        return 0;
+    }
+    let closure = g.closure(file);
+    let rules: Vec<&crate::project::Restriction> = p.restrictions.iter().filter(|r| closure.iter().any(|f| crate::test::path_matches(&r.paths, f))).collect();
+    let default = crate::project::Profile { optimizer: p.optimizer, runs: p.runs, via_ir: p.via_ir, evm_version: None };
+    std::iter::once(&default).chain(&p.profiles).position(|x| rules.iter().all(|r| r.allows(x))).unwrap_or_else(|| crate::die(&format!("no compiler profile satisfies the compilation_restrictions for {file}")))
 }
 
 /// solc's standard JSON output for `input`.
