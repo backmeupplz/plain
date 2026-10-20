@@ -20,6 +20,10 @@ contract Probe {
     }
 }
 
+contract Token {
+    mapping(address => uint256) public balanceOf;
+}
+
 // forge 1.x behavior that plain matches
 contract ForgeTest is Test {
     struct Pair { uint256 z; string a; }
@@ -93,6 +97,18 @@ contract ForgeTest is Test {
         assertEq(pairs[0].a, "s");
         vm.serializeUint("o", "n", 5);
         assertEq(vm.serializeAddress("o", "who", address(0xaa)), '{"n":5,"who":"0x00000000000000000000000000000000000000AA"}');
+    }
+
+    function test_recordAndStdStorageDeal() public {
+        Token t = new Token();
+        // forge-std's ERC-20 deal finds the balance slot with vm.record/vm.accesses
+        deal(address(t), address(0xbeef), 7);
+        assertEq(t.balanceOf(address(0xbeef)), 7);
+        vm.record();
+        t.balanceOf(address(1));
+        (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(address(t));
+        assertEq(reads.length, 1);
+        assertEq(writes.length, 0);
     }
 
     function test_envArrays() public {
