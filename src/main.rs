@@ -57,8 +57,11 @@ const USAGE: &str = "plain: compile, test and deploy EVM contracts
 usage:
   plain                                      in a terminal: a menu for everything below
   plain init [dir]                           scaffold src/Counter.sol + test/Counter.t.sol (in dir, if given)
-  plain build [--force] [--check]            compile src/, test/, script/ (solc auto-selected from pragmas);
-                                             --check: confirm each contract matches solc's own compile
+  plain build [files] [--force] [--check]    compile src/, test/, script/ (solc auto-selected from pragmas);
+             [--sizes] [--skip test|script]  --check: confirm each contract matches solc's own compile;
+             [--out dir] [--extra-output storageLayout]
+                                             --sizes: fail past EIP-170/3860; --out: forge-style artifacts
+  plain inspect <Contract> storage-layout    solc's storage layout, as JSON
   plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts;
              [--fuzz-runs N] [--seed N]      unchanged suites reuse their results (--rerun: run them anyway,
              [--rerun] [--force] [--watch]   --force: also recompile, --watch: again on every save)
@@ -171,9 +174,32 @@ fn main() {
             let p = project::Project::load();
             let check = switch(&mut args, &["--check"]);
             let force = switch(&mut args, &["--force"]);
+            let sizes = switch(&mut args, &["--sizes"]);
+            // forge's: --skip test --skip script, --out <dir> (or FOUNDRY_OUT) for its artifact layout, with the
+            // storage layouts in them for --extra-output storageLayout
+            let (mut skip, mut extra) = (vec![], vec![]);
+            while let Some(v) = flag(&mut args, "--skip") {
+                skip.push(v);
+            }
+            while let Some(v) = flag(&mut args, "--extra-output") {
+                extra.push(v);
+            }
+            if let Some(x) = extra.iter().find(|x| x.as_str() != "storageLayout") {
+                die(&format!("--extra-output {x}: plain adds storageLayout only"));
+            }
+            let forge_out = flag(&mut args, "--out").or_else(|| flag(&mut args, "-o")).or_else(|| std::env::var("FOUNDRY_OUT").ok()).filter(|d| !d.is_empty());
             no_options(&args);
-            let out = solc::build(&p, force, solc::Scope::All);
+            let scope = if args.is_empty() && skip.is_empty() && forge_out.is_none() { solc::Scope::All } else { solc::Scope::Files(args.clone(), skip, forge_out.is_some()) };
+            let out = solc::build(&p, force, scope);
             eprintln!("compiled {} files with solc {} in {:.2?} ({} contracts)", out.compiled, out.solc, t.elapsed(), out.artifacts.len());
+            let built: Vec<&solc::Artifact> = out.artifacts.iter().filter(|a| a.shard == 0 && out.built.contains(&a.file)).collect();
+            if let Some(dir) = forge_out {
+                let layouts = if extra.is_empty() { Default::default() } else { solc::layouts(&p, &out.solc, &out.built) };
+                solc::write_forge(&p.root.join(&dir), &built, &layouts, &p.profiles);
+            }
+            if sizes && !solc::sizes(&built) {
+                die("some contracts exceed the size limits (EIP-170: 24576 bytes of runtime code, EIP-3860: 49152 of init code)");
+            }
             if check {
                 let t = Instant::now();
                 let bad = solc::check(&p, &out);
@@ -230,10 +256,13 @@ fn main() {
             let mut ok = true;
             if has_sol || ts_files.is_empty() {
                 let opts = test::Opts { filter, verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none(), access: std::sync::Arc::new(p.access.clone()), spec: evm::spec(&out.evm), solc: out.solc.clone(), isolate, gas_limit };
+                // what forge's run would have compiled: src, the test files the filter matches and what they import
+                // (scripts only when imported), so the libraries it deploys are forge's, in forge's order
+                let arts: Vec<solc::Artifact> = out.artifacts.into_iter().filter(|a| out.built.contains(&a.file)).collect();
                 // --threads 1: one test at a time, for tests that share process state (vm.setEnv)
                 ok &= match threads.filter(|n| *n > 0) {
-                    Some(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap_or_else(|e| die(&e.to_string())).install(|| test::run(out.artifacts, &p.root, &opts)),
-                    None => test::run(out.artifacts, &p.root, &opts),
+                    Some(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap_or_else(|e| die(&e.to_string())).install(|| test::run(arts, &p.root, &opts)),
+                    None => test::run(arts, &p.root, &opts),
                 };
             }
             if !ts_files.is_empty() {
@@ -347,6 +376,22 @@ fn main() {
             if !ok {
                 std::process::exit(1);
             }
+        }
+        "inspect" => {
+            // forge inspect <Contract> storage-layout [--json]: solc's layout, as JSON
+            let p = project::Project::load();
+            switch(&mut args, &["--json", "-j"]);
+            no_options(&args);
+            let [name, what] = &args[..] else { die("usage: plain inspect <Contract|path:Contract> storage-layout") };
+            if !matches!(what.as_str(), "storage-layout" | "storageLayout" | "storage") {
+                die(&format!("plain inspect shows storage-layout, not {what}"));
+            }
+            let (file, contract) = name.rsplit_once(':').map_or((None, name.as_str()), |(f, c)| (Some(f), c));
+            let defines = |f: &String| file.is_none_or(|x| f == x || f.ends_with(&format!("/{x}"))) && p.read(f).and_then(|t| rewrite::Unit::parse(&t)).is_some_and(|u| u.contracts.iter().any(|c| c.name == contract));
+            let files: Vec<String> = p.project_files().into_iter().filter(defines).collect();
+            let [file] = &files[..] else { die(&format!("{name}: {} contracts by that name in the project{}", files.len(), if files.is_empty() { "" } else { "; name it path:Contract" })) };
+            let layout = solc::layouts(&p, &solc::version(&p), std::slice::from_ref(file)).remove(&(file.clone(), contract.to_string())).unwrap_or_default();
+            println!("{}", serde_json::to_string_pretty(&layout).unwrap());
         }
         "account" => account::cli(&args),
         "node" => {

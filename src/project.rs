@@ -36,6 +36,7 @@ pub struct Project {
 
 #[derive(Clone, Debug)]
 pub struct Profile {
+    pub name: String,
     pub optimizer: bool,
     pub runs: u64,
     pub via_ir: bool,
@@ -350,10 +351,8 @@ impl Project {
                 if let Some(k) = t.keys().find(|k| !["name", "optimizer", "optimizer_runs", "via_ir", "evm_version"].contains(&k.as_str())) {
                     crate::die(&format!("additional_compiler_profiles: plain doesn't support {k:?} yet"));
                 }
-                if !t.contains_key("name") {
-                    crate::die("additional_compiler_profiles: a profile needs a name");
-                }
                 Profile {
+                    name: t.get("name").and_then(|v| v.as_str()).unwrap_or_else(|| crate::die("additional_compiler_profiles: a profile needs a name")).into(),
                     optimizer: t.get("optimizer").and_then(|v| v.as_bool()).unwrap_or(optimizer),
                     runs: t.get("optimizer_runs").and_then(|v| v.as_integer()).map_or(runs, |n| n as u64),
                     via_ir: t.get("via_ir").and_then(|v| v.as_bool()).unwrap_or(via_ir),
@@ -585,6 +584,17 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restrictions() {
+        // veydrift's: an optimized default (runs 1) and an unoptimized "tests" profile; max_optimizer_runs = 0 picks the latter
+        let default = Profile { name: "default".into(), optimizer: true, runs: 1, via_ir: true, evm_version: None };
+        let tests = Profile { optimizer: false, runs: 0, ..default.clone() };
+        let r = |min, max, via_ir| Restriction { paths: "test/X.t.sol".into(), via_ir, min_runs: min, max_runs: max };
+        assert!(!r(None, Some(0), None).allows(&default) && r(None, Some(0), None).allows(&tests));
+        assert!(r(Some(1), None, None).allows(&default) && !r(Some(1), None, None).allows(&tests), "min runs needs the optimizer on");
+        assert!(r(Some(0), None, None).allows(&tests) && !r(None, None, Some(false)).allows(&tests));
+    }
     #[test]
     fn scan_imports() {
         let s = r#"// import "nope.sol";

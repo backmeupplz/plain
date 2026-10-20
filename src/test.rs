@@ -197,8 +197,8 @@ pub fn deploy(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art
 }
 
 /// Deploy from `from` every library that `art`, and the contracts it deploys from artifacts, link against
-/// (each library's own libraries first), adding them to `libs`. With `record`, the deployments are also
-/// transactions to broadcast (`plain deploy`).
+/// (each library's own libraries first; the default profile's build of each, as forge's linker picks), adding them
+/// to `libs`. With `record`, the deployments are also transactions to broadcast (`plain deploy`).
 pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, libs: &mut HashMap<String, Address>, from: Address, record: &mut Option<&mut Vec<evm::BroadcastTx>>) -> Db {
     // libraries of contracts deployed from artifacts too, in the order embedding them would give
     // (transitively: a script the test deploys can deploy contracts from artifacts in turn)
@@ -211,7 +211,8 @@ pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artif
         }
         for id in &a.deploys {
             if seen.insert(id) {
-                todo.extend(arts.iter().find(|x| x.shard == 0 && format!("{}:{}", x.file, x.name) == *id));
+                let named = |x: &&Artifact| x.shard == 0 && format!("{}:{}", x.file, x.name) == *id;
+                todo.extend(arts.iter().filter(named).find(|x| x.profile == art.profile).or_else(|| arts.iter().find(named)));
             }
         }
     }
@@ -220,7 +221,7 @@ pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artif
         if libs.contains_key(&key) {
             continue;
         }
-        let Some(lib) = arts.iter().find(|a| a.file == file && a.name == name) else {
+        let Some(lib) = arts.iter().find(|a| a.file == file && a.name == name && a.profile == 0) else {
             crate::die(&format!("library {key} has no bytecode (is it outside src/test/script?)"));
         };
         db = deploy_libs(db, env, cheats, arts, lib, libs, from, record);
@@ -237,23 +238,35 @@ pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artif
     db
 }
 
-/// A suite's starting state, as forge sets it up: every library an artifact links against, deployed from
-/// LIBRARY_DEPLOYER (nonces 0, 1, ...), then the test contract from SENDER at nonce 1 (so at TEST_CONTRACT), with
-/// 2^96-1 wei from before its constructor runs; SENDER and LIBRARY_DEPLOYER are left with 2^96-1 wei too.
+/// A suite's starting state, as forge sets it up: every library any artifact links against, deployed from
+/// LIBRARY_DEPLOYER in forge's order (its artifact ids sorted: out/<File.sol>/<Name>.json), so at the addresses
+/// forge's are, then the test contract from SENDER at nonce 1 (so at TEST_CONTRACT), with 2^96-1 wei from before its
+/// constructor runs; SENDER and LIBRARY_DEPLOYER are left with 2^96-1 wei too. Each library is the default profile's
+/// build, which forge's linker picks for every profile.
 fn setup(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact) -> (Db, Exec) {
     let initial = U256::from((1u128 << 96) - 1);
-    // the libraries of every artifact, of those plain compiled (see deploy_libs)
-    let mut links = serde_json::Map::new();
+    let base = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
+    let mut needed: std::collections::BTreeMap<(String, String), &Artifact> = Default::default();
     for a in arts.iter().filter(|a| a.shard == 0) {
-        for (file, names) in a.links.as_object().into_iter().flatten() {
-            for (name, refs) in names.as_object().into_iter().flatten().filter(|(n, _)| arts.iter().any(|l| l.file == *file && l.name == **n)) {
-                links.entry(file.clone()).or_insert_with(|| serde_json::json!({}))[name] = refs.clone();
+        for (file, names) in a.links.as_object().into_iter().chain(a.deployed_links.as_object()).flatten() {
+            for name in names.as_object().into_iter().flatten().map(|(n, _)| n) {
+                if let Some(lib) = arts.iter().find(|l| l.file == *file && l.name == *name && l.profile == 0) {
+                    needed.insert((base(file), format!("{name}.json")), lib);
+                }
             }
         }
     }
-    let all = Artifact { links: serde_json::Value::Object(links), deploys: vec![], ..art.clone() };
-    let mut libs = HashMap::new();
-    let mut db = deploy_libs(db, env, cheats, arts, &all, &mut libs, evm::LIBRARY_DEPLOYER, &mut None);
+    // where each lands, so libraries linking libraries link wherever their order puts them
+    let mut db = db;
+    let start = db.basic_ref(evm::LIBRARY_DEPLOYER).ok().flatten().map_or(0, |i| i.nonce);
+    let libs: HashMap<String, Address> = needed.values().enumerate().map(|(i, l)| (format!("{}:{}", l.file, l.name), evm::LIBRARY_DEPLOYER.create(start + i as u64))).collect();
+    for lib in needed.values() {
+        let code = evm::link_code(&lib.bytecode, &lib.links, &libs).unwrap_or_else(|e| crate::die(&format!("{}: {e}", lib.name)));
+        let r;
+        (db, r) = evm::transact(db, env, cheats, evm::LIBRARY_DEPLOYER, TxKind::Create, code.into(), U256::ZERO, true);
+        let a = r.address.filter(|_| r.ok).unwrap_or_else(|| crate::die(&format!("deploying library {} failed: {}", lib.name, decode::reason(&r.output))));
+        cheats.names.insert(a, lib.name.clone());
+    }
     for l in libs.keys() {
         cheats.read(format!("art:{l}"));
     }
@@ -265,6 +278,8 @@ fn setup(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Ar
     set(&mut db, SENDER, &|i| i.nonce = 1);
     set(&mut db, SENDER.create(1), &|i| i.balance = initial);
     let code = evm::link_code(&art.bytecode, &art.links, &libs).unwrap_or_else(|e| crate::die(&format!("{}: {e}", art.name)));
+    // what forge deploys before setUp keeps its state when a test selects a fork
+    cheats.persistent = libs.values().copied().chain([SENDER.create(1)]).collect();
     cheats.libs = libs;
     let (mut db, r) = evm::transact(db, env, cheats, SENDER, TxKind::Create, code.into(), U256::ZERO, true);
     for a in [SENDER, evm::LIBRARY_DEPLOYER] {
@@ -463,11 +478,16 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
 fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, env: &Env, id: &str, abi: &JsonAbi, tests: Vec<&Function>, inline: &HashMap<String, Inline>, reads: Option<Arc<std::sync::Mutex<evm::Reads>>>) -> Vec<TestResult> {
     let mut cheats = Cheats::new(arts.clone(), root.to_path_buf(), opts.access.clone());
     cheats.reads = reads;
-    cheats.fork_url = opts.fork.clone();
+    // --fork is fork 0
+    if let Some(f) = &remote.0 {
+        cheats.forks.push(f.clone());
+        cheats.active_fork = Some(0);
+    }
     cheats.track_creates = true;
     cheats.allow_internal_revert = opts.allow_internal_revert;
     cheats.solc = opts.solc.clone();
     cheats.isolate = opts.isolate;
+    cheats.profile = art.profile;
     let mut env = env.clone();
     env.block.gas_limit = opts.gas_limit;
     let (mut db, r) = setup(evm::base_db(remote.clone()), &mut env, &mut cheats, arts, art);
@@ -1111,4 +1131,21 @@ fn run_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32, 
             r
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn match_path() {
+        use super::path_matches as m;
+        // forge's globs: `*` crosses `/`, `{a,b}` alternatives (veydrift passes 50 files as one), a file name
+        // containing the pattern, "./" ignored
+        assert!(m("test/{A.t.sol,B.t.sol}", "test/B.t.sol") && !m("test/{A.t.sol,B.t.sol}", "test/C.t.sol"));
+        assert!(m("test/*.t.sol", "test/sub/A.t.sol") && m("**/A.t.sol", "test/sub/A.t.sol"));
+        assert!(m("A.t.sol", "test/A.t.sol") && m("./test/A.t.sol", "test/A.t.sol"));
+        assert!(m("test/[AB].t.sol", "test/B.t.sol") && !m("test/[!AB].t.sol", "test/B.t.sol") && m("test/A?t.sol", "test/A.t.sol"));
+        let f = super::Filter { path: Some("test/{A,B}.t.sol".into()), test: Some("Fuzz".into()), ..Default::default() };
+        assert!(f.wants("test/A.t.sol:ATest", Some("testFuzzX")) && f.wants("test/A.t.sol:ATest", None));
+        assert!(!f.wants("test/A.t.sol:ATest", Some("testX")) && !f.wants("test/C.t.sol:CTest", Some("testFuzzX")));
+    }
 }
