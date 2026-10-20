@@ -49,18 +49,23 @@ pub fn connect(p: &Project, name: &str) -> Conn {
     let r = rpc::batch_each(&net.url, &calls).unwrap_or_else(|e| die(&format!("{name}: {e}")));
     let chain = r[0].clone().unwrap_or_else(|e| die(&format!("{name}: {e}")));
     let b = r[1].clone().unwrap_or_else(|e| die(&format!("{name}: {e}")));
+    if !b.is_object() {
+        die(&format!("{name}: the RPC answered {b} for the latest block"));
+    }
     if std::env::var_os("PLAIN_DEBUG").is_some() {
         eprintln!("rpc for {name}: {}", net.url);
     }
+    let fee = |r: &Result<Value, String>| r.as_ref().ok().and_then(|v| rpc::quantity(v).ok()).map(|v| v.saturating_to::<u128>());
     Conn {
         name: name.into(),
-        chain: hexnum(&chain) as u64,
-        block: hexnum(&b["number"]) as u64,
-        timestamp: hexnum(&b["timestamp"]) as u64,
-        gas_limit: hexnum(&b["gasLimit"]) as u64,
-        base_fee: b["baseFeePerGas"].is_string().then(|| hexnum(&b["baseFeePerGas"])),
-        prio: r[2].as_ref().ok().map(hexnum),
-        gas_price: r[3].as_ref().map(hexnum).unwrap_or(0),
+        chain: hexnum(&chain, &format!("{name}: eth_chainId")) as u64,
+        block: hexnum(&b["number"], &format!("{name}: the latest block's number")) as u64,
+        timestamp: hexnum(&b["timestamp"], &format!("{name}: the latest block's timestamp")) as u64,
+        gas_limit: hexnum(&b["gasLimit"], &format!("{name}: the latest block's gas limit")) as u64,
+        // blocks before London have no base fee
+        base_fee: (!b["baseFeePerGas"].is_null()).then(|| hexnum(&b["baseFeePerGas"], &format!("{name}: the latest block's base fee"))),
+        prio: fee(&r[2]),
+        gas_price: fee(&r[3]).unwrap_or(0),
         url: net.url,
     }
 }
@@ -123,8 +128,9 @@ fn key_addr(k: B256) -> Address {
     evm::pk_to_addr(k.into()).unwrap_or_else(|e| die(&e))
 }
 
-fn hexnum(v: &Value) -> u128 {
-    u128::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
+/// A number the network answered, or the deploy stops: a guessed 0 would be a wrong chain id, nonce or balance.
+fn hexnum(v: &Value, what: &str) -> u128 {
+    rpc::quantity(v).and_then(|n| u128::try_from(n).map_err(|_| format!("{n} is over 128 bits"))).unwrap_or_else(|e| die(&format!("{what}: {e}")))
 }
 
 fn find(arts: &[Artifact], target: &str) -> Artifact {
@@ -343,7 +349,7 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
             let data: Bytes = [hex::decode(&proxy.bytecode).unwrap(), DynSolValue::Tuple(args).abi_encode_params()].concat().into();
             let (mut db, r) = evm::transact(db, &mut env, &mut cheats, from, TxKind::Create, data.clone(), U256::ZERO, true);
             let px = r.address.filter(|_| r.ok).unwrap_or_else(|| die(&format!("{} reverted while setting up the proxy (in initialize?): {}", art.name, why(&r.output))));
-            let now = revm::Database::storage(&mut db, px, crate::upgrade::IMPLEMENTATION.into()).map(|w| Address::from_word(w.into())).unwrap_or_default();
+            let now = revm::Database::storage(&mut db, px, crate::upgrade::IMPLEMENTATION.into()).map(|w| Address::from_word(w.into())).unwrap_or_else(|e| die(&e.to_string()));
             if now != addr {
                 die(&format!("the proxy points at {now}, not at the implementation {addr}"));
             }
@@ -383,7 +389,7 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
                 }
                 // a call that succeeds isn't an upgrade (an admin that's a plain account takes any call): the proxy
                 // has to point at the new implementation afterwards
-                let now = revm::Database::storage(&mut db, u.proxy, crate::upgrade::IMPLEMENTATION.into()).map(|w| Address::from_word(w.into())).unwrap_or_default();
+                let now = revm::Database::storage(&mut db, u.proxy, crate::upgrade::IMPLEMENTATION.into()).map(|w| Address::from_word(w.into())).unwrap_or_else(|e| die(&e.to_string()));
                 if now != addr {
                     why_not = format!("the upgrade call succeeds, but {} would still run {now}: its admin {to} isn't a contract plain knows how to upgrade through", u.name);
                     continue;
@@ -424,7 +430,7 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     // what sending will cost, before anyone is asked for a password
     if let (Some(c), Some(who)) = (conn.as_ref().filter(|c| c.chain != 31337 && (!o.broadcast || o.confirm)), me) {
         let (need, sym) = (cost(c, who, &txs, &sims), rpc::symbol(c.chain));
-        if let Ok(have) = rpc::call(&c.url, "eth_getBalance", json!([who, "latest"])).map(|b| hexnum(&b)) {
+        if let Ok(have) = rpc::call(&c.url, "eth_getBalance", json!([who, "latest"])).and_then(|b| rpc::quantity(&b)).map(|b| b.saturating_to::<u128>()) {
             let short = if have < need { "; that's not enough, so fund it first" } else { "" };
             println!("{who} has {} {sym}; sending can cost up to {} {sym}{short}", eth(have), eth(need));
         }
@@ -604,12 +610,12 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
     let block = format!("0x{at:x}");
     let calls: Vec<(&str, Value)> = senders.iter().flat_map(|a| [("eth_getTransactionCount", json!([a, "pending"])), ("eth_getBalance", json!([a, "latest"])), ("eth_getTransactionCount", json!([a, block]))]).collect();
     let r = rpc::batch(url, &calls).unwrap_or_else(|e| die(&e));
-    let mut nonces: HashMap<Address, u64> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[3 * i]) as u64)).collect();
-    let balances: HashMap<Address, u128> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[3 * i + 1]))).collect();
+    let mut nonces: HashMap<Address, u64> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[3 * i], &format!("{a}'s pending nonce")) as u64)).collect();
+    let balances: HashMap<Address, u128> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[3 * i + 1], &format!("{a}'s balance")))).collect();
     // contracts land at addresses that follow from the sender's nonce, and later transactions call them there: if
     // the next nonce isn't the one the simulation ran with, they'd call where nothing is
     for (i, a) in senders.iter().enumerate() {
-        let (next, simulated) = (nonces[a], hexnum(&r[3 * i + 2]) as u64);
+        let (next, simulated) = (nonces[a], hexnum(&r[3 * i + 2], &format!("{a}'s nonce at block {at}")) as u64);
         if next != simulated {
             die(&format!("{a}'s next nonce is {next}, but the simulation ran at nonce {simulated}: a transaction of its own is pending or just landed. Once it's in, run this again"));
         }
@@ -705,7 +711,8 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
             calls.push(("eth_blockNumber", json!([])));
             let Ok(mut rs) = rpc::batch_each(url, &calls) else { break };
             polled = true;
-            block = rs.pop().and_then(|b| b.ok()).map(|b| hexnum(&b)).unwrap_or(0);
+            // 0 (unknown) only means no resend this round
+            block = rs.pop().and_then(|b| b.ok()).and_then(|b| rpc::quantity(&b).ok()).map_or(0, |b| b.saturating_to::<u128>());
             for (i, r) in ask.iter().zip(rs) {
                 if let Ok(r) = r.and_then(|r| if r.is_null() { Err(String::new()) } else { Ok(r) }) {
                     receipts[*i] = Some(r);
@@ -725,7 +732,8 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
         while let Some(Some(receipt)) = receipts.get(next) {
             let (i, tx) = (next, &txs[next]);
             let ok = receipt["status"] == "0x1";
-            let mut line = format!("{}. {} {} gas {}", i + 1, if ok { "ok" } else { "REVERTED" }, signed[i].0, hexnum(&receipt["gasUsed"]));
+            let gas = rpc::quantity(&receipt["gasUsed"]).map_or("?".into(), |g| g.to_string());
+            let mut line = format!("{}. {} {} gas {gas}", i + 1, if ok { "ok" } else { "REVERTED" }, signed[i].0);
             let addr = match tx.to {
                 None => receipt["contractAddress"].as_str().and_then(|a| a.parse::<Address>().ok()),
                 Some(evm::CREATE2_DEPLOYER) => sims[i].creates.first().map(|c| c.0),
