@@ -507,6 +507,9 @@ pub struct Cheats {
     paused: Option<Vec<Gas>>,
     /// vm.resetGasMetering: the running frame's gas goes back to its limit at its next step
     reset_gas: bool,
+    /// vm.record: the storage slots each account read and wrote since (an SSTORE reads too, as in forge)
+    recording: bool,
+    accesses: HashMap<Address, (Vec<U256>, Vec<U256>)>,
     /// vm.serialize*: the objects so far, by key (sorted, as forge's)
     json: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// the solc version the project compiles with, which artifact ids may name ("File.sol:Name:0.8.28")
@@ -630,6 +633,7 @@ const SUPPORTED: &[&str] = sigs![
     "snapshotValue(string,string,uint256)", "ffi(string[])", "readFileBinary(string)",
     "parseUint(string)", "parseInt(string)", "parseAddress(string)", "parseBool(string)", "parseBytes32(string)", "parseBytes(string)",
     "cool(address)", "coolSlot(address,bytes32)", "lastCallGas()", "resetGasMetering()", "removeFile(string)", "dumpState(string)",
+    "record()", "stopRecord()", "accesses(address)",
     "parseJson(string)", "parseJson(string,string)", "parseJsonUint(string,string)", "parseJsonUintArray(string,string)",
     "parseJsonInt(string,string)", "parseJsonIntArray(string,string)", "parseJsonBool(string,string)", "parseJsonBoolArray(string,string)",
     "parseJsonAddress(string,string)", "parseJsonAddressArray(string,string)", "parseJsonString(string,string)",
@@ -1229,6 +1233,20 @@ impl Cheats {
                 }
                 ok
             }
+            "record()" => {
+                self.recording = true;
+                self.accesses.clear();
+                ok
+            }
+            "stopRecord()" => {
+                self.recording = false;
+                ok
+            }
+            "accesses(address)" => {
+                let (reads, writes) = self.accesses.get(&a(&args[0])).cloned().unwrap_or_default();
+                let words = |v: Vec<U256>| DynSolValue::Array(v.into_iter().map(|s| DynSolValue::FixedBytes(s.into(), 32)).collect());
+                Ok(DynSolValue::Tuple(vec![words(reads), words(writes)]).abi_encode_params())
+            }
             "lastCallGas()" => {
                 let g = self.last_gas.ok_or("no external call was made yet")?;
                 let w = |n: u64| DynSolValue::Uint(U256::from(n), 64);
@@ -1685,6 +1703,18 @@ impl Inspector<Ctx> for Cheats {
                     *interp.gas.memory_mut() = memory;
                 }
                 None => frames.push(interp.gas),
+            }
+        }
+        if self.recording {
+            let op = revm::interpreter::interpreter_types::Jumps::opcode(&interp.bytecode);
+            if op == 0x54 || op == 0x55 {
+                if let Ok(slot) = interp.stack.peek(0) {
+                    let (reads, writes) = self.accesses.entry(interp.input.target_address).or_default();
+                    reads.push(slot);
+                    if op == 0x55 {
+                        writes.push(slot);
+                    }
+                }
             }
         }
         if self.reset_gas {

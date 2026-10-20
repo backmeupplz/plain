@@ -67,7 +67,7 @@ fn fixture() {
         let should_fail = line.contains("testBad") || line.contains("testFail") || line.contains("invariantBad");
         assert_eq!(failed, should_fail, "{line}\n{text}");
     }
-    assert!(text.contains("26 passed, 10 failed"), "{text}");
+    assert!(text.contains("27 passed, 10 failed"), "{text}");
     assert!(text.contains("Breakable.poke(7)"), "{text}");
     assert!(text.contains("panic: arithmetic underflow"), "{text}");
     assert!(text.contains("log: value is 99"), "{text}");

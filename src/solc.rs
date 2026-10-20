@@ -433,6 +433,11 @@ fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (O
         Scope::Files(roots, skip, libs) => {
             let skip: Vec<String> = skip.iter().map(|s| match s.as_str() { "test" | "tests" => ".t.sol".into(), "script" | "scripts" => ".s.sol".into(), s => s.into() }).collect();
             let kept = |f: &String| !skip.iter().any(|s| f.contains(s.as_str()));
+            for r in &roots {
+                if !files.contains(&r.strip_prefix("./").unwrap_or(r).to_string()) {
+                    crate::die(&format!("{r}: no such file in {}", p.dirs.join(", ")));
+                }
+            }
             let need: std::collections::BTreeSet<String> = match roots.is_empty() {
                 true => files.iter().filter(|f| kept(f)).flat_map(|f| g.closure(f)).collect(),
                 false => roots.iter().flat_map(|r| g.closure(r.strip_prefix("./").unwrap_or(r))).collect(),
