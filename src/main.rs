@@ -2,6 +2,7 @@ mod account;
 mod decode;
 mod deploy;
 mod evm;
+mod json;
 mod menu;
 mod node;
 mod project;
@@ -44,7 +45,7 @@ fn no_options(args: &[String]) {
             "--private-key" | "--mnemonic" | "--keystore" | "--ledger" | "--trezor" => " (plain signs with --account <name> or $PRIVATE_KEY)",
             "--sig" | "-s" => " (plain runs a script's run(), which takes no arguments)",
             "--verify" => " (plain verifies after every broadcast; --no-verify turns it off)",
-            "--gas-report" | "--match-path" | "--mp" | "--no-match-test" | "--nmt" | "--no-match-contract" | "--nmc" | "--no-match-path" | "--nmp" => " (not supported yet)",
+            "--gas-report" | "--no-match-test" | "--nmt" | "--no-match-contract" | "--nmc" | "--no-match-path" | "--nmp" => " (not supported yet)",
             _ => "",
         };
         die(&format!("unknown option {a}{hint}; see plain help"));
@@ -61,6 +62,10 @@ usage:
   plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts;
              [--fuzz-runs N] [--seed N]      unchanged suites reuse their results (--rerun: run them anyway,
              [--rerun] [--force] [--watch]   --force: also recompile, --watch: again on every save)
+             [--match-path glob] [--match-contract name] [--match-test name]
+             [--isolate] [--gas-limit N] [--threads N]
+                                             forge's: each call a test makes its own transaction, the gas a
+                                             test gets, how many run at once
   plain deploy <Contract|script.s.sol> [args] [--network name|id|url] [--account name] [--broadcast]
              [--confirm] [--proxy] [--no-verify]
                                              simulate, then send with --broadcast (--confirm: ask first) and
@@ -192,35 +197,44 @@ fn main() {
             let fork = flag(&mut args, "--fork").or_else(|| flag(&mut args, "--fork-url")).map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
             let seed = flag(&mut args, "--seed").or_else(|| flag(&mut args, "--fuzz-seed")).map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
-            // forge's filters are regexes; plain's is one substring of a suite or test name, which these become
-            for f in ["--match-test", "--mt", "--match-contract", "--mc"] {
-                if let Some(v) = flag(&mut args, f) {
-                    args.push(v);
-                }
-            }
+            // forge's filters (--match-test and --match-contract are regexes there: names without special characters
+            // match the same as substrings, which is what plain takes them as)
+            let mut filter = test::Filter {
+                path: flag(&mut args, "--match-path").or_else(|| flag(&mut args, "--mp")),
+                contract: flag(&mut args, "--match-contract").or_else(|| flag(&mut args, "--mc")),
+                test: flag(&mut args, "--match-test").or_else(|| flag(&mut args, "--mt")),
+                any: None,
+            };
+            let isolate = switch(&mut args, &["--isolate"]) || p.isolate;
+            let gas_limit = flag(&mut args, "--gas-limit").or_else(|| flag(&mut args, "--block-gas-limit")).map(|v| v.parse().unwrap_or_else(|_| die("--gas-limit N"))).unwrap_or(p.gas_limit);
+            let threads = flag(&mut args, "--threads").or_else(|| flag(&mut args, "--jobs")).or_else(|| flag(&mut args, "-j")).map(|v| v.parse::<usize>().unwrap_or_else(|_| die("--threads N")));
             no_options(&args);
             if args.len() > 1 {
                 die(&format!("plain test takes one filter, got {}", args.join(" ")));
             }
-            let filter = args.first().cloned();
-            let mut ts_files = ts::files(&p.root, &p.dirs[1], filter.as_deref());
+            filter.any = args.first().cloned();
+            let mut ts_files = ts::files(&p.root, &p.dirs[1], &filter);
             // TypeScript tests are programs with your permissions: only when the project's config asks for them
             let skipped_ts = if p.typescript { 0 } else { std::mem::take(&mut ts_files).len() };
             // a filter compiles only the test files it can match; TypeScript tests need every artifact
-            let scope = solc::Scope::Tests(filter.clone().filter(|_| ts_files.is_empty()));
+            let scope = solc::Scope::Tests(if ts_files.is_empty() { filter.clone() } else { test::Filter::default() });
             let out = solc::build(&p, force, scope);
             if out.compiled > 0 {
                 eprintln!("compiled {} files in {:.2?}", out.compiled, t.elapsed());
             }
             let has_sol = out.artifacts.iter().any(test::is_test_contract);
             // a filter that matches nothing is a typo, not a pass
-            if let Some(f) = filter.as_deref().filter(|f| ts_files.is_empty() && !out.artifacts.iter().any(|a| test::is_test_contract(a) && test::matches(a, f))) {
-                die(&format!("no test matches {f:?}"));
+            if !filter.is_empty() && ts_files.is_empty() && !out.artifacts.iter().any(|a| test::is_test_contract(a) && test::matches(a, &filter)) {
+                die(&format!("no test matches {filter}"));
             }
             let mut ok = true;
             if has_sol || ts_files.is_empty() {
-                let opts = test::Opts { filter: filter.clone(), verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none(), access: std::sync::Arc::new(p.access.clone()), spec: evm::spec(&out.evm) };
-                ok &= test::run(out.artifacts, &p.root, &opts);
+                let opts = test::Opts { filter, verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none(), access: std::sync::Arc::new(p.access.clone()), spec: evm::spec(&out.evm), solc: out.solc.clone(), isolate, gas_limit };
+                // --threads 1: one test at a time, for tests that share process state (vm.setEnv)
+                ok &= match threads.filter(|n| *n > 0) {
+                    Some(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap_or_else(|e| die(&e.to_string())).install(|| test::run(out.artifacts, &p.root, &opts)),
+                    None => test::run(out.artifacts, &p.root, &opts),
+                };
             }
             if !ts_files.is_empty() {
                 ok &= ts::run(&p.root, &ts_files, verbose, fork);

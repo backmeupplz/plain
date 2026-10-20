@@ -39,7 +39,7 @@ pub struct Record {
 pub fn input(p: &Project, file: &str) -> Value {
     let g = Graph::build(p, &[file.to_string()]);
     let sources: serde_json::Map<String, Value> = g.closure(file).into_iter().map(|u| (u.clone(), json!({"content": g.files[&u].content}))).collect();
-    let mut settings = crate::solc::settings(p);
+    let mut settings = crate::solc::settings(p, crate::solc::profile_of(p, &g, file));
     settings["outputSelection"] = json!({"*": {"*": ["abi", "evm.bytecode.object", "evm.deployedBytecode.object", "metadata"]}});
     json!({"language": "Solidity", "sources": sources, "settings": settings})
 }

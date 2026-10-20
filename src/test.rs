@@ -12,8 +12,98 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Which tests run: forge's --match-path (a glob over the file's path), --match-contract and --match-test (taken
+/// as substrings: what a regex without special characters matches), and plain's own filter, a substring of the
+/// suite id ("test/Vault.t.sol:VaultTest") or of the test's name. A test runs when it passes all that are given.
+#[derive(Clone, Default, PartialEq)]
+pub struct Filter {
+    pub any: Option<String>,
+    pub path: Option<String>,
+    pub contract: Option<String>,
+    pub test: Option<String>,
+}
+
+impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.any.is_none() && self.path.is_none() && self.contract.is_none() && self.test.is_none()
+    }
+
+    pub fn file(&self, f: &str) -> bool {
+        self.path.as_deref().is_none_or(|p| path_matches(p, f))
+    }
+
+    /// The suite `file:Name` and its test `name` (None: any of its tests).
+    pub fn wants(&self, id: &str, name: Option<&str>) -> bool {
+        let (file, contract) = id.rsplit_once(':').unwrap_or((id, ""));
+        let named = |want: &Option<String>, n: Option<&str>| want.as_deref().is_none_or(|w| n.is_none_or(|n| n.contains(w)));
+        self.file(file)
+            && self.contract.as_deref().is_none_or(|c| contract.contains(c))
+            && named(&self.test, name)
+            && self.any.as_deref().is_none_or(|a| id.contains(a) || name.is_none_or(|n| n.contains(a)))
+    }
+}
+
+impl std::fmt::Display for Filter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts = [("", &self.any), ("--match-path ", &self.path), ("--match-contract ", &self.contract), ("--match-test ", &self.test)];
+        let s: Vec<String> = parts.iter().filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}{v:?}"))).collect();
+        f.write_str(&s.join(" "))
+    }
+}
+
+/// forge's --match-path: a glob over the path from the project root (`*` crosses `/`, `?`, `[abc]`, `{a,b}`), or a
+/// file name that contains it.
+pub fn path_matches(pat: &str, path: &str) -> bool {
+    let (pat, path) = (pat.strip_prefix("./").unwrap_or(pat), path.strip_prefix("./").unwrap_or(path));
+    path.rsplit('/').next().is_some_and(|name| name.contains(pat)) || alternatives(pat).iter().any(|p| glob(p.as_bytes(), path.as_bytes()))
+}
+
+/// A glob with each `{a,b}` spelled out.
+fn alternatives(p: &str) -> Vec<String> {
+    let Some(i) = p.find('{') else { return vec![p.to_string()] };
+    let (mut depth, mut cuts, mut end) = (0, vec![i], None);
+    for (j, c) in p.char_indices().skip(i) {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 1 => {
+                end = Some(j);
+                break;
+            }
+            '}' => depth -= 1,
+            ',' if depth == 1 => cuts.push(j),
+            _ => {}
+        }
+    }
+    let Some(end) = end else { return vec![p.to_string()] };
+    cuts.push(end);
+    cuts.windows(2).flat_map(|w| alternatives(&format!("{}{}{}", &p[..i], &p[w[0] + 1..w[1]], &p[end + 1..]))).collect()
+}
+
+fn glob(p: &[u8], s: &[u8]) -> bool {
+    match p.first() {
+        None => s.is_empty(),
+        Some(b'*') => {
+            let rest = &p[p.iter().take_while(|c| **c == b'*').count()..];
+            (0..=s.len()).any(|k| glob(rest, &s[k..]))
+        }
+        Some(b'?') => !s.is_empty() && glob(&p[1..], &s[1..]),
+        Some(b'[') => match (p.iter().position(|c| *c == b']'), s.first()) {
+            (Some(e), Some(c)) => {
+                let (neg, set) = match &p[1..e] {
+                    [b'!' | b'^', rest @ ..] => (true, rest),
+                    set => (false, set),
+                };
+                let hit = set.iter().enumerate().any(|(k, x)| x == c || (set.get(k + 1) == Some(&b'-') && set.get(k + 2).is_some_and(|hi| x <= c && c <= hi)));
+                hit != neg && glob(&p[e + 1..], &s[1..])
+            }
+            _ => false,
+        },
+        Some(c) => s.first() == Some(c) && glob(&p[1..], &s[1..]),
+    }
+}
+
 pub struct Opts {
-    pub filter: Option<String>,
+    pub filter: Filter,
     pub verbose: bool,
     pub fuzz_runs: u32,
     pub fork: Option<String>,
@@ -28,6 +118,12 @@ pub struct Opts {
     pub access: Arc<crate::project::Access>,
     /// the EVM rules the code was compiled for
     pub spec: revm::primitives::hardfork::SpecId,
+    /// the solc version, which artifact ids may name
+    pub solc: String,
+    /// forge's --isolate (or `isolate = true`): each call a test makes is its own transaction
+    pub isolate: bool,
+    /// gas for each test (and the block), forge's gas_limit / --gas-limit
+    pub gas_limit: u64,
 }
 
 /// `/// forge-config:` settings above a test function.
@@ -37,6 +133,7 @@ struct Inline {
     inv_runs: Option<u32>,
     inv_depth: Option<u32>,
     fail_on_revert: Option<bool>,
+    isolate: Option<bool>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -83,7 +180,7 @@ fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, Inline>) -> S
     });
     let mut inline: Vec<_> = inline.iter().collect();
     inline.sort();
-    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{}|{inline:?}|{:?}|{:?}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.seed, opts.allow_internal_revert, opts.access, opts.spec);
+    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{}|{inline:?}|{:?}|{:?}|{}|{}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.seed, opts.allow_internal_revert, opts.access, opts.spec, opts.isolate, opts.gas_limit);
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
@@ -140,9 +237,46 @@ pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artif
     db
 }
 
+/// A suite's starting state, as forge sets it up: every library an artifact links against, deployed from
+/// LIBRARY_DEPLOYER (nonces 0, 1, ...), then the test contract from SENDER at nonce 1 (so at TEST_CONTRACT), with
+/// 2^96-1 wei from before its constructor runs; SENDER and LIBRARY_DEPLOYER are left with 2^96-1 wei too.
+fn setup(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact) -> (Db, Exec) {
+    let initial = U256::from((1u128 << 96) - 1);
+    // the libraries of every artifact, of those plain compiled (see deploy_libs)
+    let mut links = serde_json::Map::new();
+    for a in arts.iter().filter(|a| a.shard == 0) {
+        for (file, names) in a.links.as_object().into_iter().flatten() {
+            for (name, refs) in names.as_object().into_iter().flatten().filter(|(n, _)| arts.iter().any(|l| l.file == *file && l.name == **n)) {
+                links.entry(file.clone()).or_insert_with(|| serde_json::json!({}))[name] = refs.clone();
+            }
+        }
+    }
+    let all = Artifact { links: serde_json::Value::Object(links), deploys: vec![], ..art.clone() };
+    let mut libs = HashMap::new();
+    let mut db = deploy_libs(db, env, cheats, arts, &all, &mut libs, evm::LIBRARY_DEPLOYER, &mut None);
+    for l in libs.keys() {
+        cheats.read(format!("art:{l}"));
+    }
+    let set = |db: &mut Db, a: Address, f: &dyn Fn(&mut revm::state::AccountInfo)| {
+        let mut info = db.basic_ref(a).ok().flatten().unwrap_or_default();
+        f(&mut info);
+        db.insert_account_info(a, info);
+    };
+    set(&mut db, SENDER, &|i| i.nonce = 1);
+    set(&mut db, SENDER.create(1), &|i| i.balance = initial);
+    let code = evm::link_code(&art.bytecode, &art.links, &libs).unwrap_or_else(|e| crate::die(&format!("{}: {e}", art.name)));
+    cheats.libs = libs;
+    let (mut db, r) = evm::transact(db, env, cheats, SENDER, TxKind::Create, code.into(), U256::ZERO, true);
+    for a in [SENDER, evm::LIBRARY_DEPLOYER] {
+        set(&mut db, a, &|i| i.balance = initial);
+    }
+    (db, r)
+}
+
 /// Whether a filter selects anything in a test contract: its id or one of its tests.
-pub fn matches(a: &Artifact, filter: &str) -> bool {
-    format!("{}:{}", a.file, a.name).contains(filter) || a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["name"].as_str().is_some_and(|n| crate::rewrite::is_test_name(n) && n.contains(filter))))
+pub fn matches(a: &Artifact, filter: &Filter) -> bool {
+    let id = format!("{}:{}", a.file, a.name);
+    a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["name"].as_str().is_some_and(|n| crate::rewrite::is_test_name(n) && filter.wants(&id, Some(n)))))
 }
 
 pub fn is_test_contract(a: &Artifact) -> bool {
@@ -187,7 +321,7 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
                 .collect()
         })
         .collect();
-    let filter = opts.filter.as_deref();
+    let filter = &opts.filter;
     let mut results: Vec<Suite> = suites
         .par_iter()
         .zip(skips.par_iter())
@@ -259,7 +393,7 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
         if opts.quiet_if_empty {
             return true;
         }
-        println!("no tests found{}", filter.map(|f| format!(" matching {f:?}")).unwrap_or_default());
+        println!("no tests found{}", if filter.is_empty() { String::new() } else { format!(" matching {filter}") });
     }
     let reused = if cached > 0 { format!(", {cached} results cached") } else { String::new() };
     println!("{pass} passed, {fail} failed, {skip} skipped ({} suites, {:.2?}{reused})", results.len(), t0.elapsed());
@@ -267,14 +401,14 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, env: &Env, filter: Option<&str>, skip: &std::collections::HashSet<[u8; 4]>) -> Option<Suite> {
+fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, opts: &Opts, remote: &evm::Remote, env: &Env, filter: &Filter, skip: &std::collections::HashSet<[u8; 4]>) -> Option<Suite> {
     let id = format!("{}:{}", art.file, art.name);
     let abi: JsonAbi = serde_json::from_value(art.abi.clone()).ok()?;
     let mut tests: Vec<&Function> = abi
         .functions()
         .filter(|f| crate::rewrite::is_test_name(&f.name))
         .filter(|f| !skip.contains(&f.selector().0))
-        .filter(|f| filter.is_none_or(|flt| id.contains(flt) || f.name.contains(flt)))
+        .filter(|f| filter.wants(&id, Some(&f.name)))
         .collect();
     if tests.is_empty() {
         return None;
@@ -332,25 +466,17 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
     cheats.fork_url = opts.fork.clone();
     cheats.track_creates = true;
     cheats.allow_internal_revert = opts.allow_internal_revert;
+    cheats.solc = opts.solc.clone();
+    cheats.isolate = opts.isolate;
     let mut env = env.clone();
-    let db = evm::base_db(remote.clone());
-    let mut libs = HashMap::new();
-    let (db, r) = deploy(db, &mut env, &mut cheats, arts, art, &[], &mut libs);
-    for l in libs.keys() {
-        cheats.read(format!("art:{l}"));
-    }
-    cheats.libs = libs;
+    env.block.gas_limit = opts.gas_limit;
+    let (mut db, r) = setup(evm::base_db(remote.clone()), &mut env, &mut cheats, arts, art);
     let fail_all = |why: String, logs: Vec<String>| -> Vec<TestResult> {
         tests.iter().map(|f| TestResult { name: sig(f), status: Status::Fail(why.clone()), gas: 0, runs: None, logs: logs.clone(), args: None, trace: vec![] }).collect()
     };
     let Some(addr) = r.address.filter(|_| r.ok) else {
         return fail_all(format!("constructor reverted: {}", decode::reason(&r.output)), cheats.console);
     };
-    let mut db = db;
-    // forge gives the test contract 2^96-1 wei
-    if let Some(acc) = db.cache.accounts.get_mut(&addr) {
-        acc.info.balance = U256::from((1u128 << 96) - 1);
-    }
     if abi.functions().any(|f| f.name == "setUp" && f.inputs.is_empty()) {
         let r;
         (db, r) = evm::transact(db, &mut env, &mut cheats, SENDER, TxKind::Call(addr), Bytes::from_static(&[0x0a, 0x92, 0x54, 0xe4]), U256::ZERO, true);
@@ -377,7 +503,17 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
         .map(|f| {
             let t = Instant::now();
             let runs = inline.get(&f.name).and_then(|i| i.fuzz_runs).unwrap_or(opts.fuzz_runs);
-            let r = legacy_fail(run_test(f, addr, &db, &env, &cheats, runs, opts, &dict), f);
+            // `forge-config: default.isolate`: this test's calls are transactions of their own (setUp's weren't)
+            let mut own;
+            let cheats = match inline.get(&f.name).and_then(|i| i.isolate) {
+                Some(isolate) => {
+                    own = cheats.clone();
+                    own.isolate = isolate;
+                    &own
+                }
+                None => &cheats,
+            };
+            let r = legacy_fail(run_test(f, addr, &db, &env, cheats, runs, opts, &dict), f);
             if std::env::var_os("PLAIN_DEBUG").is_some() {
                 eprintln!("test {:.1?} {}:{}", t.elapsed(), id, r.name);
             }
@@ -462,6 +598,7 @@ fn inline_config(path: &std::path::Path) -> HashMap<String, Inline> {
                     "invariant.runs" => p.inv_runs = v.parse().ok(),
                     "invariant.depth" => p.inv_depth = v.parse().ok(),
                     "invariant.fail-on-revert" | "invariant.fail_on_revert" => p.fail_on_revert = v.parse().ok(),
+                    "isolate" => p.isolate = v.parse().ok(),
                     _ => {}
                 }
             }
