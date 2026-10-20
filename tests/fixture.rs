@@ -99,3 +99,20 @@ fn build_outputs() {
     let layout: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
     assert!(ok && layout["storage"][1]["label"] == "owner", "{text}");
 }
+
+#[test]
+fn configured_libraries() {
+    // a library the config says is on chain already is linked against, not deployed again
+    let dir = "tests/fixture/tmp/libraries";
+    std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+    std::fs::copy("tests/fixture/src/Lib.sol", format!("{dir}/src/Lib.sol")).unwrap();
+    let deploy = |config: &str| {
+        std::fs::write(format!("{dir}/plain.toml"), config).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["deploy", "UsesLib"]).current_dir(dir).output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let text = deploy("");
+    assert!(text.contains("1. create Adder") && text.contains("2. create UsesLib"), "{text}");
+    let text = deploy(r#"libraries = ["src/Lib.sol:Adder:0x00000000000000000000000000000000000000Ad"]"#);
+    assert!(text.contains("1. create UsesLib") && !text.contains("Adder"), "{text}");
+}

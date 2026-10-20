@@ -32,6 +32,8 @@ pub struct Project {
     pub isolate: bool,
     /// forge's `gas_limit` (or `block_gas_limit`): the gas a test gets, and the block's limit
     pub gas_limit: u64,
+    /// forge's `libraries = ["src/L.sol:L:0x…"]`: libraries on chain already, which deploys link against
+    pub libraries: HashMap<String, alloy_primitives::Address>,
 }
 
 #[derive(Clone, Debug)]
@@ -383,6 +385,17 @@ impl Project {
                     _ => None,
                 })
                 .unwrap_or(crate::evm::GAS_LIMIT),
+            libraries: cfg
+                .get("libraries")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .map(|l| {
+                    let l = l.as_str().unwrap_or_default();
+                    let (id, a) = l.rsplit_once(':').unwrap_or_else(|| crate::die(&format!("libraries: {l:?} isn't path:Name:address")));
+                    (id.strip_prefix("./").unwrap_or(id).to_string(), a.trim().parse().unwrap_or_else(|_| crate::die(&format!("libraries: {l:?} isn't path:Name:address"))))
+                })
+                .collect(),
             root,
         }
     }

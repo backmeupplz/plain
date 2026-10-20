@@ -354,7 +354,8 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         cheats.track_creates = true;
         cheats.presume_creates = true;
         // libraries go on chain first, deployed by the broadcaster (like forge script)
-        let mut libs = HashMap::new();
+        // libraries the config says are on chain already are linked against, not deployed again
+        let mut libs = p.libraries.clone();
         let mut txs: Vec<BroadcastTx> = vec![];
         let db = crate::test::deploy_libs(db, &mut env, &mut cheats, &arts, &art, &mut libs, from, &mut Some(&mut txs));
         let mut proxies: Vec<Address> = vec![];
@@ -546,6 +547,12 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         })
         .collect();
 
+    // a library the config says is on chain has to be there, or what links against it can't run
+    let linked: std::collections::BTreeSet<Address> = planned.iter().flatten().flat_map(|(_, r)| r.libs.values().copied()).filter(|a| p.libraries.values().any(|l| l == a)).collect();
+    let codes = rpc::batch(&conn.url, &linked.iter().map(|a| ("eth_getCode", json!([a, "latest"]))).collect::<Vec<_>>()).unwrap_or_else(|e| die(&e));
+    if let Some((a, _)) = linked.iter().zip(&codes).find(|(_, c)| rpc::data(c).map_or(true, |c| c.is_empty())) {
+        die(&format!("the library at {a} (libraries in the config) has no code on {}", conn.name));
+    }
     let signed = sign(&conn, &txs, &sims, &keys, fork.as_ref().map_or(conn.block, |f| f.block()));
     let left = txs.into_iter().zip(sims).zip(signed).zip(planned).enumerate().map(|(i, (((tx, sim), (nonce, hash, raw)), records))| Left { n: i + 1, tx, sim, nonce, hash, raw, records }).collect();
     broadcast(p, &conn, &o, Resume { names: cheats.names.clone(), proxies, left, void: None });
