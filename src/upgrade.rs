@@ -71,12 +71,13 @@ pub fn plan(p: &Project, conn: &Conn, proxy: &str, target: Option<String>, call:
         },
     };
     let r = rpc::batch(&conn.url, &[("eth_getStorageAt", json!([addr, IMPLEMENTATION, "latest"])), ("eth_getStorageAt", json!([addr, ADMIN, "latest"]))]).unwrap_or_else(|e| die(&e));
-    let word = |v: &Value| U256::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).ok().map(|w| Address::from_word(w.into())).filter(|a| !a.is_zero());
+    let word = |v: &Value| Some(Address::from_word(rpc::quantity(v).unwrap_or_else(|e| die(&format!("{name}'s ERC-1967 slots: {e}"))).into())).filter(|a| !a.is_zero());
     let current = word(&r[0]).unwrap_or_else(|| die(&format!("{name} ({addr}) isn't an ERC-1967 proxy: its implementation slot is empty")));
     let old = crate::verify::load(p, conn.chain).remove(&current);
     let target = target.or_else(|| old.as_ref().map(|r| r.contract.clone()));
     let target = target.unwrap_or_else(|| die(&format!("{name} runs {current}, which plain didn't deploy from this project; name the contract to upgrade to")));
-    Plan { proxy: addr, name, admin: word(&r[1]), target, call, current, old }
+    let admin = word(&r[1]);
+    Plan { proxy: addr, name, admin, target, call, current, old }
 }
 
 /// Stops the upgrade unless `new` keeps every variable the proxy's storage already holds, in the same slot with

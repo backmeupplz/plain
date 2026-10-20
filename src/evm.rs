@@ -55,17 +55,20 @@ pub struct Fork {
     settled: std::sync::atomic::AtomicBool,
     accounts: Mutex<HashMap<Address, AccountInfo>>,
     slots: Mutex<HashMap<(Address, U256), U256>>,
+    hashes: Mutex<HashMap<u64, B256>>,
     /// accounts taken as empty without asking (see `presume`)
     presumed: Mutex<Vec<Address>>,
 }
 
+/// A u64 from a JSON-RPC quantity, strictly (see `rpc::quantity`).
+fn num(v: &serde_json::Value) -> Result<u64, String> {
+    crate::rpc::quantity(v)?.try_into().map_err(|_| format!("{v} is over 64 bits"))
+}
+
 impl Fork {
     pub fn new(url: &str, block: Option<u64>) -> Fork {
-        let block = block.unwrap_or_else(|| {
-            let b = crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).unwrap_or_else(|e| crate::die(&format!("fork {url}: {e}")));
-            u64::from_str_radix(b.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
-        });
-        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default(), presumed: Default::default() }
+        let block = block.unwrap_or_else(|| crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).unwrap_or_else(|e| crate::die(&format!("fork {url}: {e}"))));
+        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default(), hashes: Default::default(), presumed: Default::default() }
     }
 
     /// Takes a contract's address-to-be as empty, as it nearly always is, instead of a round trip per contract
@@ -85,18 +88,14 @@ impl Fork {
             return Ok(false);
         }
         // chunks at once: a provider capping batch size falls back to single calls per chunk, not for all
-        let r: Vec<serde_json::Value> = std::thread::scope(|s| {
-            let hs: Vec<_> = list
-                .chunks(8)
-                .map(|c| s.spawn(move || self.q(&c.iter().flat_map(|a| ["eth_getBalance", "eth_getTransactionCount", "eth_getCode"].map(|m| (m, serde_json::json!([a])))).collect::<Vec<_>>())))
-                .collect();
+        let infos: Vec<AccountInfo> = std::thread::scope(|s| {
+            let hs: Vec<_> = list.chunks(8).map(|c| s.spawn(move || self.q(true, |b| c.iter().flat_map(|a| ACCOUNT.map(|m| (m, serde_json::json!([a, b.clone()])))).collect(), |r| r.chunks(3).map(account).collect::<Result<Vec<_>, _>>()))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect::<Result<Vec<_>, _>>()
         })?
         .concat();
         let mut accounts = self.accounts.lock().unwrap();
         let mut surprise = false;
-        for (a, r) in list.iter().zip(r.chunks(3)) {
-            let info = account(r);
+        for (a, info) in list.iter().zip(infos) {
             surprise |= !info.is_empty();
             accounts.insert(*a, info);
         }
@@ -109,48 +108,68 @@ impl Fork {
 
     /// The forked block's environment (chain id, number, timestamp, fees), as tests on a fork see it.
     pub fn env(&self) -> Result<Env, DbErr> {
-        let r = crate::rpc::batch(&self.url, &[("eth_chainId", serde_json::json!([])), ("eth_getBlockByNumber", serde_json::json!([format!("0x{:x}", self.block()), false]))]).map_err(DbErr)?;
-        let n = |v: &serde_json::Value| U256::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or_default();
-        let b = &r[1];
-        let mut env = Env::new(n(&r[0]).to());
-        env.block.number = n(&b["number"]);
-        env.block.timestamp = n(&b["timestamp"]);
-        env.block.basefee = n(&b["baseFeePerGas"]).to();
+        let (chain, b) = self.q(true, |b| vec![("eth_chainId", serde_json::json!([])), ("eth_getBlockByNumber", serde_json::json!([b, false]))], |r| match r[1].is_object() {
+            true => Ok((num(&r[0])?, r[1].clone())),
+            false => Err("header not found (the RPC answered null for the block)".into()),
+        })?;
+        let bad = |e: String| DbErr(format!("block {} from {}: {e}", self.block(), self.url));
+        let mut env = Env::new(chain);
+        env.block.number = crate::rpc::quantity(&b["number"]).map_err(bad)?;
+        env.block.timestamp = crate::rpc::quantity(&b["timestamp"]).map_err(bad)?;
+        // blocks before London have no base fee
+        env.block.basefee = if b["baseFeePerGas"].is_null() { 0 } else { num(&b["baseFeePerGas"]).map_err(bad)? };
         env.block.beneficiary = b["miner"].as_str().and_then(|a| a.parse().ok()).unwrap_or_default();
         env.block.prevrandao = b["mixHash"].as_str().and_then(|h| h.parse().ok()).or(Some(B256::ZERO));
         Ok(env)
     }
 
-    /// Calls with the fork's block appended to each call's params.
-    fn q(&self, calls: &[(&str, serde_json::Value)]) -> Result<Vec<serde_json::Value>, DbErr> {
+    /// The calls `calls` makes for the fork's block, answered and parsed. A read never guesses: an RPC error, or an
+    /// answer `parse` rejects (null, "0x" for a number, a node that lost the block), is asked again a few times, and
+    /// then fails the read. With `step`, a block the RPC doesn't have yet moves the fork back a block, until a read
+    /// at the fork's block has succeeded: it stays put from then on.
+    fn q<T>(&self, step: bool, calls: impl Fn(serde_json::Value) -> Vec<(&'static str, serde_json::Value)>, parse: impl Fn(&[serde_json::Value]) -> Result<T, String>) -> Result<T, DbErr> {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut steps = 0;
+        let (mut steps, mut tries) = (0, 0);
         loop {
-            let b = serde_json::json!(format!("0x{:x}", self.block()));
-            let at: Vec<(&str, serde_json::Value)> = calls.iter().map(|(m, p)| (*m, p.as_array().map(|a| a.iter().cloned().chain([b.clone()]).collect()).unwrap_or_default())).collect();
-            match crate::rpc::batch(&self.url, &at) {
-                Err(e) if !self.settled.load(Relaxed) && steps < 8 && ["unknown block", "header not found"].iter().any(|t| e.to_lowercase().contains(t)) => {
-                    steps += 1;
-                    self.block.fetch_sub(1, Relaxed);
-                }
-                r => {
-                    self.settled.store(r.is_ok(), Relaxed);
-                    return r.map_err(DbErr);
-                }
+            let at = calls(serde_json::json!(format!("0x{:x}", self.block())));
+            // (an odd answer, which is worth asking again: rpc::batch already retried what's transient, the rest is final)
+            let (odd, e) = match crate::rpc::batch(&self.url, &at) {
+                Ok(r) => match parse(&r) {
+                    Ok(t) => {
+                        // the RPC has the fork's block: it stays put from now on
+                        if step {
+                            self.settled.store(true, Relaxed);
+                        }
+                        return Ok(t);
+                    }
+                    Err(e) => (true, e),
+                },
+                Err(e) => (false, e),
+            };
+            let missing = ["unknown block", "header not found", "block not found"].iter().any(|t| e.to_lowercase().contains(t));
+            if missing && step && !self.settled.load(Relaxed) && steps < 8 {
+                steps += 1;
+                self.block.fetch_sub(1, Relaxed);
+                continue;
             }
+            if !(odd || missing) || tries == 4 {
+                let what = at.iter().map(|c| c.0).collect::<Vec<_>>().join(", ");
+                return Err(DbErr(format!("reading the fork (block {}) failed: {what} from {}: {e}", self.block(), self.url)));
+            }
+            tries += 1;
+            crate::rpc::backoff(tries);
         }
     }
 }
 
-fn hexu(v: &serde_json::Value) -> U256 {
-    v.as_str().and_then(|s| U256::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_default()
-}
+const ACCOUNT: [&str; 3] = ["eth_getBalance", "eth_getTransactionCount", "eth_getCode"];
 
 /// An account from [eth_getBalance, eth_getTransactionCount, eth_getCode] results.
-fn account(r: &[serde_json::Value]) -> AccountInfo {
-    let code = hex::decode(r[2].as_str().unwrap_or("0x").trim_start_matches("0x")).unwrap_or_default();
-    let bc = Bytecode::new_raw(code.into());
-    AccountInfo::new(hexu(&r[0]), hexu(&r[1]).to::<u64>(), bc.hash_slow(), bc)
+fn account(r: &[serde_json::Value]) -> Result<AccountInfo, String> {
+    let bc = Bytecode::new_raw(crate::rpc::data(&r[2]).map_err(|e| format!("eth_getCode: {e}"))?.into());
+    let balance = crate::rpc::quantity(&r[0]).map_err(|e| format!("eth_getBalance: {e}"))?;
+    let nonce = num(&r[1]).map_err(|e| format!("eth_getTransactionCount: {e}"))?;
+    Ok(AccountInfo::new(balance, nonce, bc.hash_slow(), bc))
 }
 
 impl DatabaseRef for Remote {
@@ -163,8 +182,7 @@ impl DatabaseRef for Remote {
         if let Some(i) = f.accounts.lock().unwrap().get(&a) {
             return Ok(Some(i.clone()));
         }
-        let p = serde_json::json!([a]);
-        let info = account(&f.q(&[("eth_getBalance", p.clone()), ("eth_getTransactionCount", p.clone()), ("eth_getCode", p)])?);
+        let info = f.q(true, |b| ACCOUNT.map(|m| (m, serde_json::json!([a, b.clone()]))).to_vec(), account)?;
         f.accounts.lock().unwrap().insert(a, info.clone());
         Ok(Some(info))
     }
@@ -182,14 +200,29 @@ impl DatabaseRef for Remote {
         if let Some(v) = f.slots.lock().unwrap().get(&(a, k)) {
             return Ok(*v);
         }
-        let v = hexu(&f.q(&[("eth_getStorageAt", serde_json::json!([a, format!("0x{k:x}")]))])?[0]);
+        let v = f.q(true, |b| vec![("eth_getStorageAt", serde_json::json!([a, format!("0x{k:x}"), b]))], |r| crate::rpc::quantity(&r[0]).map_err(|e| format!("eth_getStorageAt: {e}")))?;
         f.slots.lock().unwrap().insert((a, k), v);
         Ok(v)
     }
     fn block_hash_ref(&self, n: u64) -> Result<B256, DbErr> {
-        match &self.1 {
-            Some(p) => p.block_hash_ref(n),
-            None => Ok(keccak256(n.to_be_bytes())),
+        if let Some(p) = &self.1 {
+            return p.block_hash_ref(n);
+        }
+        match &self.0 {
+            // the chain's own hashes up to the forked block
+            Some(f) if n <= f.block() => {
+                if let Some(h) = f.hashes.lock().unwrap().get(&n) {
+                    return Ok(*h);
+                }
+                let h = f.q(false, |_| vec![("eth_getBlockByNumber", serde_json::json!([format!("0x{n:x}"), false]))], |r| {
+                    let h = crate::rpc::data(&r[0]["hash"]).map_err(|e| format!("block {n}'s hash: {e}"))?;
+                    (h.len() == 32).then(|| B256::from_slice(&h)).ok_or_else(|| format!("block {n}'s hash: {} bytes", h.len()))
+                })?;
+                f.hashes.lock().unwrap().insert(n, h);
+                Ok(h)
+            }
+            // what forge's in-memory backend answers (revm's EmptyDB)
+            _ => Ok(keccak256(n.to_string().as_bytes())),
         }
     }
 }
@@ -1434,5 +1467,54 @@ impl Inspector<Ctx> for Cheats {
                 e.found = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::mock;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn fork_reads_never_guess() {
+        // a slot answered null, then "0x", then for real: the read gets the real value, never a zero
+        let url = mock::results(|_, _, n| match n {
+            0 => Value::Null,
+            1 => json!("0x"),
+            _ => json!("0x2a"),
+        });
+        let remote = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None);
+        assert_eq!(remote.storage_ref(Address::ZERO, U256::ZERO).unwrap(), U256::from(42));
+        // a node that keeps answering oddly fails the read: never an empty account or a zero slot
+        for odd in [Value::Null, json!("0x"), json!("nope")] {
+            let url = mock::results(move |_, _, _| odd.clone());
+            let remote = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None);
+            assert!(remote.storage_ref(Address::ZERO, U256::ZERO).is_err());
+            assert!(remote.basic_ref(Address::ZERO).is_err());
+        }
+        // "0x" is empty code, though not a balance or a nonce; reads ask for the fork's block
+        let url = mock::results(|m, params, _| {
+            assert_eq!(params.as_array().unwrap().last().unwrap(), "0x7", "{m} {params}");
+            json!(if m == "eth_getCode" { "0x" } else { "0x5" })
+        });
+        let info = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None).basic_ref(Address::ZERO).unwrap().unwrap();
+        assert_eq!((info.balance, info.nonce, info.code_hash), (U256::from(5), 5, revm::primitives::KECCAK_EMPTY));
+        let url = mock::results(|m, _, _| json!(if m == "eth_getBalance" { "0x" } else { "0x5" }));
+        assert!(Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None).basic_ref(Address::ZERO).is_err());
+    }
+
+    #[test]
+    fn block_hashes() {
+        // forge's in-memory backend hashes the decimal block number; a fork has the chain's own hashes
+        assert_eq!(Remote::default().block_hash_ref(5).unwrap(), keccak256(b"5"));
+        let h = B256::repeat_byte(0xab);
+        let url = mock::results(move |m, params, _| {
+            assert_eq!((m, &params[0]), ("eth_getBlockByNumber", &json!("0x5")));
+            json!({"hash": h})
+        });
+        let remote = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None);
+        assert_eq!(remote.block_hash_ref(5).unwrap(), h);
+        assert_eq!(remote.block_hash_ref(9).unwrap(), keccak256(b"9"), "past the forked block");
     }
 }

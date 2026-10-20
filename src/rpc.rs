@@ -187,16 +187,20 @@ pub fn batch(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Value>, String> {
     batch_each(url, calls)?.into_iter().collect()
 }
 
+/// Failures worth asking again: rate limits as public RPCs word them ("25/second request limit reached", "capacity
+/// exceeded"), timeouts, gateways and server errors, the network itself (DNS, refused or dropped connections), and
+/// answers that aren't proper JSON-RPC responses, which a node behind a load balancer gives now and then.
+fn transient(e: &str) -> bool {
+    let e = e.to_lowercase();
+    ["429", "rate limit", "rate-limit", "ratelimit", "too many requests", "request limit", "limit reached", "capacity exceeded", "timed out", "timeout", "bad gateway", "service unavailable", "gateway", "http 5", "network error", "not a json-rpc", "malformed"]
+        .iter()
+        .any(|t| e.contains(t))
+}
+
 /// JSON-RPC batch with a result per call. Retries what load-balanced public RPCs fail on now and then
-/// (a node behind on blocks, rate limits); falls back to one request per call if the server rejects batches.
+/// (a node behind on blocks, rate limits, a dropped connection); falls back to one request per call if the server
+/// rejects batches. A result is always the answer to its own call: an answer that isn't one is an error.
 pub fn batch_each(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, String>>, String> {
-    // rate limits as public RPCs word them ("25/second request limit reached", "capacity exceeded"), timeouts, gateways
-    let transient = |e: &str| {
-        let e = e.to_lowercase();
-        ["429", "rate limit", "rate-limit", "ratelimit", "too many requests", "request limit", "limit reached", "capacity exceeded", "timed out", "timeout", "502 bad gateway", "503 service", "504 gateway"]
-            .iter()
-            .any(|t| e.contains(t))
-    };
     let mut tries = 0;
     loop {
         let r = batch_once(url, calls);
@@ -208,8 +212,14 @@ pub fn batch_each(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value
             return r;
         }
         tries += 1;
-        std::thread::sleep(Duration::from_millis(300 << tries));
+        backoff(tries);
     }
+}
+
+/// The wait before asking again, doubling from 0.6 s (from 2 ms in plain's own tests).
+pub fn backoff(tries: u32) {
+    let unit = if cfg!(test) { 1 } else { 300 };
+    std::thread::sleep(Duration::from_millis(unit << tries));
 }
 
 fn batch_once(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, String>>, String> {
@@ -221,26 +231,69 @@ fn batch_once(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, St
             eprintln!("rpc {name} {:.0?}", t.elapsed());
         }
     });
-    let mut r = agent().post(url).send_json(if body.len() == 1 { body[0].clone() } else { Value::Array(body) }).map_err(|e| format!("{name}: {e}"))?;
+    let mut r = agent().post(url).send_json(if body.len() == 1 { body[0].clone() } else { Value::Array(body) }).map_err(|e| format!("{name}: network error: {e}"))?;
     let status = r.status().as_u16();
-    let text = r.body_mut().with_config().limit(256 << 20).read_to_string().map_err(|e| format!("{name}: {e}"))?;
-    let v: Value = serde_json::from_str(&text).map_err(|_| format!("{name}: HTTP {status}: {}", text.chars().take(200).collect::<String>()))?;
-    let mut items = match v {
+    let text = r.body_mut().with_config().limit(256 << 20).read_to_string().map_err(|e| format!("{name}: network error: {e}"))?;
+    let snippet = || text.chars().take(200).collect::<String>();
+    let v: Value = serde_json::from_str(&text).map_err(|_| format!("{name}: HTTP {status}: {}", snippet()))?;
+    let items = match v {
         // every call failing over the batch itself (e.g. free plans capping batch size): one call at a time
-        Value::Array(a) if a.len() == calls.len() && !(a.len() > 1 && a.iter().all(|x| x["error"]["message"].as_str().is_some_and(|m| m.to_lowercase().contains("batch")))) => a,
-        // one error object back for a batch: the server doesn't take batches
+        Value::Array(a) if a.len() > 1 && a.iter().all(|x| x["error"]["message"].as_str().is_some_and(|m| m.to_lowercase().contains("batch"))) => return Ok(calls.iter().map(|(m, p)| call(url, m, p.clone())).collect()),
+        Value::Array(a) if a.len() == calls.len() => a,
+        // one error object, or a different number of answers, back for a batch: the server doesn't take batches
         _ if calls.len() > 1 => return Ok(calls.iter().map(|(m, p)| call(url, m, p.clone())).collect()),
         one => vec![one],
     };
-    items.sort_by_key(|x| x["id"].as_u64());
-    Ok(items
+    // answers may come in any order; each must carry the id of a call, once (some servers echo ids as strings)
+    let mut answers: Vec<Option<Value>> = vec![None; calls.len()];
+    for x in items {
+        let id = match &x["id"] {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        };
+        // an error about the request itself may come without an id
+        let id = id.or((calls.len() == 1 && x.get("error").is_some()).then_some(0));
+        match id.map(|i| i as usize).filter(|&i| i < calls.len() && answers[i].is_none()) {
+            Some(i) => answers[i] = Some(x),
+            None => return Err(format!("{name}: HTTP {status}: not a JSON-RPC answer to this request (ids don't match): {}", snippet())),
+        }
+    }
+    let ok = (200..300).contains(&status);
+    Ok(answers
         .into_iter()
         .zip(calls)
-        .map(|(x, (m, _))| match x.get("error") {
-            Some(e) => Err(format!("{m}: {}", e["message"].as_str().unwrap_or(&e.to_string()))),
-            None => Ok(x["result"].clone()),
+        .map(|(x, (m, _))| {
+            let x = x.unwrap_or_default();
+            match (x.get("error"), x.get("result")) {
+                (Some(e), _) => Err(format!("{m}: {}", e["message"].as_str().map_or_else(|| e.to_string(), String::from))),
+                (None, _) if !ok => Err(format!("{m}: HTTP {status}: {}", snippet())),
+                (None, Some(r)) => Ok(r.clone()),
+                (None, None) => Err(format!("{m}: malformed answer, with neither a result nor an error: {}", snippet())),
+            }
         })
         .collect())
+}
+
+/// A JSON-RPC quantity (a balance, a nonce, a block number) or storage word: "0x" and 1 to 64 hex digits. Anything
+/// else (null, "0x", a number, garbage) is an error, so that a node that answers oddly can never pass for an empty
+/// account or a zero slot.
+pub fn quantity(v: &Value) -> Result<alloy_primitives::U256, String> {
+    let s = v.as_str().ok_or_else(|| format!("expected a hex number, got {}", short(v)))?;
+    s.strip_prefix("0x")
+        .filter(|h| !h.is_empty() && h.len() <= 64)
+        .and_then(|h| alloy_primitives::U256::from_str_radix(h, 16).ok())
+        .ok_or_else(|| format!("expected a hex number, got {}", short(v)))
+}
+
+/// JSON-RPC data (code, a hash): "0x" and an even number of hex digits; "0x" alone is empty data.
+pub fn data(v: &Value) -> Result<Vec<u8>, String> {
+    v.as_str().and_then(|s| s.strip_prefix("0x")).and_then(|h| hex::decode(h).ok()).ok_or_else(|| format!("expected hex data, got {}", short(v)))
+}
+
+fn short(v: &Value) -> String {
+    let s = v.to_string();
+    if s.chars().count() > 80 { format!("{}…", s.chars().take(80).collect::<String>()) } else { s }
 }
 
 struct Defer<F: FnMut()>(F);
@@ -250,8 +303,97 @@ impl<F: FnMut()> Drop for Defer<F> {
     }
 }
 
+/// A JSON-RPC server on localhost for tests: `answer(request, n)` gives the n-th request's status and body.
+#[cfg(test)]
+pub mod mock {
+    use std::io::{BufRead, Read, Write};
+
+    pub fn serve(answer: impl Fn(&serde_json::Value, usize) -> (u16, String) + Send + 'static) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (n, s) in l.incoming().enumerate() {
+                let Ok(s) = s else { continue };
+                let mut r = std::io::BufReader::new(s);
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+                        len = v.trim().parse().unwrap_or_else(|_| panic!("{k}: {v}"));
+                    }
+                }
+                let mut body = vec![0; len];
+                r.read_exact(&mut body).unwrap();
+                let (status, out) = answer(&serde_json::from_slice(&body).unwrap(), n);
+                let mut s = r.into_inner();
+                write!(s, "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}", out.len()).unwrap();
+            }
+        });
+        url
+    }
+
+    /// Answers each call of a request (a batch or one call) with `result(method, params, n)`, in request order.
+    pub fn results(result: impl Fn(&str, &serde_json::Value, usize) -> serde_json::Value + Send + 'static) -> String {
+        serve(move |req, n| {
+            let one = |c: &serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": c["id"], "result": result(c["method"].as_str().unwrap(), &c["params"], n)});
+            (200, match req.as_array() {
+                Some(calls) => serde_json::Value::Array(calls.iter().map(one).collect()),
+                None => one(req),
+            }.to_string())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
+    #[test]
+    fn answers_go_to_their_calls() {
+        // answers in reverse order, ids echoed as strings: each result still belongs to its own call
+        let url = super::mock::serve(|req, _| {
+            let a: Vec<Value> = req.as_array().unwrap().iter().rev().map(|c| json!({"jsonrpc": "2.0", "id": c["id"].to_string(), "result": c["method"]})).collect();
+            (200, Value::Array(a).to_string())
+        });
+        assert_eq!(super::batch(&url, &[("a", json!([])), ("b", json!([])), ("c", json!([]))]).unwrap(), ["a", "b", "c"]);
+        // a flaky first answer is asked again
+        let url = super::mock::serve(|req, n| match n {
+            0 => (503, r#"{"message":"no healthy upstream"}"#.into()),
+            _ => (200, json!({"jsonrpc": "2.0", "id": req["id"], "result": "0x5"}).to_string()),
+        });
+        assert_eq!(super::call(&url, "eth_chainId", json!([])).unwrap(), "0x5");
+    }
+
+    #[test]
+    fn broken_answers_are_errors() {
+        // ids that don't match the calls: never results, which could be some other call's
+        for body in [
+            r#"[{"jsonrpc":"2.0","id":0,"result":"0x1"},{"jsonrpc":"2.0","id":0,"result":"0x2"}]"#,
+            r#"[{"jsonrpc":"2.0","id":0,"result":"0x1"},{"jsonrpc":"2.0","id":7,"result":"0x2"}]"#,
+            r#"[{"jsonrpc":"2.0","result":"0x1"},{"jsonrpc":"2.0","result":"0x2"}]"#,
+        ] {
+            let url = super::mock::serve(move |_, _| (200, body.into()));
+            assert!(super::batch(&url, &[("a", json!([])), ("b", json!([]))]).is_err(), "{body}");
+        }
+        // a body that isn't a JSON-RPC answer, one with neither result nor error, a result under an error status
+        for (status, body) in [(503, r#"{"message":"no healthy upstream"}"#), (200, r#"{"jsonrpc":"2.0","id":0}"#), (429, r#"{"jsonrpc":"2.0","id":0,"result":"0x5"}"#), (200, "<html>")] {
+            let url = super::mock::serve(move |_, _| (status, body.into()));
+            assert!(super::call(&url, "a", json!([])).is_err(), "{status} {body}");
+        }
+        // a null result is a result (a receipt not in yet); the typed reads reject what isn't a number or data
+        let url = super::mock::results(|_, _, _| Value::Null);
+        assert_eq!(super::call(&url, "eth_getTransactionReceipt", json!([])).unwrap(), Value::Null);
+        for bad in [json!(null), json!("0x"), json!(5), json!("0xzz"), json!(format!("0x{}", "1".repeat(65)))] {
+            assert!(super::quantity(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(super::quantity(&json!("0x0")).unwrap(), alloy_primitives::U256::ZERO);
+        assert_eq!(super::data(&json!("0x")).unwrap(), Vec::<u8>::new());
+        assert!(super::data(&json!(null)).is_err() && super::data(&json!("0x123")).is_err());
+    }
+
     #[test]
     fn names() {
         let c = |id, name: &str, slug: &str, short: &str| super::Chain { id, name: name.into(), slug: slug.into(), short: short.into(), rpcs: vec![], explorers: vec![], testnet: false, symbol: String::new() };
