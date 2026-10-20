@@ -200,7 +200,7 @@ pub fn batch(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Value>, String> {
 /// Failures worth asking again: rate limits as public RPCs word them ("25/second request limit reached", "capacity
 /// exceeded"), timeouts, gateways and server errors, the network itself (DNS, refused or dropped connections), and
 /// answers that aren't proper JSON-RPC responses, which a node behind a load balancer gives now and then.
-fn transient(e: &str) -> bool {
+pub fn transient(e: &str) -> bool {
     let e = e.to_lowercase();
     ["429", "rate limit", "rate-limit", "ratelimit", "too many requests", "request limit", "limit reached", "capacity exceeded", "timed out", "timeout", "bad gateway", "service unavailable", "gateway", "http 5", "network error", "not a json-rpc", "malformed"]
         .iter()
@@ -211,6 +211,9 @@ fn transient(e: &str) -> bool {
 /// (a node behind on blocks, rate limits, a dropped connection); falls back to one request per call if the server
 /// rejects batches. A result is always the answer to its own call: an answer that isn't one is an error.
 pub fn batch_each(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, String>>, String> {
+    if calls.is_empty() {
+        return Ok(vec![]);
+    }
     let mut tries = 0;
     loop {
         let r = batch_once(url, calls);

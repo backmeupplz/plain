@@ -441,7 +441,7 @@ struct ExpectEmit {
     found: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BroadcastTx {
     pub from: Address,
     pub to: Option<Address>,
@@ -536,6 +536,8 @@ pub struct Cheats {
     pub presume_creates: bool,
     /// every contract created while `track_creates` is on, with its init code (for verification)
     pub creates: Vec<(Address, Bytes)>,
+    /// when set, every account a call went to or ran the code of (deploys: what a transaction depends on)
+    pub touched: Option<std::collections::HashSet<Address>>,
     pub trace: Option<Vec<TraceNode>>,
     trace_stack: Vec<usize>,
     bc_creates: Vec<Option<usize>>,
@@ -1735,6 +1737,9 @@ impl Inspector<Ctx> for Cheats {
 
     fn call(&mut self, ctx: &mut Ctx, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let depth = ctx.journaled_state.depth();
+        if let Some(t) = &mut self.touched {
+            t.extend([inputs.target_address, inputs.bytecode_address]);
+        }
         if self.in_inner && depth == 1 {
             // the top frame of an isolated transaction: everything for this call was done in the outer one
             ctx.tx.caller = self.inner_origin;
