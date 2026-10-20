@@ -155,6 +155,9 @@ impl Fork {
                 self.block.fetch_sub(1, Relaxed);
                 continue;
             }
+            if std::env::var_os("PLAIN_DEBUG").is_some() {
+                eprintln!("fork read at block {}: {e}", self.block());
+            }
             if !(odd || missing) || tries == 4 {
                 let what = at.iter().map(|c| c.0).collect::<Vec<_>>().join(", ");
                 return Err(DbErr(format!("reading the fork (block {}) failed: {what} from {}: {e}", self.block(), self.url)));
@@ -1809,6 +1812,16 @@ mod tests {
         });
         let remote = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None);
         assert_eq!(remote.storage_ref(Address::ZERO, U256::ZERO).unwrap(), U256::from(42));
+        // rate limited as mainnet.base.org answers it (HTTP 429, no JSON-RPC envelope), then served: the real value
+        let url = mock::serve(|req, n| match n {
+            0 | 1 => (429, r#"{"code":-32007,"message":"25/second request limit reached"}"#.into()),
+            _ => (200, json!({"jsonrpc": "2.0", "id": req["id"], "result": "0x2a"}).to_string()),
+        });
+        let remote = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None);
+        assert_eq!(remote.storage_ref(Address::ZERO, U256::ZERO).unwrap(), U256::from(42));
+        let url = mock::serve(|_, _| (429, r#"{"code":-32007,"message":"25/second request limit reached"}"#.into()));
+        let e = Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None).storage_ref(Address::ZERO, U256::ZERO).unwrap_err();
+        assert!(e.0.contains("HTTP 429") && e.0.contains("request limit"), "{e}");
         // a node that keeps answering oddly fails the read: never an empty account or a zero slot
         for odd in [Value::Null, json!("0x"), json!("nope")] {
             let url = mock::results(move |_, _, _| odd.clone());

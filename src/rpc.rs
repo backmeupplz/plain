@@ -208,18 +208,22 @@ pub fn batch_each(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value
             Err(e) => transient(e),
             Ok(items) => items.iter().any(|x| x.as_ref().is_err_and(|e| transient(e))),
         };
-        if !retry || tries == 4 {
+        if !retry || tries == 8 {
             return r;
+        }
+        if std::env::var_os("PLAIN_DEBUG").is_some() {
+            eprintln!("rpc retry: {}", match &r { Err(e) => e.clone(), Ok(items) => items.iter().filter_map(|x| x.as_ref().err()).cloned().collect::<Vec<_>>().join("; ") });
         }
         tries += 1;
         backoff(tries);
     }
 }
 
-/// The wait before asking again, doubling from 0.6 s (from 2 ms in plain's own tests).
+/// The wait before asking again: doubling from 0.6 s up to 5 s (2 ms in plain's own tests); 8 tries are about 30 s,
+/// what a rate-limited public RPC needs to let a burst of parallel tests through.
 pub fn backoff(tries: u32) {
-    let unit = if cfg!(test) { 1 } else { 300 };
-    std::thread::sleep(Duration::from_millis(unit << tries));
+    let ms = if cfg!(test) { 1 << tries.min(4) } else { (300u64 << tries.min(5)).min(5000) };
+    std::thread::sleep(Duration::from_millis(ms));
 }
 
 fn batch_once(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, String>>, String> {
@@ -256,7 +260,9 @@ fn batch_once(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, St
         let id = id.or((calls.len() == 1 && x.get("error").is_some()).then_some(0));
         match id.map(|i| i as usize).filter(|&i| i < calls.len() && answers[i].is_none()) {
             Some(i) => answers[i] = Some(x),
-            None => return Err(format!("{name}: HTTP {status}: not a JSON-RPC answer to this request (ids don't match): {}", snippet())),
+            // e.g. mainnet.base.org's rate limit: HTTP 429 {"code":-32007,"message":"25/second request limit reached"}
+            None if !(200..300).contains(&status) => return Err(format!("{name}: HTTP {status}: {}", snippet())),
+            None => return Err(format!("{name}: not a JSON-RPC answer to this request (ids don't match): {}", snippet())),
         }
     }
     let ok = (200..300).contains(&status);
@@ -379,7 +385,9 @@ mod tests {
             assert!(super::batch(&url, &[("a", json!([])), ("b", json!([]))]).is_err(), "{body}");
         }
         // a body that isn't a JSON-RPC answer, one with neither result nor error, a result under an error status
-        for (status, body) in [(503, r#"{"message":"no healthy upstream"}"#), (200, r#"{"jsonrpc":"2.0","id":0}"#), (429, r#"{"jsonrpc":"2.0","id":0,"result":"0x5"}"#), (200, "<html>")] {
+        // mainnet.base.org's rate limit came back as `result: null`, so as a zero slot (plain 0.3.2)
+        let base_429 = r#"{"code":-32007,"message":"25/second request limit reached"}"#;
+        for (status, body) in [(429, base_429), (503, r#"{"message":"no healthy upstream"}"#), (200, r#"{"jsonrpc":"2.0","id":0}"#), (429, r#"{"jsonrpc":"2.0","id":0,"result":"0x5"}"#), (200, "<html>")] {
             let url = super::mock::serve(move |_, _| (status, body.into()));
             assert!(super::call(&url, "a", json!([])).is_err(), "{status} {body}");
         }
