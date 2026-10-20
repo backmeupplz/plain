@@ -112,6 +112,9 @@ plain init
 ```sh
 plain build           # compile src/, test/ and script/
 plain build --force   # ignore every cache and recompile
+plain build src/Vault.sol --sizes --skip test --skip script   # forge's size table, failing over EIP-170
+plain build --out out --extra-output storageLayout            # forge's out/ layout too, with storage layouts
+plain inspect Vault storage-layout --json
 ```
 
 The first build downloads the newest solc that satisfies your pragmas, or reuses one Foundry already downloaded, and `solc = "0.8.28"` in the config pins a version. Artifacts land in `.plain/out/<Contract>.json` with each contract's `abi` and `bytecode`. Builds are cached by content: a build with nothing changed takes about 20 ms, and a new clone or worktree of sources that any checkout already compiled compiles nothing, because every checkout shares `~/.plain/cache`.
@@ -128,6 +131,7 @@ plain test --fork base         # run against a fork of a live network, at its la
 plain test --fuzz-runs 1000 --seed 42
 plain test --rerun             # run every suite again, even unchanged ones
 plain test --force             # recompile everything, then run everything
+plain test --mp "test/fork/*.t.sol" --isolate --gas-limit 100000000000 --threads 1   # forge's options work too
 ```
 
 `--watch` runs the tests, then watches `src/`, `test/`, `script/` and the config, and runs them again as soon as something changes. A compile error doesn't end it: fix the file and the next run starts on its own. Since unchanged suites reuse their results, a rerun after you edit one test usually takes about a second, even on big projects. It takes the other options too, so `plain test Vault --watch` keeps rerunning only the Vault tests.
@@ -180,7 +184,7 @@ FAIL test_Deposit(uint96): OutOfFunds
          Vault.deposit() value: 79228162514264337593543950335  ✗ OutOfFunds
 ```
 
-Supported cheatcodes are `prank`/`startPrank`, `deal`, `warp`, `roll`, `fee`, `chainId`, `prevrandao`, `coinbase`, `store`/`load`, `etch`, nonces, `addr`/`sign`/`rememberKey`, `label`, `assume`, `skip`, `expectRevert` and `expectPartialRevert` in all their forms (with the reverting address too), `expectEmit`, `expectCall` (with value), `mockCall`, `recordLogs`/`getRecordedLogs`, `snapshotState`/`revertToState`, `env*`, `setEnv`, `toString`, `parse*`, `getCode`, `readFile`/`writeFile`/`exists`, `ffi`, `computeCreate*Address`, the broadcast cheatcodes, gas snapshots and every `assert*`. Anything else fails with `unsupported cheatcode vm.<name>(...)`. A comment like `/// forge-config: default.fuzz.runs = 10` above a test sets its fuzz runs, and `invariant.runs`, `invariant.depth` and `invariant.fail-on-revert` work the same way.
+Supported cheatcodes are `prank`/`startPrank`, `deal`, `warp`, `roll`, `fee`, `chainId`, `prevrandao`, `coinbase`, `store`/`load`, `etch`, nonces, `addr`/`sign`/`rememberKey`, `label`, `assume`, `skip`, `expectRevert` and `expectPartialRevert` in all their forms (with the reverting address too), `expectEmit`, `expectCall` (with value), `mockCall`, `recordLogs`/`getRecordedLogs`, `snapshotState`/`revertToState`, `env*`, `setEnv`, `toString`, `parse*`, `getCode`, `readFile`/`writeFile`/`exists`, `ffi`, `computeCreate*Address`, the broadcast cheatcodes, gas snapshots, forks inside a test (`createFork`, `createSelectFork`, `selectFork`, `rollFork`, `activeFork`, `makePersistent`), the JSON cheatcodes (`parseJson*`, `keyExists`, `serialize*`, `writeJson`), `record`/`accesses` (which forge-std's `deal` and stdStorage rely on), `cool`/`coolSlot`, `lastCallGas`, the gas metering cheatcodes, `removeFile`, `dumpState`, `rpcUrl` and every `assert*`. Anything else fails with `unsupported cheatcode vm.<name>(...)`. A comment like `/// forge-config: default.fuzz.runs = 10` above a test sets its fuzz runs, and `invariant.runs`, `invariant.depth` and `invariant.fail-on-revert` work the same way.
 
 plain follows forge 1.0's rules where they changed. `expectRevert(Error.selector)` matches only an error with no arguments, and `expectPartialRevert` is the selector-only match. `testFail*` tests fail with a note, because a test that passes whenever its body fails also passes when it fails for the wrong reason. `vm.ffi` runs only with `ffi = true` in the config, and the file cheatcodes reach only what `fs_permissions` opens, exactly as in forge:
 
@@ -313,15 +317,19 @@ contract Deploy is Script {
 plain deploy script/Deploy.s.sol --network base-sepolia --account deployer --broadcast
 ```
 
-In `run()`, `msg.sender` and `tx.origin` are the deployer, as with forge, so `new Vault(msg.sender)` makes the deployer the owner. `vm.startBroadcast(pk)` signs with another key, and `new X{salt: s}()` deploys through the deterministic CREATE2 deployer, like forge. External libraries the contracts link against are deployed first, from the deployer's address. A script runs `run()` with no arguments.
+In `run()`, `msg.sender` and `tx.origin` are the deployer, as with forge, so `new Vault(msg.sender)` makes the deployer the owner. `vm.startBroadcast(pk)` signs with another key, and `new X{salt: s}()` deploys through the deterministic CREATE2 deployer, like forge. External libraries the contracts link against are deployed first, from the deployer's address, unless the config says they're on chain already: forge's `libraries = ["src/L.sol:L:0x…"]` links against that address instead, after plain checks that it holds code. A script runs `run()` with no arguments.
 
 ### What --broadcast does
 
 1. While solc compiles, plain connects to the network and reads the chain id, the latest block and the fees in one round trip.
 2. It runs the script against a fork of that block under the EVM rules the code was compiled for, with the contract size limits chains enforce, then replays each transaction on its own, in order, the way the chain will run it. That gives each transaction's gas, sent with 30% headroom over what it needs before refunds. Nothing is sent if a transaction would revert on chain or the account can't pay.
 3. It compiles every contract the transactions create again, from exactly the sources and settings explorers will get, and sends nothing unless the bytecode is identical to what it's about to put on chain. A stale or tampered cache can't deploy anything your sources don't say.
-4. It checks that the account's next nonce is the one the simulation used, since later transactions call contracts at addresses that follow from it. It signs everything up front, sends the first transaction alone so a fee or balance problem stops the deploy early, sends the rest in one batch, and waits for the receipts.
+4. It checks that the account's next nonce is the one the simulation used, since later transactions call contracts at addresses that follow from it, and that nothing of the account's is waiting in a node's pool, which could land later at the same nonces. It signs everything up front and keeps the signed transactions in `.plain/deploys/<chain id>-resume.json` until all of them are in. The first transaction goes out alone, so a fee or balance problem stops the deploy early. A node on your machine gets the rest at once; a live chain gets at most 8 at a time, because public RPCs rate-limit (plain retries a rate-limited send with backoff) and a node like op-geth keeps only 16 of an account's transactions, dropping the rest. A transaction that uses a contract an earlier one creates waits until that one is in, and the last one, like a script's final `upgradeAndCall`, waits until everything before it is. `--slow` sends one transaction at a time, each after the last one's receipt, as forge's `--slow` does. Each transaction is tracked by its hash: when a send comes back with an error, plain looks the hash up before doing anything else (some RPCs answer with an error and still take the transaction), it only ever sends again what it signed, and a transaction counts as done once the chain has exactly it, from the same account, nonce and target with the same input and value, and it succeeded. At the first rejection, revert, mismatch or nonce taken by another transaction, plain stops and prints which nonces landed, which are still out and which weren't sent.
 5. It saves the addresses and the verification records of what landed, even when something after it failed, and verifies every contract it created. A node on your machine (`plain node`, anvil, or a fork of a live chain) is never verified.
+
+### When a deploy stops part way
+
+A deploy can stop before everything is in: a public RPC that keeps rate-limiting, a node that drops transactions, or plain killed in the middle. `plain deploy --resume --network base` then sends the rest exactly as it was signed, with no build, simulation or key, and saves the addresses and verification records as a full deploy would. Before it sends anything, it checks that nothing of the accounts' is waiting in a pool and that every nonce the chain has used since is taken by the deploy's own transaction, byte for byte, so a transaction that landed after plain stopped counts as in and anything else stops the resume. Until a deploy is finished, a new `--broadcast` to that chain is refused, because its signed transactions could still land at the nonces a new deploy would use. When a transaction failed on chain, the rest can't be resumed, since it counted on that one: fix the cause and deploy afresh once nothing of the old deploy can land any more.
 
 ### Addresses
 
@@ -479,7 +487,7 @@ my-l2 = "https://rpc.my-l2.xyz"
 staging = "${STAGING_RPC}"
 ```
 
-RPC URLs from providers like Alchemy or Infura contain your API key, so keep them in `.env`, which `plain init` leaves out of git, rather than in `plain.toml`. The menu's Settings can save an RPC URL to `.env` for you.
+RPC URLs from providers like Alchemy or Infura contain your API key, so keep them in `.env`, which `plain init` leaves out of git, rather than in `plain.toml`. plain never prints more of an RPC URL than its host, in messages or errors, so set a keyed URL as `BASE_RPC_URL` and deploy with `--network base` rather than passing the URL itself. The menu's Settings can save an RPC URL to `.env` for you.
 
 ## Existing projects
 
@@ -522,12 +530,17 @@ src = "src"              # default: src, or contracts if there is no src
 ffi = false              # vm.ffi runs commands: off unless set, as in forge
 fs_permissions = []      # what the file cheatcodes may read or write, as in forge
 typescript = false       # run test/**/*.test.ts (plain.toml only)
+isolate = false          # each call a test makes as its own transaction, as forge's --isolate
+gas_limit = 1073741824   # the gas each test and its block get
+libraries = []           # ["src/L.sol:L:0x…"]: libraries on chain already, linked instead of deployed
 [fuzz]
 runs = 256
 [invariant]
 runs = 256
 depth = 500
 ```
+
+`additional_compiler_profiles` and `compilation_restrictions` work as in forge: a file the restrictions rule out of the default settings compiles with the first profile that fits them, and its tests deploy that profile's builds of what they use.
 
 Secrets stay out of these files. plain reads the project's `.env` for `PRIVATE_KEY`, `ETHERSCAN_API_KEY`, `<NAME>_RPC_URL`, `${VAR}` in the config and the `vm.env*` cheatcodes, after your environment's own variables. It never puts `.env` into its environment or that of the programs it starts, so a cloned repository's `.env` can't change how plain or solc runs. Settings for every project, like the Etherscan key the menu saves, live in `~/.plain/config.toml`.
 
@@ -547,4 +560,4 @@ Building and testing a repository with plain stays inside the EVM and the reposi
 
 ## What plain doesn't do yet
 
-Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, more than one fork inside a test (`vm.createSelectFork` uses the single `--fork`), the `vm.deployCode` cheatcode (forge-std's `deployCode` works), `targetArtifacts`/`targetInterfaces` in invariant tests, OpenZeppelin 4's transparent proxies, beacon proxies, and Windows. Library linking only works for libraries under `src/`, `test/` or `script/`. If you need one of these, [open an issue](https://github.com/backmeupplz/plain/issues).
+Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, the `vm.deployCode` cheatcode (forge-std's `deployCode` works), `targetArtifacts`/`targetInterfaces` in invariant tests, OpenZeppelin 4's transparent proxies, beacon proxies, and Windows. Library linking only works for libraries under `src/`, `test/` or `script/`. If you need one of these, [open an issue](https://github.com/backmeupplz/plain/issues).
