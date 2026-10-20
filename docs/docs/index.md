@@ -83,7 +83,7 @@ The sections below go through each step. If you'd rather not remember any of it,
 
 ```
 $ plain
-plain. 0.3.2 · ~/code/my-project
+plain. 0.4.0 · ~/code/my-project
 Contracts live in src/ and tests in test/; each step shows the command it runs.
 ? What next?
 ❯ Build     compile the contracts
