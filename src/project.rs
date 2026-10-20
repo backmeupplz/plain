@@ -567,10 +567,13 @@ impl Graph {
         self.files.iter().map(|(k, v)| (k.clone(), hex::encode(Sha256::digest(v.content.as_bytes())))).collect()
     }
 
-    /// sha256 over the file's transitive imports (sorted) and the hash `part` gives each of them.
+    /// sha256 over the file itself and its transitive imports (sorted) with the hash `part` gives each of them. The
+    /// file is named first: files that import each other have the same closure, not the same artifacts.
     pub fn closure_hash(&self, root: &str, part: &mut dyn FnMut(&str) -> String) -> String {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
+        h.update(root.as_bytes());
+        h.update(b"\0");
         for f in self.closure(root) {
             h.update(f.as_bytes());
             h.update(part(&f).as_bytes());
@@ -594,6 +597,11 @@ string constant s = "import \"x.sol\";";
 "#;
         let (i, p) = scan(s);
         assert_eq!(i, vec!["a.sol", "./b.sol", "../c.sol"]);
+        // files that import each other: one closure, two artifacts' worth of hashes
+        let node = |imports: &[&str]| FileNode { content: String::new(), imports: imports.iter().map(|s| s.to_string()).collect(), pragma: None };
+        let g = Graph { files: [("a.sol".to_string(), node(&["b.sol"])), ("b.sol".to_string(), node(&["a.sol"]))].into() };
+        assert_eq!(g.closure("a.sol"), g.closure("b.sol"));
+        assert_ne!(g.closure_hash("a.sol", &mut |_| String::new()), g.closure_hash("b.sol", &mut |_| String::new()));
         assert_eq!(p.as_deref(), Some("^0.8.20"));
         assert_eq!(normalize("src/a/../b/./c.sol"), "src/b/c.sol");
     }
