@@ -73,7 +73,7 @@ fn num(v: &serde_json::Value) -> Result<u64, String> {
 
 impl Fork {
     pub fn new(url: &str, block: Option<u64>) -> Fork {
-        let block = block.unwrap_or_else(|| crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).unwrap_or_else(|e| crate::die(&format!("fork {url}: {e}"))));
+        let block = block.unwrap_or_else(|| crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).unwrap_or_else(|e| crate::die(&format!("fork {}: {e}", crate::rpc::shown(url)))));
         Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default(), hashes: Default::default(), presumed: Default::default(), pinned: false, env: Default::default() }
     }
 
@@ -86,7 +86,7 @@ impl Fork {
             if let Some(b) = LATEST.lock().unwrap().get(url) {
                 return Ok(*b);
             }
-            let b = crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).map_err(|e| format!("forking {url}: {e}"))?;
+            let b = crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).map_err(|e| format!("forking {}: {e}", crate::rpc::shown(url)))?;
             Ok(*LATEST.lock().unwrap().entry(url.into()).or_insert(b))
         };
         let (block, pinned) = match block {
@@ -141,7 +141,7 @@ impl Fork {
             true => Ok((num(&r[0])?, r[1].clone())),
             false => Err("header not found (the RPC answered null for the block)".into()),
         })?;
-        let bad = |e: String| DbErr(format!("block {} from {}: {e}", self.block(), self.url));
+        let bad = |e: String| DbErr(format!("block {} from {}: {e}", self.block(), crate::rpc::shown(&self.url)));
         let mut env = Env::new(chain);
         env.block.number = crate::rpc::quantity(&b["number"]).map_err(bad)?;
         env.block.timestamp = crate::rpc::quantity(&b["timestamp"]).map_err(bad)?;
@@ -187,7 +187,7 @@ impl Fork {
             }
             if !(odd || missing) || tries == 4 {
                 let what = at.iter().map(|c| c.0).collect::<Vec<_>>().join(", ");
-                return Err(DbErr(format!("reading the fork (block {}) failed: {what} from {}: {e}", self.block(), self.url)));
+                return Err(DbErr(format!("reading the fork (block {}) failed: {what} from {}: {e}", self.block(), crate::rpc::shown(&self.url))));
             }
             tries += 1;
             crate::rpc::backoff(tries);

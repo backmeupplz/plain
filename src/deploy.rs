@@ -45,6 +45,8 @@ pub struct Conn {
 
 pub fn connect(p: &Project, name: &str) -> Conn {
     let net = rpc::network(p, name).unwrap_or_else(|e| die(&e));
+    // a URL given as the network is shown without what may be a key
+    let name = &if name.contains("://") { rpc::shown(name) } else { name.to_string() };
     let calls = [("eth_chainId", json!([])), ("eth_getBlockByNumber", json!(["latest", false])), ("eth_maxPriorityFeePerGas", json!([])), ("eth_gasPrice", json!([]))];
     let r = rpc::batch_each(&net.url, &calls).unwrap_or_else(|e| die(&format!("{name}: {e}")));
     let chain = r[0].clone().unwrap_or_else(|e| die(&format!("{name}: {e}")));
@@ -53,7 +55,7 @@ pub fn connect(p: &Project, name: &str) -> Conn {
         die(&format!("{name}: the RPC answered {b} for the latest block"));
     }
     if std::env::var_os("PLAIN_DEBUG").is_some() {
-        eprintln!("rpc for {name}: {}", net.url);
+        eprintln!("rpc for {name}: {}", rpc::shown(&net.url));
     }
     let fee = |r: &Result<Value, String>| r.as_ref().ok().and_then(|v| rpc::quantity(v).ok()).map(|v| v.saturating_to::<u128>());
     Conn {

@@ -66,6 +66,16 @@ pub fn network(p: &Project, name: &str) -> Result<Net, String> {
     Ok(Net { url, chain: Some(id) })
 }
 
+/// An RPC URL as plain shows it: scheme and host, since the rest often holds an API key
+/// ("https://base-mainnet.g.alchemy.com/v2/<key>" shows as "https://base-mainnet.g.alchemy.com/…").
+pub fn shown(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let cut = if rest.trim_end_matches('/').len() > host.len() { "/…" } else { "" };
+    if scheme.is_empty() { format!("{host}{cut}") } else { format!("{scheme}://{host}{cut}") }
+}
+
 pub fn network_url(p: &Project, name: &str) -> Option<String> {
     network(p, name).map(|n| n.url).ok()
 }
@@ -235,7 +245,8 @@ fn batch_once(url: &str, calls: &[(&str, Value)]) -> Result<Vec<Result<Value, St
             eprintln!("rpc {name} {:.0?}", t.elapsed());
         }
     });
-    let mut r = agent().post(url).send_json(if body.len() == 1 { body[0].clone() } else { Value::Array(body) }).map_err(|e| format!("{name}: network error: {e}"))?;
+    // (an error can quote the URL, which can hold a key)
+    let mut r = agent().post(url).send_json(if body.len() == 1 { body[0].clone() } else { Value::Array(body) }).map_err(|e| format!("{name}: network error: {}", e.to_string().replace(url, &shown(url))))?;
     let status = r.status().as_u16();
     let text = r.body_mut().with_config().limit(256 << 20).read_to_string().map_err(|e| format!("{name}: network error: {e}"))?;
     let snippet = || text.chars().take(200).collect::<String>();
@@ -356,6 +367,14 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+
+    #[test]
+    fn urls_show_without_keys() {
+        assert_eq!(super::shown("https://base-mainnet.g.alchemy.com/v2/secret"), "https://base-mainnet.g.alchemy.com/…");
+        assert_eq!(super::shown("https://user:secret@node.example:8545/?key=secret"), "https://node.example:8545/…");
+        assert_eq!(super::shown("http://127.0.0.1:8545"), "http://127.0.0.1:8545");
+        assert_eq!(super::shown("https://mainnet.base.org/"), "https://mainnet.base.org");
+    }
 
     #[test]
     fn answers_go_to_their_calls() {
