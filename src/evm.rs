@@ -61,6 +61,9 @@ pub struct Fork {
     hashes: Mutex<HashMap<u64, B256>>,
     /// accounts taken as empty without asking (see `presume`)
     presumed: Mutex<Vec<Address>>,
+    /// a block a test asked for: never stepped back from
+    pinned: bool,
+    env: Mutex<Option<Env>>,
 }
 
 /// A u64 from a JSON-RPC quantity, strictly (see `rpc::quantity`).
@@ -71,7 +74,27 @@ fn num(v: &serde_json::Value) -> Result<u64, String> {
 impl Fork {
     pub fn new(url: &str, block: Option<u64>) -> Fork {
         let block = block.unwrap_or_else(|| crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).unwrap_or_else(|e| crate::die(&format!("fork {url}: {e}"))));
-        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default(), hashes: Default::default(), presumed: Default::default() }
+        Fork { url: url.into(), block: block.into(), settled: false.into(), accounts: Default::default(), slots: Default::default(), hashes: Default::default(), presumed: Default::default(), pinned: false, env: Default::default() }
+    }
+
+    /// The fork `vm.createFork(url, block)` makes: one per RPC and block for the whole run, so tests that fork the
+    /// same block read each slot once. Without a block, the RPC's latest one when it was first forked.
+    pub fn at(url: &str, block: Option<u64>) -> Result<Arc<Fork>, String> {
+        static LATEST: std::sync::LazyLock<Mutex<HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
+        static FORKS: std::sync::LazyLock<Mutex<HashMap<(String, u64), Arc<Fork>>>> = std::sync::LazyLock::new(Default::default);
+        let latest = || -> Result<u64, String> {
+            if let Some(b) = LATEST.lock().unwrap().get(url) {
+                return Ok(*b);
+            }
+            let b = crate::rpc::call(url, "eth_blockNumber", serde_json::json!([])).and_then(|b| num(&b)).map_err(|e| format!("forking {url}: {e}"))?;
+            Ok(*LATEST.lock().unwrap().entry(url.into()).or_insert(b))
+        };
+        let (block, pinned) = match block {
+            Some(b) => (b, true),
+            None => (latest()?, false),
+        };
+        let mut forks = FORKS.lock().unwrap();
+        Ok(forks.entry((url.into(), block)).or_insert_with(|| Arc::new(Fork { pinned, ..Fork::new(url, Some(block)) })).clone())
     }
 
     /// Takes a contract's address-to-be as empty, as it nearly always is, instead of a round trip per contract
@@ -111,6 +134,9 @@ impl Fork {
 
     /// The forked block's environment (chain id, number, timestamp, fees), as tests on a fork see it.
     pub fn env(&self) -> Result<Env, DbErr> {
+        if let Some(e) = &*self.env.lock().unwrap() {
+            return Ok(e.clone());
+        }
         let (chain, b) = self.q(true, |b| vec![("eth_chainId", serde_json::json!([])), ("eth_getBlockByNumber", serde_json::json!([b, false]))], |r| match r[1].is_object() {
             true => Ok((num(&r[0])?, r[1].clone())),
             false => Err("header not found (the RPC answered null for the block)".into()),
@@ -123,6 +149,7 @@ impl Fork {
         env.block.basefee = if b["baseFeePerGas"].is_null() { 0 } else { num(&b["baseFeePerGas"]).map_err(bad)? };
         env.block.beneficiary = b["miner"].as_str().and_then(|a| a.parse().ok()).unwrap_or_default();
         env.block.prevrandao = b["mixHash"].as_str().and_then(|h| h.parse().ok()).or(Some(B256::ZERO));
+        *self.env.lock().unwrap() = Some(env.clone());
         Ok(env)
     }
 
@@ -150,7 +177,7 @@ impl Fork {
                 Err(e) => (false, e),
             };
             let missing = ["unknown block", "header not found", "block not found"].iter().any(|t| e.to_lowercase().contains(t));
-            if missing && step && !self.settled.load(Relaxed) && steps < 8 {
+            if missing && step && !self.pinned && !self.settled.load(Relaxed) && steps < 8 {
                 steps += 1;
                 self.block.fetch_sub(1, Relaxed);
                 continue;
@@ -454,7 +481,13 @@ pub struct Cheats {
     pub keys: HashMap<Address, B256>,
     pub default_broadcaster: Option<Address>,
     pub failed_expectations: Vec<String>,
-    pub fork_url: Option<String>,
+    /// forks the suite made (vm.createFork, or --fork as fork 0), by id, and the one in use
+    pub forks: Vec<Arc<Fork>>,
+    pub active_fork: Option<usize>,
+    /// accounts that keep their state when another fork is selected: the test contract and libraries (test.rs sets
+    /// them, as forge makes what it deploys persistent) and vm.makePersistent's; the cheatcode account, CREATE2
+    /// deployer and SENDER always do
+    pub persistent: Vec<Address>,
     prank: Option<Prank>,
     origin_restore: Option<(usize, Address)>,
     expect_revert: Option<ExpectRevert>,
@@ -478,6 +511,8 @@ pub struct Cheats {
     json: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// the solc version the project compiles with, which artifact ids may name ("File.sol:Name:0.8.28")
     pub solc: String,
+    /// the compiler profile of the running test: what it deploys by name comes from that profile's build
+    pub profile: u32,
     /// forge's --isolate: every call the test contract makes is a transaction of its own (see `isolated`)
     pub isolate: bool,
     /// inside one of those transactions, and the outer transaction's origin, which it keeps
@@ -574,6 +609,10 @@ const SUPPORTED: &[&str] = sigs![
     "revertToStateAndDelete(uint256)", "revertToAndDelete(uint256)", "deleteStateSnapshot(uint256)", "deleteSnapshot(uint256)",
     "envUint(string)", "envInt(string)", "envAddress(string)", "envBool(string)", "envBytes32(string)", "envString(string)",
     "envBytes(string)", "envExists(string)", "envOr(string,uint256)", "envOr(string,int256)", "envOr(string,address)",
+    "envUint(string,string)", "envInt(string,string)", "envAddress(string,string)", "envBool(string,string)",
+    "envBytes32(string,string)", "envString(string,string)", "envBytes(string,string)", "envOr(string,string,uint256[])",
+    "envOr(string,string,int256[])", "envOr(string,string,address[])", "envOr(string,string,bool[])",
+    "envOr(string,string,bytes32[])", "envOr(string,string,string[])", "envOr(string,string,bytes[])",
     "envOr(string,bool)", "envOr(string,bytes32)", "envOr(string,string)", "envOr(string,bytes)", "setEnv(string,string)",
     "toString(address)", "toString(uint256)", "toString(int256)", "toString(bytes32)", "toString(bool)", "toString(bytes)",
     "getCode(string)", "getDeployedCode(string)", "mockCall(address,bytes,bytes)", "mockCall(address,uint256,bytes,bytes)",
@@ -584,6 +623,8 @@ const SUPPORTED: &[&str] = sigs![
     "readFile(string)", "writeFile(string,string)", "exists(string)", "unixTime()", "rpcUrl(string)", "activeFork()",
     "createSelectFork(string)", "createSelectFork(string,uint256)", "createFork(string)", "createFork(string,uint256)",
     "selectFork(uint256)", "isPersistent(address)", "makePersistent(address)", "allowCheatcodes(address)",
+    "makePersistent(address,address)", "makePersistent(address,address,address)", "makePersistent(address[])",
+    "revokePersistent(address)", "revokePersistent(address[])", "rollFork(uint256)", "rollFork(uint256,uint256)",
     "snapshotGasLastCall(string)", "snapshotGasLastCall(string,string)", "startSnapshotGas(string)", "startSnapshotGas(string,string)",
     "stopSnapshotGas()", "stopSnapshotGas(string)", "stopSnapshotGas(string,string)", "snapshotValue(string,uint256)",
     "snapshotValue(string,string,uint256)", "ffi(string[])", "readFileBinary(string)",
@@ -667,7 +708,7 @@ pub fn link_code(code: &str, links: &serde_json::Value, libs: &HashMap<String, A
 /// ":<solc version>" and a compiler profile, as forge writes them) names: the exact path first, then a path suffix,
 /// then the file name. Two matches at the same level are an error, never a guess. Like forge, the profile isn't
 /// read: plain compiles each contract once.
-fn find_artifact<'a>(arts: &'a [Artifact], what: &str, solc: &str) -> Result<&'a Artifact, String> {
+fn find_artifact<'a>(arts: &'a [Artifact], what: &str, solc: &str, profile: u32) -> Result<&'a Artifact, String> {
     let mut parts = what.split(':');
     let first = parts.next().unwrap_or_default();
     let (file, name, version) = match first.contains('.') {
@@ -684,13 +725,28 @@ fn find_artifact<'a>(arts: &'a [Artifact], what: &str, solc: &str) -> Result<&'a
     let named: Vec<&Artifact> = arts.iter().filter(|a| a.shard == 0 && !a.bytecode.is_empty() && name.map_or(Some(a.name.as_str()) == fname.strip_suffix(".sol"), |n| a.name == n)).collect();
     let tiers: [&dyn Fn(&Artifact) -> bool; 3] = [&|a| file.is_empty() || a.file == file, &|a| a.file.ends_with(&format!("/{file}")), &|a| a.file.rsplit('/').next() == Some(fname)];
     for tier in tiers {
-        match named.iter().filter(|a| tier(a)).collect::<Vec<_>>().as_slice() {
+        let hits: Vec<&&Artifact> = named.iter().filter(|a| tier(a)).collect();
+        // a contract compiled with several profiles: the running test's (forge's choice)
+        let mine: Vec<&&Artifact> = hits.iter().copied().filter(|a| a.profile == profile).collect();
+        match if hits.len() > 1 && !mine.is_empty() { mine } else { hits }.as_slice() {
             [] => continue,
             [a] => return Ok(a),
             many => return Err(format!("{what:?} matches several contracts: {}", many.iter().map(|a| format!("{}:{}", a.file, a.name)).collect::<Vec<_>>().join(", "))),
         }
     }
     Err(format!("no artifact for {what:?} (only project src/test/script contracts are compiled to bytecode)"))
+}
+
+/// Every storage slot `a` holds in `db` and the layers under it (a fork's own slots are read when asked for).
+fn storage_of(db: &Db, a: Address) -> HashMap<U256, U256> {
+    let mut out = db.db.1.as_ref().map(|base| storage_of(base, a)).unwrap_or_default();
+    if let Some(acc) = db.cache.accounts.get(&a) {
+        if matches!(acc.account_state, revm::database::AccountState::StorageCleared | revm::database::AccountState::NotExisting) {
+            out.clear();
+        }
+        out.extend(acc.storage.iter().map(|(k, v)| (*k, *v)));
+    }
+    out
 }
 
 /// The structs of the sources the artifacts come from, which order the members of objects vm.parseJson decodes.
@@ -1025,22 +1081,39 @@ impl Cheats {
             sg if sg.starts_with("env") => {
                 let key = st(&args[0]);
                 self.read(format!("env:{key}"));
-                let ty = match &s.ty {
-                    DynSolType::Tuple(t) if t.len() == 2 => t[1].clone(),
-                    _ => match s.name.as_str() {
-                        "envUint" => DynSolType::Uint(256),
-                        "envInt" => DynSolType::Int(256),
-                        "envAddress" => DynSolType::Address,
-                        "envBool" => DynSolType::Bool,
-                        "envBytes32" => DynSolType::FixedBytes(32),
-                        "envBytes" => DynSolType::Bytes,
-                        _ => DynSolType::String,
-                    },
+                let types = match &s.ty {
+                    DynSolType::Tuple(t) => t.clone(),
+                    _ => vec![],
                 };
+                let named = match s.name.as_str() {
+                    "envUint" => DynSolType::Uint(256),
+                    "envInt" => DynSolType::Int(256),
+                    "envAddress" => DynSolType::Address,
+                    "envBool" => DynSolType::Bool,
+                    "envBytes32" => DynSolType::FixedBytes(32),
+                    "envBytes" => DynSolType::Bytes,
+                    _ => DynSolType::String,
+                };
+                // (the value's type, the delimiter of an array, the default): envX(name), envX(name, delim),
+                // envOr(name, default), envOr(name, delim, default[])
+                let (ty, delim, default) = match (s.name.as_str(), &types[..]) {
+                    ("envOr", [_, t]) => (t.clone(), None, args.get(1)),
+                    ("envOr", [_, _, DynSolType::Array(t)]) => ((**t).clone(), Some(st(&args[1])), args.get(2)),
+                    (_, [_, _]) => (named, Some(st(&args[1])), None),
+                    _ => (named, None, None),
+                };
+                let value = env(&key).and_then(|v| match &delim {
+                    None => crate::json::parse_value(&v, &ty),
+                    // forge's: items trimmed, an empty value an empty array
+                    Some(d) => match v.split(d.as_str()).map(str::trim).collect::<Vec<_>>().as_slice() {
+                        [] | [""] => Ok(DynSolValue::Array(vec![])),
+                        parts => parts.iter().map(|x| crate::json::parse_value(x, &ty)).collect::<Result<Vec<_>, _>>().map(DynSolValue::Array),
+                    },
+                });
                 // envOr: the default when the variable is unset or doesn't parse, as in forge
-                match (env(&key).and_then(|v| crate::json::parse_value(&v, &ty)), args.get(1)) {
+                match (value, default) {
                     (Ok(v), _) => Ok(enc(v)),
-                    (Err(_), Some(default)) => Ok(enc(default.clone())),
+                    (Err(_), Some(d)) => Ok(enc(d.clone())),
                     (Err(e), None) => Err(e),
                 }
             }
@@ -1175,11 +1248,11 @@ impl Cheats {
             sg if sg.starts_with("toString(") => Ok(enc(DynSolValue::String(decode::display(&args[0])))),
             "getCode(string)" | "getDeployedCode(string)" => {
                 let what = st(&args[0]);
-                let art = find_artifact(&self.artifacts, &what, &self.solc)?;
+                let art = find_artifact(&self.artifacts, &what, &self.solc, self.profile)?;
                 self.read(format!("art:{}:{}", art.file, art.name));
                 if s.name == "getCode" {
                     // tests deploy the same contracts run after run: link and decode each once per suite
-                    let id = format!("{}:{}", art.file, art.name);
+                    let id = format!("{}:{}#{}", art.file, art.name, art.profile);
                     if let Some(c) = self.code_memo.lock().unwrap().get(&id) {
                         return Ok(enc(DynSolValue::Bytes(c.clone())));
                     }
@@ -1227,8 +1300,16 @@ impl Cheats {
                 self.reset_gas = true;
                 ok
             }
-            "allowCheatcodes(address)" | "makePersistent(address)" => ok,
-            "isPersistent(address)" => Ok(enc(DynSolValue::Bool(true))),
+            "allowCheatcodes(address)" => ok,
+            sg if sg.starts_with("makePersistent") || sg.starts_with("revokePersistent") => {
+                let list: Vec<Address> = args.iter().flat_map(|v| v.as_array().map_or_else(|| vec![a(v)], |l| l.iter().map(a).collect())).collect();
+                match s.name.as_str() {
+                    "makePersistent" => self.persistent.extend(list),
+                    _ => self.persistent.retain(|x| !list.contains(x)),
+                }
+                ok
+            }
+            "isPersistent(address)" => Ok(enc(DynSolValue::Bool([CHEATS, CREATE2_DEPLOYER, SENDER].contains(&a(&args[0])) || self.persistent.contains(&a(&args[0]))))),
             "startBroadcast()" | "startBroadcast(address)" | "startBroadcast(uint256)" | "broadcast()" | "broadcast(address)" | "broadcast(uint256)" => {
                 let sender = match args.first() {
                     Some(DynSolValue::Address(x)) => *x,
@@ -1281,15 +1362,32 @@ impl Cheats {
                 let name = st(&args[0]);
                 Ok(enc(DynSolValue::String(crate::rpc::network_url(&p, &name).ok_or(format!("unknown network {name:?}"))?)))
             }
-            "activeFork()" => Ok(enc(DynSolValue::Uint(U256::ZERO, 256))),
-            "selectFork(uint256)" => ok,
+            "activeFork()" => Ok(enc(DynSolValue::Uint(U256::from(self.active_fork.ok_or("no active fork")?), 256))),
             "createSelectFork(string)" | "createSelectFork(string,uint256)" | "createFork(string)" | "createFork(string,uint256)" => {
                 self.impure();
-                // ponytail: one fork per run; pick it with `plain test --fork <url|network>`
-                match &self.fork_url {
-                    Some(_) => Ok(enc(DynSolValue::Uint(U256::ZERO, 256))),
-                    None => Err("forking inside tests is unsupported; run with `plain test --fork <url|network>`".into()),
+                let name = st(&args[0]);
+                let url = if name.contains("://") { name } else { crate::rpc::network_url(&crate::project::Project::load(), &name).ok_or(format!("unknown network or RPC {name:?}"))? };
+                let fork = Fork::at(&url, args.get(1).map(|b| u(b).saturating_to()))?;
+                self.forks.push(fork);
+                let id = self.forks.len() - 1;
+                if s.name == "createSelectFork" {
+                    self.select_fork(ctx, id)?;
                 }
+                Ok(enc(DynSolValue::Uint(U256::from(id), 256)))
+            }
+            "selectFork(uint256)" => {
+                self.impure();
+                self.select_fork(ctx, u(&args[0]).saturating_to())?;
+                ok
+            }
+            "rollFork(uint256)" | "rollFork(uint256,uint256)" => {
+                // ponytail: rolling forks the RPC again at the block (persistent accounts kept); forge rolls in place
+                self.impure();
+                let id = if args.len() == 2 { u(&args[0]).saturating_to() } else { self.active_fork.ok_or("no active fork")? };
+                let fork = Fork::at(&self.forks.get(id).ok_or(format!("no fork {id}"))?.url, Some(u(args.last().unwrap()).saturating_to()))?;
+                self.forks[id] = fork;
+                self.select_fork(ctx, id)?;
+                ok
             }
             sg if sg.starts_with("snapshotGasLastCall") => Ok(enc(DynSolValue::Uint(U256::from(self.last_gas.map_or(0, |g| g.total_gas_spent())), 256))),
             sg if sg.starts_with("startSnapshotGas") => {
@@ -1502,6 +1600,55 @@ impl Cheats {
                 (InterpreterResult { result: reason.into(), output: Bytes::new(), gas }, None)
             }
         }
+    }
+
+    /// Makes fork `id` the chain the rest of the run sees: its state and its block (number, time, fees, chain id; the
+    /// test's gas stays). Persistent accounts move over with all they hold; everything else is the fork's.
+    /// ponytail: a fork selected again starts over from the chain (forge keeps what was done on it)
+    fn select_fork(&mut self, ctx: &mut Ctx, id: usize) -> Result<(), String> {
+        let fork = self.forks.get(id).cloned().ok_or(format!("no fork {id}"))?;
+        let env = fork.env().map_err(|e| e.0)?;
+        let keep: std::collections::HashSet<Address> = [CHEATS, CREATE2_DEPLOYER, SENDER].into_iter().chain(self.persistent.iter().copied()).collect();
+        let old = std::mem::replace(&mut ctx.journaled_state.database, Db::new(Remote(Some(fork), None)));
+        let db = &mut ctx.journaled_state.database;
+        for a in &keep {
+            let Some(mut info) = old.basic_ref(*a).map_err(|e| e.0)? else { continue };
+            if info.code.is_none() && info.code_hash != revm::primitives::KECCAK_EMPTY {
+                info.code = Some(old.code_by_hash_ref(info.code_hash).map_err(|e| e.0)?);
+            }
+            db.insert_account_info(*a, info);
+            for (k, v) in storage_of(&old, *a) {
+                db.insert_account_storage(*a, k, v).map_err(|e| e.0)?;
+            }
+        }
+        // what this transaction loaded: only persistent accounts stay, and what was done to the others can't be
+        // reverted any more (their journal entries become no-ops)
+        let inner = &mut ctx.journaled_state.inner;
+        inner.state.retain(|a, _| keep.contains(a));
+        inner.selfdestructed_addresses.retain(|a| keep.contains(a));
+        use revm::context_interface::journaled_state::entry::JournalEntry as E;
+        for e in inner.journal.iter_mut() {
+            let addrs: Vec<Address> = match e {
+                E::AccountWarmed { address } | E::AccountTouched { address } | E::BalanceChange { address, .. } | E::NonceChange { address, .. } | E::NonceBump { address } | E::AccountCreated { address, .. } | E::StorageChanged { address, .. } | E::StorageWarmed { address, .. } | E::CodeChange { address, .. } => vec![*address],
+                E::AccountDestroyed { address, target, .. } => vec![*address, *target],
+                E::BalanceTransfer { from, to, .. } => vec![*from, *to],
+                E::TransientStorageChange { .. } => vec![],
+                #[allow(unreachable_patterns)]
+                _ => vec![Address::ZERO, Address::repeat_byte(0xff)],
+            };
+            if !addrs.iter().all(|a| keep.contains(a)) {
+                *e = E::TransientStorageChange { key: U256::ZERO, had_value: U256::ZERO, address: Address::ZERO };
+            }
+        }
+        ctx.block.number = env.block.number;
+        ctx.block.timestamp = env.block.timestamp;
+        ctx.block.basefee = env.block.basefee;
+        ctx.block.beneficiary = env.block.beneficiary;
+        ctx.block.prevrandao = env.block.prevrandao;
+        ctx.cfg.chain_id = env.chain_id;
+        ctx.tx.chain_id = Some(env.chain_id);
+        self.active_fork = Some(id);
+        Ok(())
     }
 
     /// Notes where a revert started: the innermost frame that failed with these bytes.
@@ -1838,6 +1985,20 @@ mod tests {
         assert_eq!((info.balance, info.nonce, info.code_hash), (U256::from(5), 5, revm::primitives::KECCAK_EMPTY));
         let url = mock::results(|m, _, _| json!(if m == "eth_getBalance" { "0x" } else { "0x5" }));
         assert!(Remote(Some(Arc::new(Fork::new(&url, Some(7)))), None).basic_ref(Address::ZERO).is_err());
+    }
+
+    #[test]
+    fn artifact_ids() {
+        let art = |file: &str, name: &str| Artifact { name: name.into(), file: file.into(), abi: json!([]), bytecode: "00".into(), deployed: "00".into(), links: Value::Null, deployed_links: Value::Null, immutables: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false, profile: 0 };
+        let arts = [art("src/Game.sol", "Game"), art("src/Game.sol", "Lib"), art("src/v2/Game.sol", "Game")];
+        let find = |what: &str| find_artifact(&arts, what, "0.8.28", 0).map(|a| format!("{}:{}", a.file, a.name));
+        // forge's ids: a version and a profile may follow; the profile isn't read
+        assert_eq!(find("src/Game.sol:Game:0.8.28:default").unwrap(), "src/Game.sol:Game");
+        assert_eq!(find("src/Game.sol:0.8.28").unwrap(), "src/Game.sol:Game");
+        assert_eq!(find("Lib:0.8.28").unwrap(), "src/Game.sol:Lib");
+        assert_eq!(find("v2/Game.sol:Game:0.8.28:tests").unwrap(), "src/v2/Game.sol:Game");
+        assert!(find("Game.sol:Game:0.8.28:default").unwrap_err().contains("several"));
+        assert!(find("src/Game.sol:Game:0.8.27").unwrap_err().contains("0.8.27"));
     }
 
     #[test]

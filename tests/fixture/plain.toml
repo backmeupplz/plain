@@ -1,2 +1,4 @@
 # the fixture runs its TypeScript test too (test/counter.test.ts)
 typescript = true
+# test/Forge.t.sol writes JSON and state dumps here
+fs_permissions = [{ access = "read-write", path = "./tmp" }]

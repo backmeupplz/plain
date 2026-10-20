@@ -17,6 +17,11 @@ pub struct Artifact {
     pub deployed: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub links: Value,
+    /// the deployed code's library placeholders and immutables, as solc reports them (for forge-style artifacts)
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub deployed_links: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub immutables: Value,
     /// test contracts of a sharded file: one artifact per unit (see `UnitMeta`), each running its own tests
     #[serde(default, skip_serializing_if = "is_zero")]
     pub shard: u32,
@@ -29,6 +34,9 @@ pub struct Artifact {
     /// a test or script contract compiled from rewritten sources (not solc's output for the file as written)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rewritten: bool,
+    /// the compiler profile it was compiled with (0: the default; see `profile_of`)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub profile: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -152,6 +160,10 @@ pub enum Scope {
     /// what `plain test [filter]` runs: with a filter, only test files with a matching suite or test
     Tests(crate::test::Filter),
     Deploy(String),
+    /// the files given and what they import (every file, when none is given), less those whose name contains a
+    /// `--skip` word ("test" is .t.sol, "script" .s.sol, as in forge); with `true`, the imported files outside the
+    /// project too (lib/, node_modules), as forge builds them, for its artifact layout
+    Files(Vec<String>, Vec<String>, bool),
 }
 
 /// A random value of this machine's own in the build cache's key, so that a `.plain/cache.json` committed to a repo
@@ -329,6 +341,8 @@ fn pick_version(p: &Project, g: &Graph) -> String {
 
 pub struct Output {
     pub artifacts: Vec<Artifact>,
+    /// the files the scope asked for
+    pub built: Vec<String>,
     pub compiled: usize,
     pub solc: String,
     /// the EVM version the code targets (and tests run under)
@@ -364,6 +378,22 @@ fn target_evm(p: &Project, version: &str) -> String {
 }
 
 pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
+    let libs = matches!(scope, Scope::Files(_, _, true));
+    let (mut out, variants) = build_in(p, force, scope, None);
+    // forge compiles what a test file imports with the test's profile too, and its tests deploy (and link) those
+    // artifacts: the src files that tests under another profile import, compiled again with it
+    for (k, files) in variants {
+        let v = build_in(p, force, Scope::Files(files, vec![], libs), Some(k)).0;
+        out.compiled += v.compiled;
+        out.artifacts.extend(v.artifacts.into_iter().filter(|a| a.profile == k as u32));
+    }
+    out
+}
+
+/// One build, with each file's own profile, or every file with profile `forced` (its own cache), returning what
+/// tests under other profiles need compiled with theirs: profile -> src files.
+fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (Output, BTreeMap<usize, Vec<String>>) {
+    let libs = matches!(scope, Scope::Files(_, _, true));
     let files = p.project_files();
     if files.is_empty() {
         crate::die(&format!("no .sol files under {}", p.dirs.join(", ")));
@@ -381,9 +411,12 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let key = {
         use sha2::Digest;
         // bump the suffix when rewrites change what gets compiled
-        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings:?}{:?}{:?}rw5", salt(), p.restrictions, p.dirs).as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings:?}{:?}{:?}{forced:?}rw6", salt(), p.restrictions, p.dirs).as_bytes()))
     };
-    let cache_path = p.root.join(".plain/cache.json");
+    let cache_path = p.root.join(match forced {
+        Some(k) => format!(".plain/cache-{k}.json"),
+        None => ".plain/cache.json".into(),
+    });
     let mut cache: Cache = std::fs::read(&cache_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -397,6 +430,16 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let script = format!("{}/", p.dirs[2]);
     let wanted: Vec<&String> = match scope {
         Scope::All => files.iter().collect(),
+        Scope::Files(roots, skip, libs) => {
+            let skip: Vec<String> = skip.iter().map(|s| match s.as_str() { "test" | "tests" => ".t.sol".into(), "script" | "scripts" => ".s.sol".into(), s => s.into() }).collect();
+            let kept = |f: &String| !skip.iter().any(|s| f.contains(s.as_str()));
+            let need: std::collections::BTreeSet<String> = match roots.is_empty() {
+                true => files.iter().filter(|f| kept(f)).flat_map(|f| g.closure(f)).collect(),
+                false => roots.iter().flat_map(|r| g.closure(r.strip_prefix("./").unwrap_or(r))).collect(),
+            };
+            let outside = g.files.keys().filter(|f| libs && !files.contains(f) && need.contains(*f));
+            files.iter().filter(|f| need.contains(*f) && kept(f)).chain(outside).collect()
+        }
         Scope::Tests(filter) => {
             // a test file matches by suite id ("file:Contract") or by the name of a test it has, its own or
             // inherited from test files it imports
@@ -461,6 +504,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
             w
         }
     };
+    let built: Vec<String> = wanted.iter().map(|f| f.to_string()).collect();
     let mut iface = std::mem::take(&mut cache.iface);
     let mut changed = |f: &String| {
         cache.files.get(f).is_none_or(|e| if e.code.is_empty() { e.hash != full[f] } else { !e.code.iter().all(|c| own.contains_key(c)) || e.hash != dep_hash(&g, f, &e.code, &own, &mut iface) })
@@ -473,8 +517,12 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
     let out_dir = p.root.join(".plain/out");
     // .plain/out holds solc's output as written: test and script contracts (rewritten) stay out
     let export = |arts: &[Artifact]| {
+        if forced.is_some() {
+            return; // .plain/out holds the default profile's
+        }
         std::fs::create_dir_all(&out_dir).unwrap();
-        for a in arts.iter().filter(|a| a.shard == 0 && !a.rewritten) {
+        // the project's own (lib/ contracts compile for --out only)
+        for a in arts.iter().filter(|a| a.shard == 0 && !a.rewritten && p.dirs.iter().any(|d| a.file.starts_with(&format!("{d}/")))) {
             if !a.bytecode.is_empty() || a.abi.as_array().is_some_and(|x| !x.is_empty()) {
                 let j = json!({"contractName": a.name, "sourceName": a.file, "abi": a.abi, "bytecode": format!("0x{}", a.bytecode), "deployedBytecode": format!("0x{}", a.deployed)});
                 std::fs::write(out_dir.join(format!("{}.json", a.name)), j.to_string()).ok();
@@ -503,7 +551,10 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
         let solc = ensure(&version);
         let v: semver::Version = version.parse().unwrap_or(semver::Version::new(0, 8, 0));
         phase("plan");
-        let plan = Plan::new(p, &g, &files, &dirty, &v, &cache, &own, force);
+        let mut plan = Plan::new(p, &g, &files, &dirty, &v, &cache, &own, force);
+        if let Some(k) = forced {
+            plan.jobs.iter_mut().for_each(|j| j.profile = k);
+        }
         phase("jobs");
         let mut results = run_jobs(&solc, &g, &plan.jobs, &settings, p, &plan.sources, &plan.gen_deps);
         // unoptimized code can run out of stack where optimized code doesn't: those compile as configured
@@ -548,6 +599,7 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 Ok((arts, warns)) => {
                     warnings.extend(warns);
                     for mut a in arts {
+                        a.profile = job.profile as u32;
                         if job.test {
                             a.deploys = plan.deploys.get(&(a.file.clone(), a.name.clone())).cloned().unwrap_or_default();
                             a.rewritten = plan.rewritten.contains(&(a.file.clone(), a.name.clone()));
@@ -566,7 +618,8 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
                 Err(e) => errors.push(e),
             }
         }
-        for w in &warnings {
+        // a profile's second build of the same sources: its warnings are the first's (or about unoptimized sizes)
+        for w in warnings.iter().filter(|_| forced.is_none()) {
             eprintln!("{w}");
         }
         if !errors.is_empty() {
@@ -621,13 +674,24 @@ pub fn build(p: &Project, force: bool, scope: Scope) -> Output {
         phase("done");
         gitignore(p);
     }
-    Output {
+    let mut variants: BTreeMap<usize, std::collections::BTreeSet<String>> = BTreeMap::new();
+    if forced.is_none() {
+        for f in built.iter().filter(|f| rewritten(p, f)) {
+            let k = profile_of(p, &g, f);
+            if k > 0 {
+                variants.entry(k).or_default().extend(g.closure(f).into_iter().filter(|u| (libs || files.contains(u)) && !rewritten(p, u)));
+            }
+        }
+    }
+    let out = Output {
+        built,
         compiled: compiled - reused,
         artifacts: cache.files.into_iter().filter(|(f, _)| !stale.contains(f)).flat_map(|(_, e)| e.contracts).collect(),
         solc: version,
         // tests run under the configured rules, forge's default osaka when there are none
         evm: p.evm_version.clone().unwrap_or(if evm == "osaka" { evm } else { "osaka".into() }),
-    }
+    };
+    (out, variants.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect())
 }
 
 /// One solc run: `files` selected for output; a single sharded file when `shard` is (k, of).
@@ -1175,8 +1239,65 @@ pub fn profile_of(p: &Project, g: &Graph, file: &str) -> usize {
     }
     let closure = g.closure(file);
     let rules: Vec<&crate::project::Restriction> = p.restrictions.iter().filter(|r| closure.iter().any(|f| crate::test::path_matches(&r.paths, f))).collect();
-    let default = crate::project::Profile { optimizer: p.optimizer, runs: p.runs, via_ir: p.via_ir, evm_version: None };
+    let default = crate::project::Profile { name: "default".into(), optimizer: p.optimizer, runs: p.runs, via_ir: p.via_ir, evm_version: None };
     std::iter::once(&default).chain(&p.profiles).position(|x| rules.iter().all(|r| r.allows(x))).unwrap_or_else(|| crate::die(&format!("no compiler profile satisfies the compilation_restrictions for {file}")))
+}
+
+/// The solc version the project compiles with (see `pick_version`).
+pub fn version(p: &Project) -> String {
+    pick_version(p, &Graph::build(p, &p.project_files()))
+}
+
+/// Each contract's storage layout in `files`, as solc reports it: one compile that stops after analysis.
+pub fn layouts(p: &Project, version: &str, files: &[String]) -> HashMap<(String, String), Value> {
+    let g = Graph::build(p, files);
+    let sources: serde_json::Map<String, Value> = files.iter().flat_map(|f| g.closure(f)).map(|u| (u.clone(), json!({"content": g.files[&u].content}))).collect();
+    let mut settings = settings(p, 0);
+    settings["outputSelection"] = Value::Object(files.iter().map(|f| (f.clone(), json!({"*": ["storageLayout"]}))).collect());
+    let out = standard_json(version, &json!({"language": "Solidity", "sources": sources, "settings": settings}), &p.root).unwrap_or_else(|e| crate::die(&e));
+    let mut found = HashMap::new();
+    for (file, cs) in out["contracts"].as_object().into_iter().flatten() {
+        for (name, c) in cs.as_object().into_iter().flatten() {
+            found.insert((file.clone(), name.clone()), c["storageLayout"].clone());
+        }
+    }
+    found
+}
+
+/// Artifacts as forge writes them, `<dir>/<File.sol>/<Contract>.json`, for tools that read Foundry's out/: the
+/// ABI, both bytecodes with their library and immutable references, and the storage layout when there is one.
+pub fn write_forge(dir: &std::path::Path, arts: &[&Artifact], layouts: &HashMap<(String, String), Value>, profiles: &[crate::project::Profile]) {
+    let refs = |v: &Value| if v.is_null() { json!({}) } else { v.clone() };
+    for a in arts {
+        let mut j = json!({
+            "abi": a.abi,
+            "bytecode": {"object": format!("0x{}", a.bytecode), "linkReferences": refs(&a.links)},
+            "deployedBytecode": {"object": format!("0x{}", a.deployed), "linkReferences": refs(&a.deployed_links), "immutableReferences": refs(&a.immutables)},
+        });
+        if let Some(l) = layouts.get(&(a.file.clone(), a.name.clone())).filter(|_| a.profile == 0) {
+            j["storageLayout"] = l.clone();
+        }
+        let d = dir.join(a.file.rsplit('/').next().unwrap_or(&a.file));
+        // forge names a contract compiled with another profile too <Contract>.<profile>.json
+        let name = match a.profile.checked_sub(1).and_then(|i| profiles.get(i as usize)) {
+            Some(x) => format!("{}.{}.json", a.name, x.name),
+            None => format!("{}.json", a.name),
+        };
+        std::fs::create_dir_all(&d).and_then(|_| std::fs::write(d.join(name), serde_json::to_vec_pretty(&j).unwrap())).unwrap_or_else(|e| crate::die(&format!("{}: {e}", d.display())));
+    }
+}
+
+/// forge's `--sizes`: each contract's runtime and init code size against EIP-170 (24576 bytes) and EIP-3860 (49152),
+/// tests and scripts left out. Returns whether all fit.
+pub fn sizes(arts: &[&Artifact]) -> bool {
+    let dev = |a: &Artifact| a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["type"] == "function" && x["name"].as_str().is_some_and(|n| crate::rewrite::is_test_name(n) || n == "IS_TEST" || n == "IS_SCRIPT")));
+    let mut rows: Vec<(String, usize, usize)> = arts.iter().filter(|a| !dev(a) && !a.file.contains("forge-std/") && (!a.bytecode.is_empty() || !a.deployed.is_empty())).map(|a| (a.name.clone(), a.deployed.len() / 2, a.bytecode.len() / 2)).collect();
+    rows.sort();
+    println!("{:<40} {:>17} {:>18} {:>19} {:>20}", "Contract", "Runtime Size (B)", "Initcode Size (B)", "Runtime Margin (B)", "Initcode Margin (B)");
+    for (name, run, init) in &rows {
+        println!("{name:<40} {run:>17} {init:>18} {:>19} {:>20}", 24576 - *run as i64, 49152 - *init as i64);
+    }
+    rows.iter().all(|r| r.1 <= 24576 && r.2 <= 49152)
 }
 
 /// solc's standard JSON output for `input`.
@@ -1277,7 +1398,7 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
     if job.fast {
         settings["optimizer"]["enabled"] = json!(false);
     }
-    let out = json!(["abi", "evm.bytecode.object", "evm.bytecode.linkReferences", "evm.deployedBytecode.object"]);
+    let out = json!(["abi", "evm.bytecode.object", "evm.bytecode.linkReferences", "evm.deployedBytecode.object", "evm.deployedBytecode.linkReferences", "evm.deployedBytecode.immutableReferences"]);
     let sel: serde_json::Map<String, Value> = job
         .files
         .iter()
@@ -1309,7 +1430,10 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
     for (file, cs) in v["contracts"].as_object().into_iter().flatten() {
         for (name, c) in cs.as_object().into_iter().flatten() {
             let links = &c["evm"]["bytecode"]["linkReferences"];
+            let some = |v: &Value| if v.as_object().is_some_and(|o| !o.is_empty()) { v.clone() } else { Value::Null };
             arts.push(Artifact {
+                deployed_links: some(&c["evm"]["deployedBytecode"]["linkReferences"]),
+                immutables: some(&c["evm"]["deployedBytecode"]["immutableReferences"]),
                 name: name.clone(),
                 file: file.clone(),
                 abi: c["abi"].clone(),
@@ -1320,6 +1444,7 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
                 tests: vec![],
                 deploys: vec![],
                 rewritten: false,
+                profile: 0,
             });
         }
     }

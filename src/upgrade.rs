@@ -30,7 +30,7 @@ pub fn proxy_artifacts(p: &Project, version: &str, uups: bool) -> (Artifact, Vec
     for (file, cs) in out["contracts"].as_object().into_iter().flatten() {
         for (name, c) in cs.as_object().into_iter().flatten() {
             let code = |k: &str| c["evm"][k]["object"].as_str().unwrap_or_default().to_string();
-            arts.push(Artifact { name: name.clone(), file: file.clone(), abi: c["abi"].clone(), bytecode: code("bytecode"), deployed: code("deployedBytecode"), links: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false });
+            arts.push(Artifact { name: name.clone(), file: file.clone(), abi: c["abi"].clone(), bytecode: code("bytecode"), deployed: code("deployedBytecode"), links: Value::Null, deployed_links: Value::Null, immutables: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false, profile: 0 });
         }
     }
     let name = if uups { "ERC1967Proxy" } else { "TransparentUpgradeableProxy" };
