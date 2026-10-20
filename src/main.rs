@@ -286,9 +286,23 @@ fn main() {
             let verify = !switch(&mut args, &["--no-verify"]);
             let proxy = switch(&mut args, &["--proxy"]);
             let confirm = switch(&mut args, &["--confirm"]);
+            let slow = switch(&mut args, &["--slow"]);
+            let resume = switch(&mut args, &["--resume"]);
             no_options(&args);
+            if resume {
+                // what a deploy that stopped part way left, as signed then: no build, simulation or key
+                if !args.is_empty() || proxy {
+                    die("plain deploy --resume takes only --network (and --no-verify, --confirm, --slow): it sends what the last deploy there left");
+                }
+                let conn = deploy::connect(&p, &network.unwrap_or_else(|| die("--resume needs --network")));
+                if verify {
+                    let c = conn.chain;
+                    std::thread::spawn(move || rpc::chain_info(c));
+                }
+                return deploy::resume(&p, conn, deploy::Opts { target: String::new(), args, broadcast: true, verify, account, proxy: false, upgrade: None, confirm, slow });
+            }
             if args.is_empty() {
-                die("usage: plain deploy <Contract|script.s.sol> [args...] [--network name|id|url] [--account name] [--broadcast] [--proxy] [--no-verify]");
+                die("usage: plain deploy <Contract|script.s.sol> [args...] [--network name|id|url] [--account name] [--broadcast] [--slow] [--proxy] [--no-verify]\n       plain deploy --resume --network name|id|url");
             }
             let target = args.remove(0);
             // talk to the network while solc compiles
@@ -303,7 +317,7 @@ fn main() {
                     std::thread::spawn(move || rpc::chain_info(c));
                 }
             }
-            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify, account, proxy, upgrade: None, confirm });
+            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify, account, proxy, upgrade: None, confirm, slow });
         }
         "upgrade" => {
             let p = project::Project::load();
@@ -314,9 +328,10 @@ fn main() {
             let verify = !switch(&mut args, &["--no-verify"]);
             let unchecked = switch(&mut args, &["--unsafe-skip-storage-check"]);
             let confirm = switch(&mut args, &["--confirm"]);
+            let slow = switch(&mut args, &["--slow"]);
             no_options(&args);
             if args.is_empty() {
-                die("usage: plain upgrade <proxy name|address> [Contract] [--call function args...] --network net [--account name] [--broadcast]");
+                die("usage: plain upgrade <proxy name|address> [Contract] [--call function args...] --network net [--account name] [--broadcast] [--slow]");
             }
             let proxy = args.remove(0);
             let target = (!args.is_empty()).then(|| args.remove(0));
@@ -331,7 +346,7 @@ fn main() {
                 let c = conn.chain;
                 std::thread::spawn(move || rpc::chain_info(c));
             }
-            deploy::run(&p, out, Some(conn), deploy::Opts { target: plan.target.clone(), args, broadcast, verify, account, proxy: false, upgrade: Some(plan), confirm });
+            deploy::run(&p, out, Some(conn), deploy::Opts { target: plan.target.clone(), args, broadcast, verify, account, proxy: false, upgrade: Some(plan), confirm, slow });
         }
         "verify" => {
             let p = project::Project::load();

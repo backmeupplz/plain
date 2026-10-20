@@ -1,5 +1,6 @@
 //! `plain deploy`: simulate (forked when a network is given), replay each transaction on its own for exact gas,
-//! then sign everything, send without waiting in between, and verify the created contracts on explorers.
+//! then sign everything, send it a window at a time (what uses a new contract only once that's in), and verify the
+//! created contracts on explorers.
 use crate::evm::{self, BroadcastTx, Cheats, Env, SENDER};
 use crate::project::Project;
 use crate::solc::Artifact;
@@ -28,6 +29,8 @@ pub struct Opts {
     pub upgrade: Option<crate::upgrade::Plan>,
     /// with --broadcast: show what will be sent and what it can cost, and send only on a yes
     pub confirm: bool,
+    /// forge's --slow: send one transaction at a time, each after the last one's receipt
+    pub slow: bool,
 }
 
 /// The network as of now, fetched in one round trip while solc compiles.
@@ -193,6 +196,7 @@ fn describe(tx: &BroadcastTx, names: &HashMap<Address, String>) -> String {
 }
 
 /// A transaction as the chain will run it: on its own, after the ones before it.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Sim {
     /// gas used, as the receipt will say
     gas: u64,
@@ -200,6 +204,8 @@ struct Sim {
     spent: u64,
     /// contracts it creates (directly, through the CREATE2 deployer, or nested), with their init code
     creates: Vec<(Address, Bytes)>,
+    /// accounts it called or ran the code of
+    touched: std::collections::HashSet<Address>,
 }
 
 /// What a simulation of the deploy produced.
@@ -209,6 +215,59 @@ struct Planned {
     libs: HashMap<String, Address>,
     /// proxies this deploys or upgrades, to point Etherscan at their implementation
     proxies: Vec<Address>,
+}
+
+/// A transaction signed and ready to go, with what recording what it makes takes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Left {
+    /// its number in the deploy, from 1
+    n: usize,
+    tx: BroadcastTx,
+    sim: Sim,
+    nonce: u64,
+    hash: B256,
+    raw: Bytes,
+    /// what explorers need to verify the contracts it creates
+    records: Vec<(Address, Record)>,
+}
+
+/// Signed transactions to send, kept in .plain/deploys/<chain id>-resume.json from before the first goes out until
+/// all are in: what didn't get on chain is there for `plain deploy --resume`, and no new deploy to the chain starts
+/// meanwhile (its nonces are this one's).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Resume {
+    names: HashMap<Address, String>,
+    /// proxies to point Etherscan at their implementation
+    proxies: Vec<Address>,
+    left: Vec<Left>,
+    /// why what's left can't be sent any more (a transaction before it failed), when some of it was sent and may
+    /// still land
+    #[serde(default)]
+    void: Option<String>,
+}
+
+fn resume_path(p: &Project, conn: &Conn) -> std::path::PathBuf {
+    p.root.join(format!(".plain/deploys/{}-resume.json", conn.chain))
+}
+
+/// Sends what a deploy that stopped part way left, as it was signed then: nothing is simulated or signed again, so
+/// what landed meanwhile or is still in the pool is recognized as such.
+pub fn resume(p: &Project, conn: Conn, o: Opts) {
+    let path = resume_path(p, &conn);
+    let shown = path.strip_prefix(&p.root).unwrap_or(&path).display().to_string();
+    let r: Resume = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| die(&format!("nothing to resume on {}: there's no {shown}", conn.name)));
+    if let Some(why) = &r.void {
+        die(&format!("{why}, and the rest of that deploy counted on it, so it can't be resumed. Once none of what was sent can still land (each is on chain or dropped), delete {shown} and deploy afresh"));
+    }
+    check_resume(&conn.url, &r.left).unwrap_or_else(|e| die(&e));
+    for l in &r.left {
+        println!("{}. {} (from {}, nonce {})", l.n, describe(&l.tx, &r.names), l.tx.from, l.nonce);
+    }
+    if o.confirm && !crate::ui::confirm(&format!("Send the {} transaction(s) left to {}?", r.left.len(), conn.name)) {
+        println!("nothing sent");
+        return;
+    }
+    broadcast(p, &conn, &o, r);
 }
 
 /// Whether an RPC is a node on this machine (a local chain, or a fork of a live one): nothing it deploys is verified.
@@ -239,6 +298,11 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     decode::init(&arts);
     if o.broadcast && conn.is_none() {
         die("--broadcast needs --network <name|chain id|url>");
+    }
+    // an unfinished deploy's signed transactions may still land, at the nonces a new one would use
+    if let Some(c) = conn.as_ref().filter(|c| o.broadcast && resume_path(p, c).exists()) {
+        let path = resume_path(p, c);
+        die(&format!("an earlier deploy to {} didn't finish ({}), and its signed transactions may still land at the nonces a new one would use. Finish it with plain deploy --resume --network {}; or, once none of them can land any more, delete that file and deploy afresh", c.name, path.strip_prefix(&p.root).unwrap_or(&path).display(), c.name));
     }
     let recorded = o.account.as_deref().and_then(crate::account::address);
     // with --confirm and a keystore that records its address, the password comes after the plan is shown
@@ -482,23 +546,58 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         })
         .collect();
 
-    let landed = send(p, &conn, &txs, &sims, &keys, &cheats.names, fork.as_ref().map_or(conn.block, |f| f.block()));
-    let all_ok = landed.iter().all(|l| l.is_some_and(|(_, ok)| ok));
+    let signed = sign(&conn, &txs, &sims, &keys, fork.as_ref().map_or(conn.block, |f| f.block()));
+    let left = txs.into_iter().zip(sims).zip(signed).zip(planned).enumerate().map(|(i, (((tx, sim), (nonce, hash, raw)), records))| Left { n: i + 1, tx, sim, nonce, hash, raw, records }).collect();
+    broadcast(p, &conn, &o, Resume { names: cheats.names.clone(), proxies, left, void: None });
+    if o.proxy {
+        println!("{} is upgradeable: plain upgrade {} --network {}", art.name, art.name, conn.name);
+    }
+}
+
+/// Sends signed transactions (see send), saves where what they made landed and what explorers need to verify it,
+/// keeps what didn't get on chain for --resume, and verifies. Dies unless everything went through.
+fn broadcast(p: &Project, conn: &Conn, o: &Opts, r: Resume) {
+    // forge's --slow: one at a time; a node on this machine takes everything at once
+    let window = if o.slow { 1 } else if local(&conn.url) || matches!(conn.chain, 31337 | 1337) { usize::MAX } else { 8 };
+    // until it's all in, what's signed is kept for --resume (even if plain is stopped): in .plain, which `plain init`
+    // keeps out of git
+    let path = resume_path(p, conn);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
+    let (landed, deployed, sent) = send(conn, &r.left, &r.names, window);
+    if !deployed.is_empty() {
+        let path = addresses_path(p, conn);
+        let mut all = addresses(p, conn);
+        all.extend(deployed);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&all).unwrap() + "\n").unwrap();
+        println!("addresses saved to {}", path.strip_prefix(&p.root).unwrap_or(&path).display());
+    }
     // records for what made it on chain, whatever happened to the rest
     let mut recs = BTreeMap::new();
-    for (l, created) in landed.iter().zip(planned) {
-        if let Some((hash, true)) = l {
-            for (addr, mut r) in created {
-                r.tx = Some(*hash);
-                recs.insert(addr, r);
+    for (l, ok) in r.left.iter().zip(&landed) {
+        if *ok == Some(true) {
+            for (addr, rec) in &l.records {
+                recs.insert(*addr, Record { tx: Some(l.hash), ..rec.clone() });
             }
         }
     }
     let mut all = crate::verify::load(p, conn.chain);
     all.extend(recs.clone());
     crate::verify::save(p, conn.chain, &all);
-    if o.proxy && all_ok {
-        println!("{} is upgradeable: plain upgrade {} --network {}", art.name, art.name, conn.name);
+    // a proxy this deploy makes is pointed at its implementation once it's on chain; one it upgrades, always
+    let link: Vec<Address> = r.proxies.iter().copied().filter(|px| all.contains_key(px) || !r.left.iter().any(|l| l.sim.creates.iter().any(|c| c.0 == *px))).collect();
+    // what didn't get on chain stays for --resume; after a failed transaction, which the rest counts on, it can't
+    // be resumed, but stays (blocking new deploys) if some of it was sent and may still land
+    let failed = r.left.iter().zip(&landed).find(|(_, l)| **l == Some(false)).map(|(l, _)| l.n);
+    let in_flight = landed[..sent].contains(&None);
+    let rest: Vec<Left> = r.left.into_iter().zip(&landed).filter(|(_, l)| l.is_none()).map(|(l, _)| l).collect();
+    let resumable = !rest.is_empty() && failed.is_none();
+    if resumable || (failed.is_some() && in_flight) {
+        let void = failed.map(|n| format!("transaction {n} of the deploy to {} didn't go through", conn.name));
+        std::fs::write(&path, serde_json::to_vec(&Resume { left: rest, void, ..r }).unwrap()).unwrap();
+    } else {
+        std::fs::remove_file(&path).ok();
     }
     if !recs.is_empty() {
         if !o.verify {
@@ -510,16 +609,20 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
             let ok = crate::verify::run(p, conn.chain, &mut recs);
             all.extend(recs);
             crate::verify::save(p, conn.chain, &all);
-            for px in proxies.iter().filter(|px| all.contains_key(*px) || o.upgrade.as_ref().is_some_and(|u| u.proxy == **px)) {
-                crate::verify::link_proxy(p, conn.chain, *px);
+            for px in link {
+                crate::verify::link_proxy(p, conn.chain, px);
             }
             if !ok {
                 println!("retry the failed ones with: plain verify --network {}", conn.name);
             }
         }
     }
-    if !all_ok {
-        die("not every transaction went through (see above)");
+    if resumable {
+        die(&format!("not everything got on chain; to send the rest as signed: plain deploy --resume --network {}", conn.name));
+    }
+    if let Some(n) = failed {
+        let wait = if in_flight { format!("; some of what was sent after it may still land, so a new deploy to {} waits until {} is deleted", conn.name, path.strip_prefix(&p.root).unwrap_or(&path).display()) } else { String::new() };
+        die(&format!("transaction {n} didn't go through (see above){wait}"));
     }
 }
 
@@ -572,7 +675,9 @@ fn replay(fork: Option<Arc<evm::Fork>>, env: &Env, txs: &[BroadcastTx], arts: &A
     let mut out = vec![];
     for (i, tx) in txs.iter().enumerate() {
         let n = vm.cheats().creates.len();
+        vm.cheats().touched = Some(Default::default());
         let r = vm.call(tx.from, tx.to.map(TxKind::Call).unwrap_or(TxKind::Create), tx.data.clone(), tx.value, true);
+        let touched = vm.cheats().touched.take().unwrap_or_default();
         if !r.ok {
             die(&format!("transaction {} would revert on chain: {}", i + 1, why(&r.output)));
         }
@@ -580,7 +685,7 @@ fn replay(fork: Option<Arc<evm::Fork>>, env: &Env, txs: &[BroadcastTx], arts: &A
         if tx.to == Some(evm::CREATE2_DEPLOYER) && creates.is_empty() {
             die(&format!("transaction {} goes through the CREATE2 deployer {}, which this chain doesn't have", i + 1, evm::CREATE2_DEPLOYER));
         }
-        out.push(Sim { gas: r.gas, spent: r.spent, creates });
+        out.push(Sim { gas: r.gas, spent: r.spent, creates, touched });
     }
     out
 }
@@ -601,25 +706,24 @@ fn cost(conn: &Conn, who: Address, txs: &[BroadcastTx], sims: &[Sim]) -> u128 {
     txs.iter().zip(sims).filter(|(t, _)| t.from == who).map(|(t, s)| gas_limit(conn, s) as u128 * fees(conn).0 + t.value.to::<u128>()).sum()
 }
 
-/// Signs every transaction up front, sends them back to back (nonces keep them in order), then waits for all
-/// receipts at once. Returns each transaction's hash and whether it went through, None for one that didn't get on
-/// chain; saves the addresses of what did.
-fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &HashMap<Address, B256>, names: &HashMap<Address, String>, at: u64) -> Vec<Option<(B256, bool)>> {
+/// Signs every transaction, each sender's from its next nonce, which has to be the one the simulation ran with at
+/// block `at`. Returns each one's nonce, hash and encoding.
+fn sign(conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &HashMap<Address, B256>, at: u64) -> Vec<(u64, B256, Bytes)> {
     let url = &conn.url;
     let mut senders: Vec<Address> = txs.iter().map(|t| t.from).collect();
     senders.sort();
     senders.dedup();
+    let mut nonces = next_nonces(url, &senders).unwrap_or_else(|e| die(&e));
     let block = format!("0x{at:x}");
-    let calls: Vec<(&str, Value)> = senders.iter().flat_map(|a| [("eth_getTransactionCount", json!([a, "pending"])), ("eth_getBalance", json!([a, "latest"])), ("eth_getTransactionCount", json!([a, block]))]).collect();
+    let calls: Vec<(&str, Value)> = senders.iter().flat_map(|a| [("eth_getBalance", json!([a, "latest"])), ("eth_getTransactionCount", json!([a, block]))]).collect();
     let r = rpc::batch(url, &calls).unwrap_or_else(|e| die(&e));
-    let mut nonces: HashMap<Address, u64> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[3 * i], &format!("{a}'s pending nonce")) as u64)).collect();
-    let balances: HashMap<Address, u128> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[3 * i + 1], &format!("{a}'s balance")))).collect();
+    let balances: HashMap<Address, u128> = senders.iter().enumerate().map(|(i, a)| (*a, hexnum(&r[2 * i], &format!("{a}'s balance")))).collect();
     // contracts land at addresses that follow from the sender's nonce, and later transactions call them there: if
     // the next nonce isn't the one the simulation ran with, they'd call where nothing is
     for (i, a) in senders.iter().enumerate() {
-        let (next, simulated) = (nonces[a], hexnum(&r[3 * i + 2], &format!("{a}'s nonce at block {at}")) as u64);
+        let (next, simulated) = (nonces[a], hexnum(&r[2 * i + 1], &format!("{a}'s nonce at block {at}")) as u64);
         if next != simulated {
-            die(&format!("{a}'s next nonce is {next}, but the simulation ran at nonce {simulated}: a transaction of its own is pending or just landed. Once it's in, run this again"));
+            die(&format!("{a}'s next nonce is {next}, but the simulation ran at nonce {simulated}: a transaction of its own just landed. Run this again"));
         }
     }
     let (max_fee, prio) = fees(conn);
@@ -645,8 +749,8 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
             let sig = sign(t.signature_hash());
             t.into_signed(sig).into()
         };
+        signed.push((*nonce, *env.tx_hash(), env.encoded_2718().into()));
         *nonce += 1;
-        signed.push((*env.tx_hash(), env.encoded_2718()));
     }
     for (a, need) in &cost {
         let have = balances[a];
@@ -655,41 +759,102 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
             die(&format!("{a} has {} {sym} but these transactions can cost up to {} {sym} (at a {} gwei max fee); fund it first", eth(have), eth(*need), max_fee as f64 / 1e9));
         }
     }
-    let t = Instant::now();
-    let raw = |i: usize| ("eth_sendRawTransaction", json!([format!("0x{}", hex::encode(&signed[i].1))]));
-    // the first on its own: a fee, balance or chain problem stops the deploy before anything else is in the pool.
-    // The rest in one batch, in nonce order (a round trip each would cost seconds on a remote RPC)
-    let mut results = vec![rpc::call(url, raw(0).0, raw(0).1)];
-    if results[0].is_ok() && signed.len() > 1 {
-        let calls: Vec<(&str, Value)> = (1..signed.len()).map(raw).collect();
-        // a batch that failed as a whole may still have gone through: its transactions are looked for below
-        results.extend(rpc::batch_each(url, &calls).unwrap_or_else(|e| vec![Err(format!("unknown: {e}")); calls.len()]));
-    }
-    // the transactions that are (or may be) in the pool, in order; the first rejected one ends it
-    let mut sent = 0;
-    for (i, r) in results.into_iter().enumerate() {
-        let r = match r {
-            // a node that ran the batch out of order: again, now that the nonces before it are in
-            Err(e) if e.contains("nonce too high") || e.contains("gap") => rpc::call(url, raw(i).0, raw(i).1),
-            r => r,
-        };
-        let known = |e: &str| ["already known", "known transaction", "already imported"].iter().any(|k| e.to_lowercase().contains(k));
-        // "nonce too low": ours, mined while a rate-limited request was retried, if the chain has it
-        let mined = |e: &str| e.contains("nonce too low") && rpc::call(url, "eth_getTransactionByHash", json!([signed[i].0])).is_ok_and(|v| !v.is_null());
-        match r {
-            Err(e) if !known(&e) && !e.starts_with("unknown: ") && !mined(&e) => {
-                eprintln!("transaction {} rejected: {e}", i + 1);
-                if i + 1 < signed.len() && i > 0 {
-                    eprintln!("the {} after it went out in the same batch and wait behind its nonce", signed.len() - i - 1);
-                }
-                break;
+    signed
+}
+
+/// Each sender's next nonce, refusing while one has transactions waiting in a node's pool: those (an aborted run's,
+/// say) can land later at nonces this run uses, and put contracts that aren't the plan's where it puts its own.
+fn next_nonces(url: &str, senders: &[Address]) -> Result<HashMap<Address, u64>, String> {
+    let calls: Vec<(&str, Value)> = senders.iter().flat_map(|a| [("eth_getTransactionCount", json!([a, "latest"])), ("eth_getTransactionCount", json!([a, "pending"]))]).collect();
+    let mut tries = 0;
+    loop {
+        let r = rpc::batch(url, &calls)?;
+        let n = |v: &Value| rpc::quantity(v).map(|n| n.saturating_to::<u64>());
+        let mut next = HashMap::new();
+        let mut waiting = None;
+        for (i, a) in senders.iter().enumerate() {
+            let (latest, pending) = (n(&r[2 * i]).map_err(|e| format!("{a}'s nonce: {e}"))?, n(&r[2 * i + 1]).map_err(|e| format!("{a}'s pending nonce: {e}"))?);
+            if pending != latest {
+                waiting = Some(format!("{a} has transactions waiting in a node's pool (nonce {latest} on chain, {pending} counting the pool): wait until they land or drop, then run this again"));
             }
-            _ => sent = i + 1,
+            next.insert(*a, latest);
+        }
+        // (a load-balanced RPC's nodes can be a block apart for a moment)
+        match waiting {
+            Some(e) if tries == 2 => return Err(e),
+            Some(_) => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(if cfg!(test) { 1 } else { 2000 }));
+            }
+            None => return Ok(next),
         }
     }
-    println!("sent {sent}/{} transactions to {} in {:.1?}; waiting for receipts", signed.len(), conn.name, t.elapsed());
+}
 
-    let mut receipts: Vec<Option<Value>> = vec![None; sent];
+/// Whether the chain's copy of a transaction (eth_getTransactionByHash) is exactly the planned one: sender, nonce,
+/// target, input and value.
+fn exact(l: &Left, got: &Value) -> bool {
+    let addr = |v: &Value| v.as_str().and_then(|s| s.parse::<Address>().ok());
+    let input = got["input"].as_str().and_then(|s| hex::decode(s.trim_start_matches("0x")).ok());
+    addr(&got["from"]) == Some(l.tx.from) && rpc::quantity(&got["nonce"]).ok() == Some(U256::from(l.nonce)) && addr(&got["to"]) == l.tx.to && input.as_deref() == Some(&l.tx.data[..]) && rpc::quantity(&got["value"]).ok() == Some(l.tx.value)
+}
+
+/// What --resume checks first: nothing waiting in a pool, and every nonce of what's left that the chain has used
+/// taken by exactly that transaction of the plan.
+fn check_resume(url: &str, left: &[Left]) -> Result<(), String> {
+    let mut senders: Vec<Address> = left.iter().map(|l| l.tx.from).collect();
+    senders.sort();
+    senders.dedup();
+    let next = next_nonces(url, &senders)?;
+    let used: Vec<&Left> = left.iter().filter(|l| l.nonce < next[&l.tx.from]).collect();
+    let got = rpc::batch(url, &used.iter().map(|l| ("eth_getTransactionByHash", json!([l.hash]))).collect::<Vec<_>>())?;
+    if let Some((l, _)) = used.iter().zip(&got).find(|(l, g)| !exact(l, g)) {
+        return Err(format!("nonce {} of {} is taken, and not by transaction {} of this deploy ({}): not resuming", l.nonce, l.tx.from, l.n, l.hash));
+    }
+    for a in &senders {
+        if let Some(l) = left.iter().find(|l| l.tx.from == *a && l.nonce >= next[a]).filter(|l| l.nonce != next[a]) {
+            return Err(format!("{a}'s next nonce is {}, but what's left of the deploy goes on at {}: not resuming", next[a], l.nonce));
+        }
+    }
+    Ok(())
+}
+
+/// Sends signed transactions in nonce order, at most `window` of a sender in the pool at once, waiting for receipts
+/// in between (public RPCs rate-limit, and op-geth keeps about 16 per sender, dropping the rest). A transaction's
+/// hash is the truth: a node can answer a send with an error and still take it, so an error is looked up by hash
+/// first, and what's sent again is only ever what was signed. One counts as in once the chain has exactly it with
+/// success. Sending stops at the first rejection, revert or mismatch; what uses a contract an earlier transaction
+/// creates goes out only once that one is in, and the last transaction (a script's final upgradeAndCall, say) only
+/// once everything before it is. Returns whether each went through (None: not on chain), the addresses made, and
+/// how many were sent.
+fn send(conn: &Conn, left: &[Left], names: &HashMap<Address, String>, window: usize) -> (Vec<Option<bool>>, BTreeMap<String, String>, usize) {
+    let url = &conn.url;
+    let t = Instant::now();
+    let n = left.len();
+    let raw = |i: usize| ("eth_sendRawTransaction", json!([format!("0x{}", hex::encode(&left[i].raw))]));
+    // a transaction that calls or passes on a contract an earlier one creates goes out only once that one is in
+    // with success: if the create fails or is dropped, nothing that uses it gets mined
+    let deps: Vec<Vec<usize>> = (0..n).map(|j| (0..j).filter(|&i| left[i].sim.creates.iter().any(|(a, _)| left[j].tx.to == Some(*a) || left[j].sim.touched.contains(a) || left[j].tx.data.windows(20).any(|w| w == a.as_slice()))).collect()).collect();
+    let known = |e: &str| ["already known", "known transaction", "already imported"].iter().any(|k| e.to_lowercase().contains(k));
+    // rate limits, timeouts, and a node that lost an earlier nonce: sent again on a later round
+    let later = |e: &str| rpc::transient(e) || e.contains("nonce too high") || e.contains("gap");
+    let pause = |ms: u64| std::thread::sleep(Duration::from_millis(if cfg!(test) { 1 } else { ms }));
+    // whether the chain or a pool has it, asked `k` times 2 s apart: a node may answer a send with an error and
+    // still have it (one forwarding to a sequencer, say), and a load-balanced RPC's nodes lag one another
+    let has = |j: usize, k: u32| {
+        (0..k).any(|t| {
+            if t > 0 {
+                pause(2000);
+            }
+            rpc::call(url, "eth_getTransactionByHash", json!([left[j].hash])).is_ok_and(|v| !v.is_null())
+        })
+    };
+    // "nonce too low" for a transaction the chain doesn't have: its nonce went to another one, so it never lands
+    let taken = |j: usize| json!({"status": "taken", "why": format!("nonce {} of {} is taken by a transaction that isn't this deploy's", left[j].nonce, left[j].tx.from)});
+    let ok = |r: &Option<Value>| r.as_ref().is_some_and(|r| r["status"] == "0x1");
+    let mut receipts: Vec<Option<Value>> = vec![None; n];
+    // [0, sent) are in a pool or on chain; `stop` ends sending, though what's out is still waited for
+    let (mut sent, mut stop, mut busy) = (0, None::<String>, 0);
     let mut next = 0;
     let mut deployed: BTreeMap<String, String> = BTreeMap::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -698,60 +863,140 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
     // them (anvil does when one doesn't fit in a block; public mempools evict): send what's pending again,
     // nodes answer "already known" otherwise
     let mut seen = 0;
-    while next < sent {
-        let pending: Vec<usize> = (0..sent).filter(|i| receipts[*i].is_none()).collect();
-        // a sender's transactions are mined in nonce order: ask for each sender's first pending receipt, and for
-        // the rest once one of those is in (public RPCs rate-limit per call, batched or not)
-        let heads: Vec<usize> = pending.iter().copied().filter(|&i| !pending.iter().any(|&j| j < i && txs[j].from == txs[i].from)).collect();
-        let (mut block, mut progress, mut polled) = (0, false, false);
-        for ask in [heads, pending.clone()] {
-            let ask: Vec<usize> = ask.into_iter().filter(|i| receipts[*i].is_none()).collect();
-            if ask.is_empty() || (polled && !progress) {
+    while next < sent || (stop.is_none() && sent < n) {
+        // what may go out now: up to `window` of one sender in the pool (the first transaction alone until it's in, so
+        // a fee, balance or chain problem stops the deploy before anything else is sent), in the script's order
+        // across senders, nothing waiting on an unconfirmed create, and the last transaction only once everything
+        // before it is in. A node on this machine (no window) takes the rest at once: nothing real is at stake there,
+        // and its blocks are what a deploy waits on
+        let mut batch = vec![];
+        let cap = if receipts[0].is_none() { 1 } else { window };
+        let gated = window != usize::MAX;
+        while stop.is_none() && sent + batch.len() < n {
+            let j = sent + batch.len();
+            let waiting: Vec<usize> = (0..j).filter(|&i| receipts[i].is_none()).collect();
+            let blocked = (gated && (deps[j].iter().any(|&i| !ok(&receipts[i])) || (j + 1 == n && !(0..j).all(|i| ok(&receipts[i]))))) || waiting.iter().any(|&i| left[i].tx.from != left[j].tx.from) || waiting.len() >= cap;
+            if blocked {
                 break;
             }
-            let mut calls: Vec<(&str, Value)> = ask.iter().map(|i| ("eth_getTransactionReceipt", json!([signed[*i].0]))).collect();
+            batch.push(j);
+        }
+        if !batch.is_empty() {
+            let calls: Vec<(&str, Value)> = batch.iter().map(|&j| raw(j)).collect();
+            // a batch that failed as a whole may still have gone through: each is looked up below
+            let results = rpc::batch_each(url, &calls).unwrap_or_else(|e| vec![Err(e); calls.len()]);
+            let before = sent;
+            for (&j, r) in batch.iter().zip(results) {
+                let Err(e) = r else {
+                    sent = j + 1;
+                    continue;
+                };
+                // its hash decides, given a few seconds to show up unless the node was only busy
+                if known(&e) || has(j, if later(&e) { 1 } else { 6 }) {
+                    if !known(&e) {
+                        eprintln!("{}. the RPC answered {e:?}, but has the transaction", left[j].n);
+                    }
+                    sent = j + 1;
+                    continue;
+                }
+                if e.contains("nonce too low") {
+                    receipts[j] = Some(taken(j));
+                    sent = j + 1;
+                    stop = Some(taken(j)["why"].as_str().unwrap().into());
+                } else if !later(&e) {
+                    stop = Some(format!("transaction {} rejected: {e}", left[j].n));
+                } else if busy == 10 {
+                    stop = Some(format!("transaction {} couldn't be sent: {e}", left[j].n));
+                }
+                busy += 1;
+                break;
+            }
+            if sent > before {
+                busy = 0;
+                last = Instant::now();
+            } else if stop.is_none() {
+                rpc::backoff(busy.min(4) as u32);
+            }
+        }
+        let pending: Vec<usize> = (next..sent).filter(|i| receipts[*i].is_none()).collect();
+        if pending.is_empty() {
+            continue;
+        }
+        // a sender's transactions are mined in nonce order: ask for each sender's first pending receipt, and for
+        // the rest once one of those is in (public RPCs rate-limit per call, batched or not)
+        let heads: Vec<usize> = pending.iter().copied().filter(|&i| !pending.iter().any(|&j| j < i && left[j].tx.from == left[i].tx.from)).collect();
+        let (mut block, mut polled) = (0, false);
+        let mut found: Vec<(usize, Value)> = vec![];
+        for ask in [heads, pending.clone()] {
+            let ask: Vec<usize> = ask.into_iter().filter(|i| !found.iter().any(|(j, _)| j == i)).collect();
+            if ask.is_empty() || (polled && found.is_empty()) {
+                break;
+            }
+            let mut calls: Vec<(&str, Value)> = ask.iter().map(|i| ("eth_getTransactionReceipt", json!([left[*i].hash]))).collect();
             calls.push(("eth_blockNumber", json!([])));
             let Ok(mut rs) = rpc::batch_each(url, &calls) else { break };
             polled = true;
             // 0 (unknown) only means no resend this round
             block = rs.pop().and_then(|b| b.ok()).and_then(|b| rpc::quantity(&b).ok()).map_or(0, |b| b.saturating_to::<u128>());
-            for (i, r) in ask.iter().zip(rs) {
-                if let Ok(r) = r.and_then(|r| if r.is_null() { Err(String::new()) } else { Ok(r) }) {
-                    receipts[*i] = Some(r);
-                    last = Instant::now();
-                    progress = true;
+            found.extend(ask.iter().zip(rs).filter_map(|(i, r)| Some((*i, r.ok().filter(|r| !r.is_null())?))));
+        }
+        // a receipt counts once the chain's copy of the transaction is exactly the planned one (else it's asked again)
+        let mut progress = false;
+        let calls: Vec<(&str, Value)> = found.iter().map(|(i, _)| ("eth_getTransactionByHash", json!([left[*i].hash]))).collect();
+        if let Ok(got) = rpc::batch_each(url, &calls) {
+            for ((i, mut r), got) in found.into_iter().zip(got) {
+                let Some(got) = got.ok().filter(|g| !g.is_null()) else { continue };
+                let tx = &left[i].tx;
+                let made = r["contractAddress"].as_str().and_then(|a| a.parse::<Address>().ok());
+                if !exact(&left[i], &got) || (tx.to.is_none() && tx.created.is_some() && made != tx.created) {
+                    r["status"] = json!("not as planned");
                 }
+                if r["status"] != "0x1" && stop.is_none() {
+                    stop = Some(format!("transaction {} {}", left[i].n, if r["status"] == "0x0" { "reverted on chain" } else { "is on chain, but isn't the planned transaction" }));
+                }
+                receipts[i] = Some(r);
+                last = Instant::now();
+                progress = true;
             }
         }
         if polled {
             if progress || seen == 0 {
                 seen = block;
             } else if block > seen {
-                rpc::batch_each(url, &pending.iter().take(16).map(|&i| raw(i)).collect::<Vec<_>>()).ok();
+                let again: Vec<usize> = pending.iter().copied().take(16).collect();
+                for (i, r) in again.iter().zip(rpc::batch_each(url, &again.iter().map(|&i| raw(i)).collect::<Vec<_>>()).unwrap_or_default()) {
+                    if r.is_err_and(|e| e.contains("nonce too low")) && !has(*i, 6) {
+                        receipts[*i] = Some(taken(*i));
+                        stop.get_or_insert_with(|| taken(*i)["why"].as_str().unwrap().into());
+                    }
+                }
                 seen = block;
             }
         }
         while let Some(Some(receipt)) = receipts.get(next) {
-            let (i, tx) = (next, &txs[next]);
-            let ok = receipt["status"] == "0x1";
-            let gas = rpc::quantity(&receipt["gasUsed"]).map_or("?".into(), |g| g.to_string());
-            let mut line = format!("{}. {} {} gas {gas}", i + 1, if ok { "ok" } else { "REVERTED" }, signed[i].0);
+            let (l, tx) = (&left[next], &left[next].tx);
+            let good = receipt["status"] == "0x1";
+            let gas = rpc::quantity(&receipt["gasUsed"]).map_or(String::new(), |g| format!(" gas {g}"));
+            let what = match receipt["status"].as_str() {
+                Some("0x1") => "ok",
+                Some("0x0") => "REVERTED",
+                Some("taken") => "NONCE TAKEN",
+                _ => "NOT AS PLANNED",
+            };
+            let mut line = format!("{}. {what} {}{gas}", l.n, l.hash);
             let addr = match tx.to {
                 None => receipt["contractAddress"].as_str().and_then(|a| a.parse::<Address>().ok()),
-                Some(evm::CREATE2_DEPLOYER) => sims[i].creates.first().map(|c| c.0),
+                Some(evm::CREATE2_DEPLOYER) => l.sim.creates.first().map(|c| c.0),
                 _ => None,
             };
-            if let Some(addr) = addr.filter(|_| ok) {
-                if tx.created.is_some_and(|c| c != addr) {
-                    eprintln!("warning: {addr} differs from simulated address {} (nonce changed?)", tx.created.unwrap());
-                }
-                let name = tx.created.and_then(|c| names.get(&c).cloned()).unwrap_or_else(|| format!("contract-{i}"));
+            if let Some(addr) = addr.filter(|_| good) {
+                let name = tx.created.and_then(|c| names.get(&c).cloned()).unwrap_or_else(|| format!("contract-{}", l.n - 1));
                 line += &format!(" -> {name} at {addr}");
                 // a name made more than once (proxies, say) keeps the latest under the name, earlier ones as name#n
                 if let Some(old) = deployed.remove(&name) {
-                    deployed.insert(format!("{name}#{}", index[&name] + 1), old);
+                    deployed.insert(format!("{name}#{}", index[&name]), old);
                 }
-                index.insert(name.clone(), i);
+                index.insert(name.clone(), l.n);
                 deployed.insert(name, addr.to_checksum(None));
             }
             println!("{line}");
@@ -759,21 +1004,38 @@ fn send(p: &Project, conn: &Conn, txs: &[BroadcastTx], sims: &[Sim], keys: &Hash
         }
         if next < sent {
             if last.elapsed() > Duration::from_secs(300) {
-                eprintln!("no receipt for {} after 5 minutes; it may still land (plain verify can verify it later)", signed[next].0);
+                eprintln!("no receipt for {} after 5 minutes; it may still land", left[next].hash);
+                stop.get_or_insert_with(|| format!("transaction {} wasn't mined", left[next].n));
                 break;
             }
-            std::thread::sleep(Duration::from_millis(250));
+            pause(250);
         }
     }
-    if !deployed.is_empty() {
-        let path = addresses_path(p, conn);
-        let mut all = addresses(p, conn);
-        all.extend(deployed);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_string_pretty(&all).unwrap() + "\n").unwrap();
-        println!("addresses saved to {}", path.strip_prefix(&p.root).unwrap_or(&path).display());
+    println!("sent {sent}/{n} transactions to {} in {:.1?}", conn.name, t.elapsed());
+    if let Some(why) = &stop {
+        // what's where, by nonce
+        eprintln!("stopped: {why}");
+        let state = |i: usize| match &receipts[i] {
+            Some(r) if r["status"] == "0x1" => "on chain",
+            Some(r) if r["status"] == "0x0" => "on chain, reverted",
+            Some(r) if r["status"] == "taken" => "nonce taken by another transaction",
+            Some(_) => "on chain, not as planned",
+            None if i < sent => "sent, no receipt yet",
+            None => "not sent",
+        };
+        let mut i = 0;
+        while i < n {
+            let (a, mut b) = (&left[i], i);
+            while b + 1 < n && state(b + 1) == state(i) && left[b + 1].tx.from == a.tx.from {
+                b += 1;
+            }
+            let z = &left[b];
+            let which = if b == i { format!("{}. nonce {}", a.n, a.nonce) } else { format!("{}-{}. nonces {}-{}", a.n, z.n, a.nonce, z.nonce) };
+            eprintln!("  {which} from {}: {}", a.tx.from, state(i));
+            i = b + 1;
+        }
     }
-    (0..signed.len()).map(|i| receipts.get(i).and_then(|r| r.as_ref()).map(|r| (signed[i].0, r["status"] == "0x1"))).collect()
+    (receipts.iter().map(|r| r.as_ref().map(|r| r["status"] == "0x1")).collect(), deployed, sent)
 }
 
 /// The gas a transaction is sent with: 30% over what the simulation spent before refunds (refunds come back only
@@ -797,5 +1059,209 @@ fn eth(wei: u128) -> String {
         0.0 => "0".into(),
         v if v < 0.001 => format!("{v:.9}"),
         v => format!("{v:.6}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A chain behind a public RPC, the way Base's looked on a 34-transaction upgrade: every third request
+    /// rate-limited, two transactions mined per block (a block per eth_blockNumber), and a sender's transactions past
+    /// 16 in the pool accepted but dropped, as op-geth does. Transaction ids are the nonces (one sender).
+    #[derive(Default)]
+    struct Chain {
+        /// mined, in nonce order: Some(id) ours, None someone else's
+        mined: Vec<Option<u8>>,
+        pool: std::collections::BTreeSet<u8>,
+        /// each send: the id, and how many nonces were used by then
+        sends: Vec<(u8, usize)>,
+        most_in_pool: usize,
+        blocks: u64,
+        /// a create that fails on chain
+        fails: Option<u8>,
+        /// a nonce someone else's transaction takes when its turn comes
+        foreign: Option<u8>,
+        /// sends answered with an error although the transaction is taken
+        errs: Vec<u8>,
+        /// what eth_getTransactionByHash answers for ours: the planned fields
+        plan: Vec<Value>,
+    }
+
+    fn chain(c: Chain) -> (String, Arc<Mutex<Chain>>) {
+        let c = Arc::new(Mutex::new(Chain { plan: txs().iter().map(|l| json!({"from": l.tx.from, "nonce": format!("0x{:x}", l.nonce), "to": l.tx.to, "input": format!("0x{}", hex::encode(&l.tx.data)), "value": "0x0"})).collect(), ..c }));
+        let state = c.clone();
+        let from = Address::repeat_byte(1);
+        let url = rpc::mock::serve(move |req, n| {
+            if n % 3 == 2 {
+                return (429, r#"{"code":-32007,"message":"25/second request limit reached"}"#.into());
+            }
+            let mut c = state.lock().unwrap();
+            let mut one = |call: &Value| {
+                let id = |v: &Value| (0..=255u8).find(|i| json!(alloy_primitives::keccak256([*i])) == *v);
+                let r: Result<Value, &str> = match call["method"].as_str().unwrap() {
+                    "eth_sendRawTransaction" => {
+                        let i = hex::decode(call["params"][0].as_str().unwrap().trim_start_matches("0x")).unwrap()[0];
+                        if (i as usize) < c.mined.len() {
+                            Err("nonce too low")
+                        } else if c.pool.contains(&i) {
+                            Err("already known")
+                        } else {
+                            let at = c.mined.len();
+                            c.sends.push((i, at));
+                            if c.pool.len() < 16 {
+                                c.pool.insert(i);
+                                c.most_in_pool = c.most_in_pool.max(c.pool.len());
+                            }
+                            if c.errs.contains(&i) { Err("failed to forward the transaction") } else { Ok(json!(alloy_primitives::keccak256([i]))) }
+                        }
+                    }
+                    "eth_blockNumber" => {
+                        for _ in 0..2 {
+                            let next = c.mined.len() as u8;
+                            if c.foreign == Some(next) {
+                                c.pool.remove(&next);
+                                c.mined.push(None);
+                            } else if c.pool.remove(&next) {
+                                c.mined.push(Some(next));
+                            }
+                        }
+                        c.blocks += 1;
+                        Ok(json!(format!("0x{:x}", c.blocks)))
+                    }
+                    "eth_getTransactionCount" => {
+                        let latest = c.mined.len();
+                        let pending = (latest..).take_while(|i| c.pool.contains(&(*i as u8))).count() + latest;
+                        Ok(json!(format!("0x{:x}", if call["params"][1] == "pending" { pending } else { latest })))
+                    }
+                    "eth_getTransactionReceipt" => Ok(match id(&call["params"][0]) {
+                        Some(i) if c.mined.contains(&Some(i)) => json!({"status": if c.fails == Some(i) { "0x0" } else { "0x1" }, "gasUsed": "0x5208", "contractAddress": from.create(i as u64)}),
+                        _ => Value::Null,
+                    }),
+                    "eth_getTransactionByHash" => Ok(match id(&call["params"][0]) {
+                        Some(i) if c.mined.contains(&Some(i)) || c.pool.contains(&i) => c.plan[i as usize].clone(),
+                        _ => Value::Null,
+                    }),
+                    m => panic!("{m}"),
+                };
+                match r {
+                    Ok(r) => json!({"jsonrpc": "2.0", "id": call["id"], "result": r}),
+                    Err(e) => json!({"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32000, "message": e}}),
+                }
+            };
+            (200, match req.as_array() {
+                Some(calls) => Value::Array(calls.iter().map(&mut one).collect()),
+                None => one(req),
+            }.to_string())
+        });
+        (url, c)
+    }
+
+    /// 20 creates from one sender, except the 4th, which calls the contract the 3rd creates, and the last, a call
+    fn txs() -> Vec<Left> {
+        let from = Address::repeat_byte(1);
+        (0..20u8)
+            .map(|i| {
+                let to = match i {
+                    3 => Some(from.create(2)),
+                    19 => Some(Address::repeat_byte(9)),
+                    _ => None,
+                };
+                let created = from.create(i as u64);
+                let creates = if to.is_none() { vec![(created, Bytes::new())] } else { vec![] };
+                let tx = BroadcastTx { from, to, value: U256::ZERO, data: Bytes::new(), created: to.is_none().then_some(created) };
+                Left { n: i as usize + 1, tx, sim: Sim { gas: 21000, spent: 21000, creates, touched: Default::default() }, nonce: i as u64, hash: alloy_primitives::keccak256([i]), raw: Bytes::from(vec![i]), records: vec![] }
+            })
+            .collect()
+    }
+
+    fn conn(url: String) -> Conn {
+        Conn { name: "base".into(), url, chain: 8453, block: 1, timestamp: 0, gas_limit: 0, base_fee: Some(1), prio: Some(1), gas_price: 2 }
+    }
+
+    #[test]
+    fn sends_a_window_at_a_time_through_rate_limits() {
+        for window in [8, 1] {
+            let (url, c) = chain(Chain::default());
+            let (landed, deployed, _) = send(&conn(url), &txs(), &HashMap::new(), window);
+            let c = c.lock().unwrap();
+            assert_eq!(landed, vec![Some(true); 20]);
+            assert_eq!(c.mined, (0..20).map(Some).collect::<Vec<_>>());
+            assert_eq!(c.most_in_pool, window, "at most a window in the pool at once, and that many");
+            // the first goes out alone and the rest once it's in; the last once everything else is
+            assert!(c.sends.iter().all(|&(i, at)| i == 0 || at >= 1));
+            assert_eq!(c.sends.iter().find(|s| s.0 == 19), Some(&(19, 19)));
+            assert_eq!(deployed.len(), 18);
+        }
+        // all at once (a node on this machine): what the pool drops is sent again
+        let (url, c) = chain(Chain::default());
+        let (landed, _, _) = send(&conn(url), &txs(), &HashMap::new(), usize::MAX);
+        assert_eq!(landed, vec![Some(true); 20]);
+        assert_eq!(c.lock().unwrap().most_in_pool, 16);
+    }
+
+    #[test]
+    fn an_error_is_looked_up_by_hash() {
+        // the RPC answers two sends with errors though it took them: they're in, not sent again or given up on
+        let (url, c) = chain(Chain { errs: vec![0, 5], ..Default::default() });
+        let (landed, _, _) = send(&conn(url), &txs(), &HashMap::new(), 8);
+        assert_eq!(landed, vec![Some(true); 20]);
+        assert_eq!(c.lock().unwrap().sends.iter().filter(|s| s.0 == 5).count(), 1);
+        // the chain's copy of a transaction isn't the planned one: that's where it stops
+        let (url, c) = chain(Chain::default());
+        c.lock().unwrap().plan[4]["input"] = json!("0x00");
+        let (landed, _, _) = send(&conn(url), &txs(), &HashMap::new(), 8);
+        assert_eq!(landed[4], Some(false));
+        assert!(c.lock().unwrap().sends.iter().all(|s| s.0 != 19), "the last waits for everything before it");
+    }
+
+    #[test]
+    fn never_sends_what_uses_a_failed_create() {
+        let (url, c) = chain(Chain { fails: Some(2), ..Default::default() });
+        let (landed, _, sent) = send(&conn(url), &txs(), &HashMap::new(), 8);
+        let c = c.lock().unwrap();
+        assert_eq!(landed[..3], [Some(true), Some(true), Some(false)]);
+        assert!(landed[3..].iter().all(|l| l.is_none()));
+        assert!(c.sends.iter().all(|&(i, _)| i < 3), "{:?}", c.sends);
+        assert_eq!(sent, 3);
+    }
+
+    #[test]
+    fn stops_at_a_nonce_someone_else_took() {
+        // nonce 6 goes to another transaction: 7 to 13, out already, still land on top, but nothing more is sent
+        let (url, c) = chain(Chain { foreign: Some(6), ..Default::default() });
+        let t = Instant::now();
+        let (landed, _, sent) = send(&conn(url), &txs(), &HashMap::new(), 8);
+        assert!(t.elapsed() < Duration::from_secs(10));
+        assert_eq!(landed[..6], [Some(true); 6]);
+        assert_eq!(landed[6], Some(false));
+        assert_eq!(landed[7..14], [Some(true); 7]);
+        assert_eq!(sent, 14);
+        assert!(c.lock().unwrap().sends.iter().all(|s| s.0 < 14), "{:?}", c.lock().unwrap().sends);
+    }
+
+    #[test]
+    fn resumes_by_hash() {
+        // stopped after 3 of 20; then 2 more landed. What was saved is sent as it was signed
+        let (url, c) = chain(Chain::default());
+        c.lock().unwrap().mined = (0..5).map(Some).collect();
+        let saved = serde_json::to_vec(&Resume { names: HashMap::new(), proxies: vec![], left: txs().split_off(3), void: None }).unwrap();
+        let r: Resume = serde_json::from_slice(&saved).unwrap();
+        assert_eq!((r.left[0].n, r.left[0].tx.to, r.left[1].sim.creates.len()), (4, Some(Address::repeat_byte(1).create(2)), 1));
+        check_resume(&url, &r.left).unwrap();
+        check_resume(&url, &r.left[2..]).unwrap();
+        let (landed, deployed, _) = send(&conn(url), &r.left, &HashMap::new(), 8);
+        assert_eq!(landed, vec![Some(true); 17]);
+        assert_eq!(c.lock().unwrap().mined, (0..20).map(Some).collect::<Vec<_>>());
+        assert_eq!(deployed.len(), 15);
+        // not over a nonce someone else took, nor while the pool holds the sender's transactions
+        let (url, c) = chain(Chain::default());
+        c.lock().unwrap().mined = vec![Some(0), Some(1), None, Some(3)];
+        assert!(check_resume(&url, &txs()[1..]).unwrap_err().contains("nonce 2 of"));
+        let (url, c) = chain(Chain::default());
+        c.lock().unwrap().mined = vec![Some(0)];
+        c.lock().unwrap().pool = [1].into();
+        assert!(check_resume(&url, &txs()[1..]).unwrap_err().contains("waiting in a node's pool"));
     }
 }
