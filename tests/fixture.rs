@@ -101,6 +101,48 @@ fn build_outputs() {
 }
 
 #[test]
+fn forge_out_with_profiles() {
+    // forge's out/ when a test compiles with another profile: what it imports (forge-std included) is built with
+    // that profile too, and its src contracts are written as <Contract>.<profile>.json
+    let dir = "tests/fixture/tmp/profiles";
+    std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+    std::fs::create_dir_all(format!("{dir}/test")).unwrap();
+    std::fs::copy("tests/fixture/src/Counter.sol", format!("{dir}/src/Counter.sol")).unwrap();
+    std::fs::write(format!("{dir}/foundry.toml"), "[profile.default]\noptimizer = true\nadditional_compiler_profiles = [{ name = \"tests\", optimizer = false, optimizer_runs = 0 }]\ncompilation_restrictions = [{ paths = \"test/Slow.t.sol\", max_optimizer_runs = 0 }]\n").unwrap();
+    std::fs::write(format!("{dir}/test/Slow.t.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\nimport {Counter} from \"../src/Counter.sol\";\ncontract SlowTest is Test {\n    function test_counter() public {\n        new Counter();\n    }\n}\n").unwrap();
+    std::fs::remove_dir_all(format!("{dir}/out")).ok();
+    let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["build", "--out", "out"]).current_dir(dir).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    // a file's own profile keeps the plain name; a lib/ file (forge-std here) has none
+    for f in ["Counter.sol/Counter.json", "Counter.sol/Counter.tests.json", "Slow.t.sol/SlowTest.json", "Test.sol/Test.default.json", "Test.sol/Test.tests.json"] {
+        assert!(std::path::Path::new(&format!("{dir}/out/{f}")).exists(), "no out/{f}: {text}");
+    }
+    assert!(!std::path::Path::new(&format!("{dir}/out/Slow.t.sol/SlowTest.tests.json")).exists());
+}
+
+#[test]
+fn storage_layouts_like_forge() {
+    // forge's storage layouts: each type's fields in forge's order, and `types` {} rather than null
+    let dir = "tests/fixture/tmp/layouts";
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+    let write = |f: &str, body: &str| std::fs::write(format!("{dir}/{f}"), format!("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n{body}\n")).unwrap();
+    write("src/A.sol", "contract A {\n    struct Slot {\n        uint128 a;\n        uint128 b;\n    }\n    mapping(address => Slot) public slots;\n    uint256[] public list;\n}");
+    write("src/Empty.sol", "contract Empty {}");
+    std::fs::write(format!("{dir}/plain.toml"), "").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["build", "--out", "out", "--extra-output", "storageLayout"]).current_dir(dir).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let layout = |f: &str| -> serde_json::Value { serde_json::from_slice::<serde_json::Value>(&std::fs::read(format!("{dir}/out/{f}")).unwrap()).unwrap()["storageLayout"].clone() };
+    assert_eq!(layout("Empty.sol/Empty.json").to_string(), r#"{"storage":[],"types":{}}"#);
+    let a = layout("A.sol/A.json");
+    let keys: Vec<Vec<&str>> = a["types"].as_object().unwrap().values().map(|t| t.as_object().unwrap().keys().map(|k| k.as_str()).collect()).collect();
+    for want in [vec!["encoding", "key", "label", "numberOfBytes", "value"], vec!["encoding", "label", "numberOfBytes", "members"], vec!["encoding", "label", "numberOfBytes", "base"]] {
+        assert!(keys.contains(&want), "{want:?} not in {keys:?}");
+    }
+}
+
+#[test]
 fn configured_libraries() {
     // a library the config says is on chain already is linked against, not deployed again
     let dir = "tests/fixture/tmp/libraries";

@@ -195,7 +195,7 @@ fn main() {
             let built: Vec<&solc::Artifact> = out.artifacts.iter().filter(|a| a.shard == 0 && out.built.contains(&a.file)).collect();
             if let Some(dir) = forge_out {
                 let layouts = if extra.is_empty() { Default::default() } else { solc::layouts(&p, &out.solc, &out.built) };
-                solc::write_forge(&p.root.join(&dir), &built, &layouts, &p.profiles);
+                solc::write_forge(&p, &p.root.join(&dir), &built, &layouts);
             }
             if sizes && !solc::sizes(&built) {
                 die("some contracts exceed the size limits (EIP-170: 24576 bytes of runtime code, EIP-3860: 49152 of init code)");
