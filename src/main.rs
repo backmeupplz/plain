@@ -74,6 +74,9 @@ usage:
                                              simulate, then send with --broadcast (--confirm: ask first) and
                                              verify on Sourcify, Blockscout and Etherscan; --proxy: behind an
                                              OpenZeppelin proxy, args going to initialize()
+  plain script <script.s.sol[:Contract]> --rpc-url url [--chain id] [--broadcast]
+                                             forge script's flags for plain deploy of a script; a simulation also
+                                             writes forge's dry-run journal (broadcast/<script>/<chain>/dry-run/)
   plain upgrade <proxy> [Contract] [--call fn args...] --network net [--account name] [--broadcast]
                                              check the storage layout, then point the proxy at a new
                                              implementation (default: its contract as the source is now)
@@ -299,7 +302,7 @@ fn main() {
                     let c = conn.chain;
                     std::thread::spawn(move || rpc::chain_info(c));
                 }
-                return deploy::resume(&p, conn, deploy::Opts { target: String::new(), args, broadcast: true, verify, account, proxy: false, upgrade: None, confirm, slow });
+                return deploy::resume(&p, conn, deploy::Opts { target: String::new(), args, broadcast: true, verify, account, proxy: false, upgrade: None, confirm, slow, journal: false });
             }
             if args.is_empty() {
                 die("usage: plain deploy <Contract|script.s.sol> [args...] [--network name|id|url] [--account name] [--broadcast] [--slow] [--proxy] [--no-verify]\n       plain deploy --resume --network name|id|url");
@@ -317,7 +320,36 @@ fn main() {
                     std::thread::spawn(move || rpc::chain_info(c));
                 }
             }
-            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify, account, proxy, upgrade: None, confirm, slow });
+            deploy::run(&p, out, conn, deploy::Opts { target, args, broadcast, verify, account, proxy, upgrade: None, confirm, slow, journal: false });
+        }
+        "script" => {
+            // forge's `forge script <file>[:Contract] --rpc-url <url> [--chain <id>]`: plain deploy of the script under
+            // forge's flags; a simulation against a chain also writes forge's dry-run journal for tools that read it
+            let p = project::Project::load();
+            let network = ["--rpc-url", "-r", "--fork-url", "-f", "--network"].iter().find_map(|f| flag(&mut args, f));
+            let chain = flag(&mut args, "--chain").or_else(|| flag(&mut args, "--chain-id"));
+            let account = flag(&mut args, "--account");
+            let broadcast = switch(&mut args, &["--broadcast"]);
+            let verify = switch(&mut args, &["--verify"]);
+            let slow = switch(&mut args, &["--slow"]);
+            no_options(&args);
+            let [target] = &args[..] else { die("usage: plain script <script.s.sol[:Contract]> [--rpc-url url|network] [--chain id] [--broadcast] [--slow] [--verify] [--account name]") };
+            let target = target.clone();
+            let (out, conn) = std::thread::scope(|s| {
+                let conn = network.as_deref().map(|n| s.spawn(|| deploy::connect(&p, n)));
+                let out = solc::build(&p, false, solc::Scope::Deploy(target.clone()));
+                (out, conn.map(|c| c.join().unwrap()))
+            });
+            if let (Some(c), Some(want)) = (&conn, &chain) {
+                let id = want.parse::<u64>().ok().or_else(|| rpc::NETWORKS.iter().find(|x| x.0 == want).map(|x| x.1)).unwrap_or_else(|| die(&format!("--chain {want}: not a chain id or a network plain knows")));
+                if id != c.chain {
+                    die(&format!("--chain {want}, but {} is chain {}", c.name, c.chain));
+                }
+            }
+            if broadcast && verify && let Some(c) = conn.as_ref().map(|c| c.chain) {
+                std::thread::spawn(move || rpc::chain_info(c));
+            }
+            deploy::run(&p, out, conn, deploy::Opts { target, args: vec![], broadcast, verify, account, proxy: false, upgrade: None, confirm: false, slow, journal: true });
         }
         "upgrade" => {
             let p = project::Project::load();
@@ -346,7 +378,7 @@ fn main() {
                 let c = conn.chain;
                 std::thread::spawn(move || rpc::chain_info(c));
             }
-            deploy::run(&p, out, Some(conn), deploy::Opts { target: plan.target.clone(), args, broadcast, verify, account, proxy: false, upgrade: Some(plan), confirm, slow });
+            deploy::run(&p, out, Some(conn), deploy::Opts { target: plan.target.clone(), args, broadcast, verify, account, proxy: false, upgrade: Some(plan), confirm, slow, journal: false });
         }
         "verify" => {
             let p = project::Project::load();

@@ -37,6 +37,7 @@ plain build [files...] [--force] [--check] [--sizes] [--skip test|script] [--out
 plain test [filter] [-v] [--mt name] [--mc name] [--mp glob] [--fork <network|url>] [--fuzz-runs N] [--seed N] [--isolate] [--gas-limit N] [--threads N] [--rerun] [--force] [--watch]
 plain deploy <Contract|path/Script.s.sol> [args...] [--network <name|id|url>] [--account <name>] [--broadcast] [--confirm] [--slow] [--proxy] [--no-verify]
 plain deploy --resume --network <name|id|url>
+plain script <path/Script.s.sol[:Contract]> --rpc-url <url|name> [--chain <id>] [--broadcast] [--slow]   # forge script's flags; writes forge's dry-run journal
 plain upgrade <proxy> [Contract] [--call <function> args...] --network <name|id|url> [--account <name>] [--broadcast] [--slow]
 plain inspect <Contract> storage-layout [--json]
 plain verify [--network <name|id|url>] [name|address...] [--export]
