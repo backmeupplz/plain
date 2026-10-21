@@ -434,7 +434,9 @@ fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (O
             let skip: Vec<String> = skip.iter().map(|s| match s.as_str() { "test" | "tests" => ".t.sol".into(), "script" | "scripts" => ".s.sol".into(), s => s.into() }).collect();
             let kept = |f: &String| !skip.iter().any(|s| f.contains(s.as_str()));
             for r in &roots {
-                if !files.contains(&r.strip_prefix("./").unwrap_or(r).to_string()) {
+                let r_ = r.strip_prefix("./").unwrap_or(r).to_string();
+                // forge-style output also has lib/ files other profiles compile (build passes those as roots)
+                if !files.contains(&r_) && !(libs && g.files.contains_key(&r_)) {
                     crate::die(&format!("{r}: no such file in {}", p.dirs.join(", ")));
                 }
             }
@@ -1263,16 +1265,43 @@ pub fn layouts(p: &Project, version: &str, files: &[String]) -> HashMap<(String,
     let mut found = HashMap::new();
     for (file, cs) in out["contracts"].as_object().into_iter().flatten() {
         for (name, c) in cs.as_object().into_iter().flatten() {
-            found.insert((file.clone(), name.clone()), c["storageLayout"].clone());
+            found.insert((file.clone(), name.clone()), forge_layout(c["storageLayout"].clone()));
         }
     }
     found
 }
 
+/// A storage layout as forge writes it: `types` is {} rather than null, and each type's fields are in forge's order
+/// (encoding, key, label, numberOfBytes, value, then the rest by name) rather than solc's.
+fn forge_layout(mut l: Value) -> Value {
+    match l.get_mut("types") {
+        Some(t @ Value::Null) => *t = json!({}),
+        Some(Value::Object(types)) => {
+            for t in types.values_mut() {
+                if let Value::Object(o) = t {
+                    let mut ordered: serde_json::Map<String, Value> = ["encoding", "key", "label", "numberOfBytes", "value"].iter().filter_map(|k| Some((k.to_string(), o.remove(*k)?))).collect();
+                    ordered.extend(std::mem::take(o).into_iter().collect::<BTreeMap<_, _>>());
+                    *o = ordered;
+                }
+            }
+        }
+        _ => {}
+    }
+    l
+}
+
 /// Artifacts as forge writes them, `<dir>/<File.sol>/<Contract>.json`, for tools that read Foundry's out/: the
 /// ABI, both bytecodes with their library and immutable references, and the storage layout when there is one.
-pub fn write_forge(dir: &std::path::Path, arts: &[&Artifact], layouts: &HashMap<(String, String), Value>, profiles: &[crate::project::Profile]) {
+pub fn write_forge(p: &Project, dir: &std::path::Path, arts: &[&Artifact], layouts: &HashMap<(String, String), Value>) {
     let refs = |v: &Value| if v.is_null() { json!({}) } else { v.clone() };
+    // forge's names: <Contract>.json, and when a contract is compiled with several profiles, <Contract>.<profile>.json
+    // for each but its file's own profile (a lib/ file has none, so all of its get one)
+    let mut compiled: HashMap<(&str, &str), std::collections::BTreeSet<u32>> = HashMap::new();
+    for a in arts {
+        compiled.entry((&a.file, &a.name)).or_default().insert(a.profile);
+    }
+    let g = Graph::build(p, &p.project_files());
+    let own = |f: &str| p.dirs.iter().any(|d| f.starts_with(&format!("{d}/"))).then(|| profile_of(p, &g, f) as u32);
     for a in arts {
         let mut j = json!({
             "abi": a.abi,
@@ -1283,10 +1312,9 @@ pub fn write_forge(dir: &std::path::Path, arts: &[&Artifact], layouts: &HashMap<
             j["storageLayout"] = l.clone();
         }
         let d = dir.join(a.file.rsplit('/').next().unwrap_or(&a.file));
-        // forge names a contract compiled with another profile too <Contract>.<profile>.json
-        let name = match a.profile.checked_sub(1).and_then(|i| profiles.get(i as usize)) {
-            Some(x) => format!("{}.{}.json", a.name, x.name),
-            None => format!("{}.json", a.name),
+        let name = match compiled[&(a.file.as_str(), a.name.as_str())].len() > 1 && own(&a.file) != Some(a.profile) {
+            true => format!("{}.{}.json", a.name, a.profile.checked_sub(1).and_then(|i| p.profiles.get(i as usize)).map_or("default", |x| x.name.as_str())),
+            false => format!("{}.json", a.name),
         };
         std::fs::create_dir_all(&d).and_then(|_| std::fs::write(d.join(name), serde_json::to_vec_pretty(&j).unwrap())).unwrap_or_else(|e| crate::die(&format!("{}: {e}", d.display())));
     }
