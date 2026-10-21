@@ -317,7 +317,15 @@ contract Deploy is Script {
 plain deploy script/Deploy.s.sol --network base-sepolia --account deployer --broadcast
 ```
 
-In `run()`, `msg.sender` and `tx.origin` are the deployer, as with forge, so `new Vault(msg.sender)` makes the deployer the owner. `vm.startBroadcast(pk)` signs with another key, and `new X{salt: s}()` deploys through the deterministic CREATE2 deployer, like forge. External libraries the contracts link against are deployed first, from the deployer's address, unless the config says they're on chain already: forge's `libraries = ["src/L.sol:L:0x…"]` links against that address instead, after plain checks that it holds code. A script runs `run()` with no arguments.
+In `run()`, `msg.sender` and `tx.origin` are the deployer, as with forge, so `new Vault(msg.sender)` makes the deployer the owner. `vm.startBroadcast(pk)` signs with another key, and `new X{salt: s}()` deploys through the deterministic CREATE2 deployer, like forge. A script runs `run()` with no arguments.
+
+External libraries the contracts link against go where forge script puts them. On a chain with the CREATE2 deployer (most have it), each library is at its CREATE2 address (salt 0, or `create2_library_salt`), so it's deployed once per chain: a deploy sends only the libraries the chain doesn't have yet, through that deployer. Elsewhere they're deployed first, from the deployer's address. When the deployer isn't set (no `--account` or `PRIVATE_KEY`) and one account creates the script's contracts, like `vm.startBroadcast(owner)` in a rehearsal, that account deploys the libraries, as with forge. forge's `libraries = ["src/L.sol:L:0x…"]` in the config links against that address instead, after plain checks that it holds code.
+
+`plain script` takes forge script's flags, so the command forge would run works as it is. Without `--broadcast` it also writes forge's dry-run journal of the plan, every transaction with the nonce it goes out at, to `broadcast/<script>/<chain id>/dry-run/run-latest.json`, for tools that read forge's plans:
+
+```sh
+plain script script/Deploy.s.sol:Deploy --rpc-url https://mainnet.base.org --chain 8453
+```
 
 ### What --broadcast does
 
@@ -533,6 +541,7 @@ typescript = false       # run test/**/*.test.ts (plain.toml only)
 isolate = false          # each call a test makes as its own transaction, as forge's --isolate
 gas_limit = 1073741824   # the gas each test and its block get
 libraries = []           # ["src/L.sol:L:0x…"]: libraries on chain already, linked instead of deployed
+create2_library_salt = "0x00…00"  # where a script's libraries go through the CREATE2 deployer
 [fuzz]
 runs = 256
 [invariant]

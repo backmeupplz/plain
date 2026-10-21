@@ -200,23 +200,7 @@ pub fn deploy(db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art
 /// (each library's own libraries first; the default profile's build of each, as forge's linker picks), adding them
 /// to `libs`. With `record`, the deployments are also transactions to broadcast (`plain deploy`).
 pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, libs: &mut HashMap<String, Address>, from: Address, record: &mut Option<&mut Vec<evm::BroadcastTx>>) -> Db {
-    // libraries of contracts deployed from artifacts too, in the order embedding them would give
-    // (transitively: a script the test deploys can deploy contracts from artifacts in turn)
-    let mut needed: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
-    let mut todo = vec![art];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(a) = todo.pop() {
-        for (file, names) in a.links.as_object().into_iter().flatten() {
-            needed.extend(names.as_object().into_iter().flatten().map(|(name, _)| (file.clone(), name.clone())));
-        }
-        for id in &a.deploys {
-            if seen.insert(id) {
-                let named = |x: &&Artifact| x.shard == 0 && format!("{}:{}", x.file, x.name) == *id;
-                todo.extend(arts.iter().filter(named).find(|x| x.profile == art.profile).or_else(|| arts.iter().find(named)));
-            }
-        }
-    }
-    for (file, name) in needed {
+    for (file, name) in needed_libs(arts, art) {
         let key = format!("{file}:{name}");
         if libs.contains_key(&key) {
             continue;
@@ -236,6 +220,26 @@ pub fn deploy_libs(mut db: Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artif
         libs.insert(key, a);
     }
     db
+}
+
+/// The libraries `art` links against, and those of the contracts it deploys from artifacts (transitively: a script
+/// a test deploys can deploy contracts from artifacts in turn), in the order embedding them would give.
+pub fn needed_libs(arts: &[Artifact], art: &Artifact) -> std::collections::BTreeSet<(String, String)> {
+    let mut needed: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut todo = vec![art];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(a) = todo.pop() {
+        for (file, names) in a.links.as_object().into_iter().flatten() {
+            needed.extend(names.as_object().into_iter().flatten().map(|(name, _)| (file.clone(), name.clone())));
+        }
+        for id in &a.deploys {
+            if seen.insert(id) {
+                let named = |x: &&Artifact| x.shard == 0 && format!("{}:{}", x.file, x.name) == *id;
+                todo.extend(arts.iter().filter(named).find(|x| x.profile == art.profile).or_else(|| arts.iter().find(named)));
+            }
+        }
+    }
+    needed
 }
 
 /// A suite's starting state, as forge sets it up: every library any artifact links against, deployed from

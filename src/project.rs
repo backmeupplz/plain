@@ -34,6 +34,8 @@ pub struct Project {
     pub gas_limit: u64,
     /// forge's `libraries = ["src/L.sol:L:0x…"]`: libraries on chain already, which deploys link against
     pub libraries: HashMap<String, alloy_primitives::Address>,
+    /// forge's `create2_library_salt`: where a script's libraries go through the CREATE2 deployer
+    pub create2_library_salt: alloy_primitives::B256,
 }
 
 #[derive(Clone, Debug)]
@@ -396,6 +398,7 @@ impl Project {
                     (id.strip_prefix("./").unwrap_or(id).to_string(), a.trim().parse().unwrap_or_else(|_| crate::die(&format!("libraries: {l:?} isn't path:Name:address"))))
                 })
                 .collect(),
+            create2_library_salt: s("create2_library_salt").map(|v| v.parse().unwrap_or_else(|_| crate::die(&format!("create2_library_salt: {v:?} isn't 32 bytes of hex")))).unwrap_or_default(),
             root,
         }
     }

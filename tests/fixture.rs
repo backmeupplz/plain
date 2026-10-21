@@ -3,6 +3,9 @@
 use std::io::{BufRead, Read, Write};
 use std::process::Command;
 
+const CREATE2_DEPLOYER: &str = "0x4e59b44847b379578588920ca78fbf26c0b4956c";
+const CREATE2_DEPLOYER_CODE: &str = "0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
+
 /// A JSON-RPC chain for test/Forge.t.sol's fork test: chain 8453 at block 100, where 0x…beef's code returns its
 /// slot 0, which holds 42.
 fn mock_rpc() -> String {
@@ -33,8 +36,11 @@ fn mock_rpc() -> String {
                     "eth_blockNumber" => serde_json::json!("0x64"),
                     "eth_getBlockByNumber" => serde_json::json!({"number": "0x64", "timestamp": "0x6553f100", "baseFeePerGas": "0x7", "gasLimit": "0x1c9c380", "miner": "0x4200000000000000000000000000000000000011", "mixHash": word(1), "hash": word(2)}),
                     "eth_getBalance" | "eth_getTransactionCount" => serde_json::json!("0x0"),
-                    // PUSH0 SLOAD PUSH0 MSTORE PUSH1 32 PUSH0 RETURN
-                    "eth_getCode" => serde_json::json!(if beef { "0x5f545f5260205ff3" } else { "0x" }),
+                    "eth_gasPrice" | "eth_maxPriorityFeePerGas" => serde_json::json!("0x1"),
+                    // PUSH0 SLOAD PUSH0 MSTORE PUSH1 32 PUSH0 RETURN; and the CREATE2 deployer, as on Base
+                    "eth_getCode" if beef => serde_json::json!("0x5f545f5260205ff3"),
+                    "eth_getCode" if p[0].as_str().is_some_and(|a| a.eq_ignore_ascii_case(CREATE2_DEPLOYER)) => serde_json::json!(CREATE2_DEPLOYER_CODE),
+                    "eth_getCode" => serde_json::json!("0x"),
                     "eth_getStorageAt" => serde_json::json!(word(if beef { 42 } else { 0 })),
                     m => panic!("mock RPC: {m}"),
                 };
@@ -140,6 +146,68 @@ fn storage_layouts_like_forge() {
     for want in [vec!["encoding", "key", "label", "numberOfBytes", "value"], vec!["encoding", "label", "numberOfBytes", "members"], vec!["encoding", "label", "numberOfBytes", "base"]] {
         assert!(keys.contains(&want), "{want:?} not in {keys:?}");
     }
+}
+
+#[test]
+fn script_journal() {
+    // forge script's flags; the simulation is also written as forge's dry-run journal, at the nonces the chain has
+    let dir = "tests/fixture/tmp/script";
+    std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+    std::fs::create_dir_all(format!("{dir}/script")).unwrap();
+    std::fs::copy("tests/fixture/src/Counter.sol", format!("{dir}/src/Counter.sol")).unwrap();
+    std::fs::write(format!("{dir}/plain.toml"), "").unwrap();
+    std::fs::write(format!("{dir}/script/Deploy.s.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Script} from \"forge-std/Script.sol\";\nimport {Counter} from \"../src/Counter.sol\";\ncontract Deploy is Script {\n    function run() external {\n        vm.startBroadcast(address(0xc2ae));\n        new Counter().increment();\n        vm.stopBroadcast();\n    }\n}\n").unwrap();
+    std::fs::remove_dir_all(format!("{dir}/broadcast")).ok();
+    let rpc = mock_rpc();
+    let script = |chain: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["script", "script/Deploy.s.sol:Deploy", "--rpc-url", &rpc, "--chain", chain]).current_dir(dir).output().unwrap();
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let (ok, text) = script("1");
+    assert!(!ok && text.contains("--chain 1, but"), "{text}");
+    let (ok, text) = script("8453");
+    assert!(ok && text.contains("plan written to broadcast/Deploy.s.sol/8453/dry-run/run-latest.json"), "{text}");
+    let j: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/broadcast/Deploy.s.sol/8453/dry-run/run-latest.json")).unwrap()).unwrap();
+    let txs = j["transactions"].as_array().unwrap();
+    // the mock chain has every nonce at 0: the create is nonce 0, so the counter lands at 0xc2ae's first address
+    let counter = "0xbff07e966fed2f2dfac9a5a6f8daf9682e625ae5";
+    let sender = "0x000000000000000000000000000000000000c2ae";
+    assert_eq!(txs.len(), 2, "{j}");
+    assert_eq!((txs[0]["transactionType"].as_str(), txs[0]["contractName"].as_str(), txs[0]["transaction"]["to"].is_null()), (Some("CREATE"), Some("Counter"), true), "{j}");
+    assert_eq!((txs[0]["transaction"]["from"].as_str(), txs[0]["transaction"]["nonce"].as_str(), txs[0]["transaction"]["chainId"].as_str()), (Some(sender), Some("0x0"), Some("0x2105")), "{j}");
+    assert_eq!(txs[0]["contractAddress"], counter, "{j}");
+    assert_eq!((txs[1]["transactionType"].as_str(), txs[1]["function"].as_str(), txs[1]["transaction"]["to"].as_str()), (Some("CALL"), Some("increment()"), Some(counter)), "{j}");
+    assert_eq!((txs[1]["transaction"]["input"].as_str(), txs[1]["transaction"]["nonce"].as_str()), (Some("0xd09de08a"), Some("0x1")), "{j}");
+}
+
+#[test]
+fn script_libraries_create2() {
+    // as forge script links them on a chain with the CREATE2 deployer: at their CREATE2 addresses (salt 0), deployed
+    // through it by the one account that creates contracts in the script (here a keyless vm.startBroadcast(address))
+    let dir = "tests/fixture/tmp/script-libraries";
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+    std::fs::create_dir_all(format!("{dir}/script")).unwrap();
+    std::fs::copy("tests/fixture/src/Lib.sol", format!("{dir}/src/Lib.sol")).unwrap();
+    std::fs::write(format!("{dir}/plain.toml"), "").unwrap();
+    std::fs::write(format!("{dir}/script/UseLib.s.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Script} from \"forge-std/Script.sol\";\nimport {UsesLib} from \"../src/Lib.sol\";\ncontract UseLib is Script {\n    function run() external {\n        vm.startBroadcast(address(0xc2ae));\n        new UsesLib();\n        vm.stopBroadcast();\n    }\n}\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["script", "script/UseLib.s.sol", "--rpc-url", &mock_rpc()]).current_dir(dir).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    let j: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/broadcast/UseLib.s.sol/8453/dry-run/run-latest.json")).unwrap()).unwrap();
+    let txs = j["transactions"].as_array().unwrap();
+    assert_eq!(txs.len(), 2, "{text}");
+    let (lib, uses) = (&txs[0], &txs[1]);
+    let sender = "0x000000000000000000000000000000000000c2ae";
+    assert_eq!((lib["transactionType"].as_str(), lib["contractName"].as_str(), lib["transaction"]["to"].as_str()), (Some("CREATE2"), Some("Adder"), Some(CREATE2_DEPLOYER)), "{j}");
+    assert_eq!((lib["transaction"]["from"].as_str(), lib["transaction"]["nonce"].as_str()), (Some(sender), Some("0x0")), "{j}");
+    // salt 0, then the library's code, which decides where it lands
+    let input = lib["transaction"]["input"].as_str().unwrap();
+    let code = hex::decode(input.strip_prefix(&format!("0x{}", "0".repeat(64))).unwrap()).unwrap();
+    let at: alloy_primitives::Address = CREATE2_DEPLOYER.parse::<alloy_primitives::Address>().unwrap().create2_from_code(alloy_primitives::B256::ZERO, &code);
+    assert_eq!(lib["contractAddress"].as_str(), Some(format!("{at:#x}").as_str()), "{j}");
+    assert_eq!((uses["transactionType"].as_str(), uses["contractName"].as_str(), uses["transaction"]["nonce"].as_str()), (Some("CREATE"), Some("UsesLib"), Some("0x1")), "{j}");
+    assert!(uses["transaction"]["input"].as_str().unwrap().contains(&format!("{at:x}")), "UsesLib isn't linked against {at}: {j}");
 }
 
 #[test]

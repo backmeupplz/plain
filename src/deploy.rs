@@ -31,6 +31,8 @@ pub struct Opts {
     pub confirm: bool,
     /// forge's --slow: send one transaction at a time, each after the last one's receipt
     pub slow: bool,
+    /// `plain script`: a simulation against a chain also writes forge's dry-run journal (see `journal`)
+    pub journal: bool,
 }
 
 /// The network as of now, fetched in one round trip while solc compiles.
@@ -342,8 +344,15 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         die(&format!("a script takes no arguments: plain runs {}.run()", art.name));
     }
     let from = me.unwrap_or(SENDER);
+    // forge script links a script's libraries at CREATE2 addresses when the chain has the CREATE2 deployer (a local
+    // simulation always does)
+    let create2 = is_script
+        && fork.as_ref().is_none_or(|f| {
+            let at = revm::DatabaseRef::basic_ref(&evm::Remote(Some(f.clone()), None), evm::CREATE2_DEPLOYER);
+            at.unwrap_or_else(|e| die(&format!("couldn't read the CREATE2 deployer's code from the RPC ({e})"))).is_some_and(|i| i.code_hash != revm::primitives::KECCAK_EMPTY)
+        });
 
-    let simulate = || -> Planned {
+    let simulate = |from: Address| -> Planned {
         let mut env = fresh_env.clone();
         let mut cheats = Cheats::new(arts.clone(), p.root.clone(), Arc::new(p.access.clone()));
         cheats.default_broadcaster = Some(from);
@@ -353,11 +362,13 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
         let db = evm::base_db(evm::Remote(fork.clone(), None));
         cheats.track_creates = true;
         cheats.presume_creates = true;
-        // libraries go on chain first, deployed by the broadcaster (like forge script)
-        // libraries the config says are on chain already are linked against, not deployed again
+        // libraries go on chain first (like forge script), except those the config says are on chain already
         let mut libs = p.libraries.clone();
         let mut txs: Vec<BroadcastTx> = vec![];
-        let db = crate::test::deploy_libs(db, &mut env, &mut cheats, &arts, &art, &mut libs, from, &mut Some(&mut txs));
+        let db = match create2 {
+            true => link_create2(db, &mut env, &mut cheats, &arts, &art, &mut libs, from, p.create2_library_salt, &mut txs),
+            false => crate::test::deploy_libs(db, &mut env, &mut cheats, &arts, &art, &mut libs, from, &mut Some(&mut txs)),
+        };
         let mut proxies: Vec<Address> = vec![];
         cheats.libs = libs.clone();
         if is_script {
@@ -474,12 +485,19 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     // where contracts land is taken as empty (`Fork::presume`): one round trip checks it all, and the simulation runs
     // again on the chain's own state when something was there after all (a CREATE2 salt used before)
     let settle = || fork.as_ref().is_some_and(|f| f.settle().unwrap_or_else(|e| die(&e.to_string())));
-    let Planned { txs, cheats, libs, proxies } = loop {
-        let plan = simulate();
+    let run = |from: Address| loop {
+        let plan = simulate(from);
         if !settle() {
             break plan;
         }
     };
+    let mut plan = run(from);
+    // forge script: a script that needs libraries runs again as the one account that creates contracts in it, when
+    // that isn't the sender (a keyless rehearsal broadcasting as the owner), and that account deploys them
+    if is_script && plan.libs.len() > p.libraries.len() && let Some(x) = new_sender(&plan.txs, from) {
+        plan = run(x);
+    }
+    let Planned { txs, cheats, libs, proxies } = plan;
     if txs.is_empty() {
         println!("nothing to broadcast (did the script call vm.startBroadcast?)");
         return;
@@ -505,6 +523,9 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     let conn = match conn {
         Some(c) if o.broadcast => c,
         c => {
+            if let Some(c) = c.as_ref().filter(|_| o.journal) {
+                journal(p, c, &art, &txs, &sims, &cheats.names, &libs);
+            }
             println!("simulated {} transaction(s){}; add --broadcast to send", txs.len(), c.map(|c| format!(" against {}", c.name)).unwrap_or_default());
             return;
         }
@@ -559,6 +580,114 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
     if o.proxy {
         println!("{} is upgradeable: plain upgrade {} --network {}", art.name, art.name, conn.name);
     }
+}
+
+/// forge script's `maybe_new_sender`: the one account other than `sender` whose transactions create contracts, if
+/// there's exactly one (a create from `sender` after it means there are two).
+fn new_sender(txs: &[BroadcastTx], sender: Address) -> Option<Address> {
+    let mut new = None;
+    for t in txs.iter().filter(|t| t.to.is_none()) {
+        match new {
+            Some(n) if t.from != n => return None,
+            None if t.from != sender => new = Some(t.from),
+            _ => {}
+        }
+    }
+    new
+}
+
+/// forge script's linking on a chain with the CREATE2 deployer: each library the script needs (and the libraries
+/// those need) at its CREATE2 address with `salt`, placed in forge's order (artifact ids sorted, then repeatedly the
+/// first one whose own libraries are placed, taken out with swap_remove); only those the chain doesn't have yet are
+/// deployed, by `from` through the deployer.
+#[allow(clippy::too_many_arguments)]
+fn link_create2(mut db: evm::Db, env: &mut Env, cheats: &mut Cheats, arts: &[Artifact], art: &Artifact, libs: &mut HashMap<String, Address>, from: Address, salt: B256, txs: &mut Vec<BroadcastTx>) -> evm::Db {
+    let lib = |file: &str, name: &str| arts.iter().find(|a| a.file == file && a.name == name && a.profile == 0).unwrap_or_else(|| die(&format!("library {file}:{name} has no bytecode (is it outside src/test/script?)")));
+    let mut needed = crate::test::needed_libs(arts, art);
+    let mut todo: Vec<(String, String)> = needed.iter().cloned().collect();
+    while let Some((f, n)) = todo.pop() {
+        for (file, names) in lib(&f, &n).links.as_object().into_iter().flatten() {
+            for name in names.as_object().into_iter().flatten().map(|(name, _)| name) {
+                if needed.insert((file.clone(), name.clone())) {
+                    todo.push((file.clone(), name.clone()));
+                }
+            }
+        }
+    }
+    let base = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
+    let mut left: Vec<&Artifact> = needed.iter().filter(|(f, n)| !libs.contains_key(&format!("{f}:{n}"))).map(|(f, n)| lib(f, n)).collect();
+    left.sort_by_key(|a| (base(&a.file), format!("{}.json", a.name)));
+    while !left.is_empty() {
+        let i = left.iter().position(|a| evm::link_code(&a.bytecode, &a.links, libs).is_ok()).unwrap_or_else(|| die("the libraries link against each other in a cycle"));
+        let a = left.swap_remove(i);
+        let code = evm::link_code(&a.bytecode, &a.links, libs).unwrap();
+        let at = evm::CREATE2_DEPLOYER.create2_from_code(salt, &code);
+        libs.insert(format!("{}:{}", a.file, a.name), at);
+        cheats.names.insert(at, a.name.clone());
+        let there = revm::Database::basic(&mut db, at).unwrap_or_else(|e| die(&format!("couldn't read {at} from the RPC ({e})")));
+        if there.is_some_and(|i| i.code_hash != revm::primitives::KECCAK_EMPTY) {
+            continue;
+        }
+        let data: Bytes = [salt.as_slice(), &code].concat().into();
+        let r;
+        (db, r) = evm::transact(db, env, cheats, from, TxKind::Call(evm::CREATE2_DEPLOYER), data.clone(), U256::ZERO, true);
+        if !r.ok {
+            die(&format!("deploying library {}:{} through the CREATE2 deployer failed: {}", a.file, a.name, why(&r.output)));
+        }
+        txs.push(BroadcastTx { from, to: Some(evm::CREATE2_DEPLOYER), value: U256::ZERO, data, created: Some(at) });
+    }
+    db
+}
+
+/// forge's dry-run journal of a simulation, broadcast/<script file>/<chain id>/dry-run/run-latest.json (and
+/// run-<ms>.json), for tools that read forge's plans: every transaction as it would be sent, at the nonces its sender
+/// has at the block the simulation ran on. `returns` and `arguments` stay empty.
+fn journal(p: &Project, conn: &Conn, script: &Artifact, txs: &[BroadcastTx], sims: &[Sim], names: &HashMap<Address, String>, libs: &HashMap<String, Address>) {
+    let mut senders: Vec<Address> = txs.iter().map(|t| t.from).collect();
+    senders.sort();
+    senders.dedup();
+    let block = format!("{:#x}", conn.block);
+    let r = rpc::batch(&conn.url, &senders.iter().map(|a| ("eth_getTransactionCount", json!([a, block]))).collect::<Vec<_>>()).unwrap_or_else(|e| die(&e));
+    let mut nonces: HashMap<Address, u64> = senders.iter().zip(&r).map(|(a, n)| (*a, hexnum(n, &format!("{a}'s nonce at block {}", conn.block)) as u64)).collect();
+    let addr = |a: &Address| format!("{a:#x}");
+    let transactions: Vec<Value> = txs
+        .iter()
+        .zip(sims)
+        .map(|(tx, s)| {
+            let nonce = nonces.get_mut(&tx.from).unwrap();
+            let (kind, at) = match tx.to {
+                None => ("CREATE", tx.created),
+                Some(evm::CREATE2_DEPLOYER) => ("CREATE2", tx.created),
+                Some(to) => ("CALL", Some(to)),
+            };
+            let function = tx.to.filter(|_| kind == "CALL" && tx.data.len() >= 4).and_then(|_| decode::tables()?.functions.get(&<[u8; 4]>::try_from(&tx.data[..4]).ok()?)).map(|f| f.signature());
+            let nested: Vec<Value> = s.creates.iter().filter(|(a, _)| Some(*a) != tx.created).map(|(a, init)| json!({"contractName": names.get(a), "address": addr(a), "initCode": format!("0x{}", hex::encode(init))})).collect();
+            let t = json!({
+                "hash": null,
+                "transactionType": kind,
+                "contractName": at.and_then(|a| names.get(&a)),
+                "contractAddress": at.as_ref().map(addr),
+                "function": function,
+                "arguments": null,
+                "transaction": {"from": addr(&tx.from), "to": tx.to.as_ref().map(addr), "gas": format!("{:#x}", gas_limit(conn, s)), "value": format!("{:#x}", tx.value), "input": format!("0x{}", hex::encode(&tx.data)), "nonce": format!("{:#x}", *nonce), "chainId": format!("{:#x}", conn.chain)},
+                "additionalContracts": nested,
+                "isFixedGasLimit": false,
+            });
+            *nonce += 1;
+            t
+        })
+        .collect();
+    let mut libraries: Vec<String> = libs.iter().map(|(id, a)| format!("{id}:{a}")).collect();
+    libraries.sort();
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let j = json!({"transactions": transactions, "receipts": [], "libraries": libraries, "pending": [], "returns": {}, "timestamp": ms, "chain": conn.chain, "commit": null});
+    let dir = p.root.join("broadcast").join(script.file.rsplit('/').next().unwrap_or(&script.file)).join(conn.chain.to_string()).join("dry-run");
+    let text = serde_json::to_string_pretty(&j).unwrap();
+    for name in [format!("run-{ms}.json"), "run-latest.json".into()] {
+        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join(name), &text)).unwrap_or_else(|e| die(&format!("{}: {e}", dir.display())));
+    }
+    let latest = dir.join("run-latest.json");
+    println!("plan written to {}", latest.strip_prefix(&p.root).unwrap_or(&latest).display());
 }
 
 /// Sends signed transactions (see send), saves where what they made landed and what explorers need to verify it,
