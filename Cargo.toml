@@ -1,6 +1,6 @@
 [package]
 name = "plain-evm" # "plain" on crates.io is an unrelated crate; the binary is still `plain`
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Compile, test and deploy EVM smart contracts with a single binary that needs no setup"
 license = "MIT"
