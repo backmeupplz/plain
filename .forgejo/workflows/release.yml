@@ -1,0 +1,241 @@
+# Pushing a v* tag to git.borodutch.com (`git tag v0.4.2 && git push origin v0.4.2`; the push mirror carries it to GitHub)
+# builds plain for each platform the installer (docs/install) supports on the Forgejo runners, packages the Linux binary as
+# a .deb and a signed .rpm, and publishes everything in one go with SHA256SUMS, which the installer checks, as the GitHub
+# Release (installers, Homebrew, npm, AUR and binstall download from there) and the same release on git.borodutch.com.
+# Publishing the GitHub Release runs .github/workflows/attest.yml on GitHub, which adds a build provenance attestation for
+# each file listed in SHA256SUMS (`gh attestation verify <file> -R backmeupplz/plain`; mise checks them by itself;
+# SHA256SUMS itself isn't attested), since Forgejo has no GitHub OIDC. Then it updates every package channel:
+#   Homebrew     Formula/plain.rb in backmeupplz/homebrew-tap on git.borodutch.com     (secret FJ_PUSH_TOKEN)
+#   npm          plain-evm and plain-evm-<os>-<cpu>                                (secret NPM_TOKEN, skipped while unset)
+#   apt and dnf  signed repos at https://pkg.getplain.org, GitHub Pages from backmeupplz/plain-packages, pushed to
+#                git.borodutch.com and mirrored (secrets PACKAGES_GPG_PRIVATE_KEY, which also signs the .rpm, and FJ_PUSH_TOKEN)
+#   AUR          plain-bin                                                         (secret AUR_SSH_PRIVATE_KEY)
+#   crates.io    plain-evm                                                 (secret CARGO_REGISTRY_TOKEN, skipped while unset)
+# GH_MIRROR_TOKEN (a GitHub PAT) creates the GitHub Release; the repo itself is a read-only mirror there.
+# The channel jobs run independently after the release, so one failing holds up none of the others and can be re-run
+# alone. Actions are pinned to commits, nfpm to a checksum and the AUR's SSH host key is pinned, so a moved tag or a
+# spoofed host can't change a release, and no third-party action ever sees a secret.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency: release # one release at a time: the tap and the package repo are pushed, not merged
+env:
+  GH_REPO: ${{ github.repository }} # gh talks to github.com/backmeupplz/plain, not to the Forgejo remote
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          # glibc 2.34+; no linux-arm64 build yet (solc has official ones only since 0.8.31), cargo and nix build one
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust stable, in the job's own directory (the macOS runner is a shared host, the Linux image has none)
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | CARGO_HOME="$RUNNER_TEMP/cargo" RUSTUP_HOME="$RUNNER_TEMP/rustup" \
+            sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: tar -czf plain-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release plain
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
+        with:
+          name: plain-${{ matrix.target }}
+          path: plain-${{ matrix.target }}.tar.gz
+
+  # One job publishes the release with every file at once, so releases/latest/download/* never 404s mid-release.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
+        with:
+          pattern: plain-*
+          path: dist
+          merge-multiple: true
+      - name: .deb and signed .rpm
+        env:
+          GPG_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+          # pinned by checksum because it gets the signing key
+          NFPM_URL: https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz
+          NFPM_SHA256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+        run: |
+          curl -sSfL "$NFPM_URL" -o "$RUNNER_TEMP/nfpm.tar.gz"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP" nfpm
+          tar -xzf dist/plain-x86_64-unknown-linux-gnu.tar.gz # ./plain, which packaging/nfpm.yaml packages
+          (umask 077 && printf '%s\n' "$GPG_KEY" > key.asc)
+          for format in deb rpm; do
+            VERSION="${GITHUB_REF_NAME#v}" RPM_SIGNING_KEY_FILE="$PWD/key.asc" \
+              "$RUNNER_TEMP/nfpm" pkg -f packaging/nfpm.yaml -p "$format" -t dist/
+          done
+          rm key.asc plain
+      - run: cd dist && sha256sum plain* > SHA256SUMS && cat SHA256SUMS
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "" --verify-tag
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+
+  forgejo:
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - name: The same release on git.borodutch.com
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          FJ_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -D dist
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases"
+          id=$(jq -n --arg t "$GITHUB_REF_NAME" '{tag_name: $t, name: $t, body: ""}' |
+            curl -sSf -H "Authorization: token $FJ_TOKEN" -H 'Content-Type: application/json' -d @- "$api" | jq .id)
+          for f in dist/*; do
+            curl -sSf -o /dev/null -H "Authorization: token $FJ_TOKEN" -F "attachment=@$f" "$api/$id/assets?name=$(basename "$f")"
+          done
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - name: Formula/plain.rb in backmeupplz/homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          FJ_PUSH_TOKEN: ${{ secrets.FJ_PUSH_TOKEN }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS
+          packaging/homebrew/formula.sh "${GITHUB_REF_NAME#v}" SHA256SUMS > plain.rb
+          git clone --depth 1 "https://backmeupplz:$FJ_PUSH_TOKEN@git.borodutch.com/backmeupplz/homebrew-tap.git" tap
+          mv plain.rb tap/Formula/plain.rb
+          cd tap
+          git add Formula/plain.rb
+          git diff --cached --quiet && exit 0
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "plain ${GITHUB_REF_NAME#v}"
+          git push
+
+  npm:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org # writes an .npmrc that reads NODE_AUTH_TOKEN
+      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
+      - name: Publish, platform packages first so plain-evm's optional dependencies resolve
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::NPM_TOKEN isn't set on git.borodutch.com, so npm isn't published: add it as a repo secret and re-run this job"
+            exit 0
+          fi
+          v=${GITHUB_REF_NAME#v}
+          gh release download "$GITHUB_REF_NAME" -p 'plain-*.tar.gz' -D dist
+          packaging/npm/build.sh "$v" dist npm
+          for dir in npm/plain-evm-* npm/plain-evm; do
+            npm view "$(basename "$dir")@$v" version > /dev/null 2>&1 || npm publish "./$dir" --access public
+          done
+
+  packages:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c && { command -v gh || sudo apt-get install -y gh; }
+      - name: The .deb and .rpm of the last 5 releases
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+        run: |
+          for tag in $(gh release list --exclude-drafts --limit 5 --json tagName --jq '.[].tagName'); do
+            gh release download "$tag" -p '*.deb' -p '*.rpm' -D pkgs || echo "$tag has no .deb or .rpm"
+          done
+      - name: Signed apt and dnf repos, force-pushed as one commit so old packages don't pile up in git history
+        env:
+          GPG_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+          FJ_PUSH_TOKEN: ${{ secrets.FJ_PUSH_TOKEN }}
+        run: |
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          packaging/build-repos.sh pkgs site
+          echo pkg.getplain.org > site/CNAME
+          cd site
+          git init -q -b main
+          git add -A
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qm "plain $GITHUB_REF_NAME"
+          git push -f "https://backmeupplz:$FJ_PUSH_TOKEN@git.borodutch.com/backmeupplz/plain-packages.git" main
+
+  aur:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends makepkg pacman-package-manager && { command -v gh || sudo apt-get install -y gh; }
+      - name: plain-bin on the AUR
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS
+          bin=$(awk '$2 == "plain-x86_64-unknown-linux-gnu.tar.gz" { print $1 }' SHA256SUMS | grep .)
+          printf '%s\n' "$AUR_KEY" > "$RUNNER_TEMP/key" && chmod 600 "$RUNNER_TEMP/key"
+          echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          git clone ssh://aur@aur.archlinux.org/plain-bin.git aur
+          sed -e "s/^pkgver=.*/pkgver=$v/" -e "s/^pkgrel=.*/pkgrel=1/" \
+            -e "s/^sha256sums=.*/sha256sums=('$(sha256sum LICENSE | cut -d' ' -f1)')/" \
+            -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin')/" packaging/aur/PKGBUILD > aur/PKGBUILD
+          # .SRCINFO comes from makepkg itself (Ubuntu's, since jobs get no Docker; same output as Arch's for this
+          # PKGBUILD), which refuses to run as root and wants a writable directory
+          useradd -m b && cp aur/PKGBUILD /home/b/ && su b -c 'cd ~ && makepkg --printsrcinfo' > aur/.SRCINFO
+          cd aur
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && exit 0
+          git -c user.name=backmeupplz -c user.email=backmeupplz@gmail.com commit -qm "plain $v"
+          git push origin HEAD:master
+
+  crates:
+    needs: release # binstall's metadata points at the release tarballs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN isn't set on git.borodutch.com, so crates.io isn't published: add it as a repo secret and re-run this job"
+            exit 0
+          fi
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          ~/.cargo/bin/cargo publish --locked

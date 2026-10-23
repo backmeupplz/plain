@@ -1,5 +1,5 @@
 # Maintainer: Nikita Kolmogorov <backmeupplz@gmail.com>
-# pkgver and both sha256sums are filled in for each release by .github/workflows/release.yml
+# pkgver and both sha256sums are filled in for each release by .forgejo/workflows/release.yml
 pkgname=plain-bin
 pkgver=0.2.0
 pkgrel=1
