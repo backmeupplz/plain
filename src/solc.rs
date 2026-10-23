@@ -239,7 +239,11 @@ fn list() -> Value {
         if let Ok(mut r) = ureq::get(&url).call() {
             if let Ok(s) = r.body_mut().read_to_string() {
                 std::fs::create_dir_all(cached.parent().unwrap()).ok();
-                std::fs::write(&cached, s).ok();
+                // temp file + rename: parallel plain processes read this while one of them refreshes it
+                let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
+                if std::fs::write(&tmp, s).is_ok() {
+                    std::fs::rename(&tmp, &cached).ok();
+                }
             }
         }
     }
@@ -366,7 +370,10 @@ fn target_evm(p: &Project, version: &str) -> String {
         let words: Vec<&str> = section.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| EVMS.contains(w)).collect();
         let list = words.join(" ");
         std::fs::create_dir_all(path.parent().unwrap()).ok();
-        std::fs::write(&path, &list).ok();
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, &list).is_ok() {
+            std::fs::rename(&tmp, &path).ok();
+        }
         list
     });
     let newest = EVMS.iter().rev().find(|e| known.split(' ').any(|k| k == **e)).copied().unwrap_or("cancun");
@@ -903,7 +910,7 @@ impl Plan {
             // core's share of the build, not less.
             let floor = if p.via_ir { 48 * 1024 } else { usize::MAX };
             let old = cache.files.get(*f).filter(|o| !o.units.is_empty() && !force);
-            let big = old.is_some_and(|o| o.units.len() > 1) || split > slot || test_bytes > 2 * floor;
+            let big = old.is_some_and(|o| o.units.len() > 1) || split > slot || test_bytes > floor.saturating_mul(2);
             if test && workers > 1 {
                 // contract indices survive the `new` rewrite (it only edits bodies and appends a free function)
                 let in_test = |ci: usize| testish.get(&(f.as_str(), ci)).copied().unwrap_or(false);

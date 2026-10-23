@@ -1,0 +1,25 @@
+# Runs on git.borodutch.com's Forgejo runner. GitHub ignores .forgejo/, and Forgejo ignores .github/workflows.
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup
+            ~/.plain/solc
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+      - run: command -v cargo || curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      # the TS fixture test imports viem
+      - run: npm install --prefix tests/fixture --no-package-lock --no-audit --no-fund
+      - run: ~/.cargo/bin/cargo test --locked
