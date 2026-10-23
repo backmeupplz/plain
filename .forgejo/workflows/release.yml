@@ -6,11 +6,11 @@
 # each file listed in SHA256SUMS (`gh attestation verify <file> -R backmeupplz/plain`; mise checks them by itself;
 # SHA256SUMS itself isn't attested), since Forgejo has no GitHub OIDC. Then it updates every package channel:
 #   Homebrew     Formula/plain.rb in backmeupplz/homebrew-tap on git.borodutch.com     (secret FJ_PUSH_TOKEN)
-#   npm          plain-evm and plain-evm-<os>-<cpu>                                (secret NPM_TOKEN, skipped while unset)
+#   npm          plain-evm and plain-evm-<os>-<cpu>     (on GitHub: .github/workflows/release.yml, trusted publishing)
 #   apt and dnf  signed repos at https://pkg.getplain.org, GitHub Pages from backmeupplz/plain-packages, pushed to
 #                git.borodutch.com and mirrored (secrets PACKAGES_GPG_PRIVATE_KEY, which also signs the .rpm, and FJ_PUSH_TOKEN)
 #   AUR          plain-bin                                                         (secret AUR_SSH_PRIVATE_KEY)
-#   crates.io    plain-evm                                                 (secret CARGO_REGISTRY_TOKEN, skipped while unset)
+#   crates.io    plain-evm                              (on GitHub: .github/workflows/release.yml, trusted publishing)
 # GH_MIRROR_TOKEN (a GitHub PAT) creates the GitHub Release; the repo itself is a read-only mirror there.
 # The channel jobs run independently after the release, so one failing holds up none of the others and can be re-run
 # alone. Actions are pinned to commits, nfpm to a checksum and the AUR's SSH host key is pinned, so a moved tag or a
@@ -132,34 +132,6 @@ jobs:
             commit -m "plain ${GITHUB_REF_NAME#v}"
           git push
 
-  npm:
-    needs: release
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org # writes an .npmrc that reads NODE_AUTH_TOKEN
-      - run: command -v gh || { sudo apt-get update && sudo apt-get install -y gh; }
-      - name: Publish, platform packages first so plain-evm's optional dependencies resolve
-        env:
-          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::warning::NPM_TOKEN isn't set on git.borodutch.com, so npm isn't published: add it as a repo secret and re-run this job"
-            exit 0
-          fi
-          v=${GITHUB_REF_NAME#v}
-          gh release download "$GITHUB_REF_NAME" -p 'plain-*.tar.gz' -D dist
-          packaging/npm/build.sh "$v" dist npm
-          for dir in npm/plain-evm-* npm/plain-evm; do
-            npm view "$(basename "$dir")@$v" version > /dev/null 2>&1 || npm publish "./$dir" --access public
-          done
-
   packages:
     needs: release
     runs-on: ubuntu-24.04
@@ -221,21 +193,3 @@ jobs:
           git diff --cached --quiet && exit 0
           git -c user.name=backmeupplz -c user.email=backmeupplz@gmail.com commit -qm "plain $v"
           git push origin HEAD:master
-
-  crates:
-    needs: release # binstall's metadata points at the release tarballs
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::CARGO_REGISTRY_TOKEN isn't set on git.borodutch.com, so crates.io isn't published: add it as a repo secret and re-run this job"
-            exit 0
-          fi
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          ~/.cargo/bin/cargo publish --locked
