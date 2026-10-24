@@ -48,3 +48,9 @@ ureq = { version = "3.4.2", features = ["json"] }
 lto = true
 codegen-units = 1
 strip = true
+
+# scrypt is ~100x slower unoptimized: keystore tests (and debug runs) would spend seconds per unlock
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
