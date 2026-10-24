@@ -4,22 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
     runs-on: ubuntu-latest
+    # act image + Rust and Node preinstalled: no rustup download or toolchain cache per run
+    container: ghcr.io/catthehacker/ubuntu:rust-24.04
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.rustup
-            ~/.plain/solc
-            target
-          key: cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-
-      - run: command -v cargo || curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-      # the TS fixture test imports viem
-      - run: npm install --prefix tests/fixture --no-package-lock --no-audit --no-fund
-      - run: ~/.cargo/bin/cargo test --locked
+          cache-directories: ~/.plain/solc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: |
+          rustc --version; node --version
+          # the TS fixture test imports viem; install it while the tests compile
+          npm install --prefix tests/fixture --no-package-lock --no-audit --no-fund > npm.log 2>&1 &
+          npm=$!
+          cargo test --locked --no-run
+          wait $npm || { cat npm.log; exit 1; }
+          cargo test --locked
