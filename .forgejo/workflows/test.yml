@@ -28,7 +28,7 @@ jobs:
         with:
           workspaces: . -> ../../../ramdisk/target # = CARGO_TARGET_DIR, relative to /workspace/<owner>/<repo>
           cache-directories: /ramdisk/plain/solc
-          save-if: true # TEMP: measure warm runs on the PR
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: |
           rustc --version; node --version
           # the TS fixture test imports viem; install it while the tests compile
