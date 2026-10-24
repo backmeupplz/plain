@@ -20,7 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-directories: ~/.plain/solc
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: measure warm runs on the PR
       - run: |
           rustc --version; node --version
           # the TS fixture test imports viem; install it while the tests compile
