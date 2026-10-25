@@ -101,6 +101,10 @@ fn build_outputs() {
     let art: serde_json::Value = serde_json::from_slice(&std::fs::read("tests/fixture/tmp/out/Counter.sol/Counter.json").unwrap()).unwrap();
     assert!(art["deployedBytecode"]["object"].as_str().unwrap().starts_with("0x60"), "{art}");
     assert_eq!(art["storageLayout"]["storage"][0]["label"], "number", "{art}");
+    // forge's methodIdentifiers, and its ABI order (functions by name)
+    assert_eq!(art["methodIdentifiers"]["number()"], "8381f58a", "{art}");
+    let names: Vec<&str> = art["abi"].as_array().unwrap().iter().filter(|x| x["type"] == "function").map(|x| x["name"].as_str().unwrap()).collect();
+    assert!(names.windows(2).all(|w| w[0] <= w[1]), "{names:?}");
     let (ok, text) = plain(&["inspect", "Counter", "storage-layout", "--json"]);
     let layout: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
     assert!(ok && layout["storage"][1]["label"] == "owner", "{text}");
@@ -225,4 +229,86 @@ fn configured_libraries() {
     assert!(text.contains("1. create Adder") && text.contains("2. create UsesLib"), "{text}");
     let text = deploy(r#"libraries = ["src/Lib.sol:Adder:0x00000000000000000000000000000000000000Ad"]"#);
     assert!(text.contains("1. create UsesLib") && !text.contains("Adder"), "{text}");
+}
+
+#[test]
+fn fmt_like_forge() {
+    // forge fmt 1.7.1's output for this input with these [fmt] settings, byte for byte
+    let dir = "tests/fixture/tmp/fmt";
+    std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+    std::fs::write(format!("{dir}/foundry.toml"), "[fmt]\nline_length = 60\nint_types = \"short\"\nbracket_spacing = true\nsort_imports = true\n").unwrap();
+    let input = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {B} from \"./B.sol\";\nimport {A as Z} from './A.sol';\ncontract  Counter{\nuint256 public number;event Set(uint256 indexed value,address indexed by,uint256 when);\n    function set(uint256 n,address who,uint256 when) external { number=n; emit Set(n,who,when); }\n  // forgefmt: disable-next-line\n  function   keep( ) external {}\n}\n";
+    let want = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport { A as Z } from \"./A.sol\";\nimport { B } from \"./B.sol\";\n\ncontract Counter {\n    uint public number;\n    event Set(\n        uint indexed value, address indexed by, uint when\n    );\n\n    function set(uint n, address who, uint when) external {\n        number = n;\n        emit Set(n, who, when);\n    }\n    // forgefmt: disable-next-line\n  function   keep( ) external {}\n}\n";
+    std::fs::write(format!("{dir}/src/A.sol"), input).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(args).current_dir(dir).output().unwrap();
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let (ok, text) = run(&["fmt", "--check"]);
+    assert!(!ok && text.contains("src/A.sol"), "{text}");
+    assert_eq!(std::fs::read_to_string(format!("{dir}/src/A.sol")).unwrap(), input, "--check wrote the file");
+    let (ok, text) = run(&["fmt"]);
+    assert!(ok, "{text}");
+    assert_eq!(std::fs::read_to_string(format!("{dir}/src/A.sol")).unwrap(), want);
+    let (ok, text) = run(&["fmt", "--check"]);
+    assert!(ok, "{text}");
+    // a key forge doesn't have is an error, not a silent difference
+    std::fs::write(format!("{dir}/foundry.toml"), "[fmt]\nline_lenght = 60\n").unwrap();
+    let (ok, text) = run(&["fmt", "--check"]);
+    assert!(!ok && text.contains("line_lenght"), "{text}");
+}
+
+#[test]
+fn node_like_anvil() {
+    // plain node with anvil's flags: a geth-style genesis' alloc, the chain id, gas limit and base fee
+    let dir = "tests/fixture/tmp/node";
+    std::fs::create_dir_all(dir).unwrap();
+    // runtime: return storage slot 0 (PUSH0 SLOAD PUSH0 MSTORE PUSH1 32 PUSH0 RETURN)
+    std::fs::write(format!("{dir}/genesis.json"), r#"{"config":{"chainId":8453},"timestamp":"0x6553f100","alloc":{"0x000000000000000000000000000000000000bEEF":{"balance":"0x2a","nonce":"0x3","code":"0x5f545f5260205ff3","storage":{"0x0":"0x07"}}}}"#).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_plain"))
+        .args(["node", "--host", "127.0.0.1", "--port", &port, "--init", "genesis.json", "--gas-limit", "16777216", "--base-fee", "100", "--silent"])
+        .current_dir(dir)
+        .spawn()
+        .unwrap();
+    let rpc = |method: &str, params: serde_json::Value| -> serde_json::Value {
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
+        for _ in 0..100 {
+            if let Ok(mut s) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+                write!(s, "POST / HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
+                let mut r = std::io::BufReader::new(s);
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    r.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut out = vec![0; len];
+                r.read_exact(&mut out).unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                return v["result"].clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("plain node didn't start");
+    };
+    let beef = "0x000000000000000000000000000000000000beef";
+    let checks = [
+        (rpc("eth_chainId", serde_json::json!([])), "0x2105"),
+        (rpc("eth_getBalance", serde_json::json!([beef, "latest"])), "0x2a"),
+        (rpc("eth_getTransactionCount", serde_json::json!([beef, "latest"])), "0x3"),
+        (rpc("eth_call", serde_json::json!([{"to": beef}, "latest"])), "0x0000000000000000000000000000000000000000000000000000000000000007"),
+        (rpc("eth_getBlockByNumber", serde_json::json!(["latest", false]))["gasLimit"].clone(), "0x1000000"),
+        (rpc("eth_getBlockByNumber", serde_json::json!(["latest", false]))["baseFeePerGas"].clone(), "0x64"),
+        (rpc("eth_getBlockByNumber", serde_json::json!(["0x0", false]))["timestamp"].clone(), "0x6553f100"),
+    ];
+    child.kill().ok();
+    for (got, want) in checks {
+        assert_eq!(got, want);
+    }
 }

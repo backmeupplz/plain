@@ -1,6 +1,6 @@
 # plain
 
-Compile, test, deploy, verify and upgrade EVM smart contracts with one ~7 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
+Compile, test, deploy, verify and upgrade EVM smart contracts with one ~9 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
 
 ```sh
 curl -fsSL https://getplain.org/install | sh   # macOS and Linux
@@ -24,6 +24,7 @@ plain is also on Homebrew (`brew install backmeupplz/tap/plain`), npm, mise, apt
 - **Test:** runs Solidity tests in the forge-std style (`*.t.sol`, `setUp`, `test*`, fuzzing, invariants, cheatcodes) on revm, in parallel. It also runs `test/**/*.test.ts` files against a fresh in-process chain per file. A suite whose compiled code and inputs haven't changed reuses its last results.
 - **Deploy:** runs Solidity scripts (`vm.startBroadcast`) or a single contract, optionally behind an OpenZeppelin proxy. It always simulates first, against a fork of the target network, then signs and sends when you add `--broadcast`, and verifies every contract it created on Sourcify, Etherscan and the chain's Blockscout. Keys stay in encrypted keystores (`plain account`, Foundry's work too).
 - **Upgrade:** `plain upgrade` checks that the new implementation keeps the proxy's storage layout, then deploys it and points the proxy at it.
+- **Format:** `plain fmt` lays out `src/`, `test/` and `script/` exactly as `forge fmt` 1.7.1 does, byte for byte and with `foundry.toml`'s `[fmt]` settings, in about a third of its time; `plain fmt --check` is the CI gate.
 - **Menu:** `plain` with no arguments opens a menu for all of the above that prints every command it runs.
 - **Networks:** any chain on [chainlist.org](https://chainlist.org), by name or chain id (`base`, `base-sepolia`, `linea`, `8453`, ...), or a URL.
 - **Zero setup:** `forge-std` is built into the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. `lib/` dependencies, `remappings.txt` and `node_modules` (`@openzeppelin/...`) resolve automatically.
@@ -39,17 +40,22 @@ plain deploy <Contract|path/Script.s.sol> [args...] [--network <name|id|url>] [-
 plain deploy --resume --network <name|id|url>
 plain script <path/Script.s.sol[:Contract]> --rpc-url <url|name> [--chain <id>] [--broadcast] [--slow]   # forge script's flags; writes forge's dry-run journal
 plain upgrade <proxy> [Contract] [--call <function> args...] --network <name|id|url> [--account <name>] [--broadcast] [--slow]
+plain fmt [paths...] [--check]                 # forge fmt's output; - formats stdin
 plain inspect <Contract> storage-layout [--json]
 plain verify [--network <name|id|url>] [name|address...] [--export]
 plain account [new <name> | import <name>]
-plain node [--port 8545] [--fork <network|url>]
+plain node [--port 8545] [--fork <network|url>] [--host ip] [--init genesis.json] [--chain-id N] [--gas-limit N] [--base-fee N] [--silent]
 plain init
 plain <anything>            # runs `plain-<anything>` from PATH (plugins)
 ```
 
 `filter` matches suite paths (`test/Vault.t.sol:VaultTest`) and test names, and only the test files it can match get compiled. A filter that matches nothing, or an unknown option, is an error. Exit code is non-zero on any failure.
 
-`plain build --check` compiles every contract again from the standard JSON input explorers get and fails unless the bytecode is identical. Given files, `plain build` builds only those and what they import, and `--skip test` or `--skip script` leaves those out. `--sizes` prints forge's table of runtime and init code sizes and fails when a contract is over the EIP-170 or EIP-3860 limit. `--out <dir>` (or `FOUNDRY_OUT`) also writes forge's artifact layout there (`<dir>/<File.sol>/<Name>.json`) for tools that read forge's `out/`, with each contract's storage layout under `--extra-output storageLayout`, and `plain inspect <Contract> storage-layout` prints a storage layout (`--json` for forge's JSON).
+`plain build --check` compiles every contract again from the standard JSON input explorers get and fails unless the bytecode is identical. Given files, `plain build` builds only those and what they import, and `--skip test` or `--skip script` leaves those out. `--sizes` prints forge's table of runtime and init code sizes and fails when a contract is over the EIP-170 or EIP-3860 limit. `--out <dir>` (or `FOUNDRY_OUT`) also writes forge's artifact layout there (`<dir>/<File.sol>/<Name>.json`, `<Name>.<profile>.json` for other compiler profiles) for tools that read forge's `out/`: the ABI in forge's order, both bytecodes with their link and immutable references, and `methodIdentifiers`, with each contract's storage layout under `--extra-output storageLayout`. Contracts in `src/` and libraries are byte for byte forge's; test and script contracts are plain's own builds (see Benchmarks), and `plain inspect <Contract> storage-layout` prints a storage layout (`--json` for forge's JSON).
+
+`plain fmt` is forge fmt's formatter (Foundry 1.7.1's, on the same solar parser), so its output is forge's for every `[fmt]` setting (`line_length`, `tab_width`, `style`, `bracket_spacing`, `int_types`, `multiline_func_header`, `quote_style`, `number_underscore`, `hex_underscore`, `single_line_statement_blocks`, `override_spacing`, `wrap_comments`, `docs_style`, `ignore`, `contract_new_lines`, `sort_imports`, `namespace_import_style`, `pow_no_space`, `prefer_compact`, `single_line_imports`) and `// forgefmt:` comments; a key forge doesn't know is an error. `--check` lists the files that would change and exits 1. On veydrift's 200 files `plain fmt --check` takes 47 ms against forge's 150 ms, on v4-core 16 ms against 40 ms.
+
+`plain node` takes anvil's flags, so a script that starts `anvil --host 127.0.0.1 --port N --init genesis.json --chain-id 8453 --gas-limit N --base-fee N --silent` can start `plain node` instead: `--init` loads a geth-style genesis (each `alloc` account's balance, nonce, code and storage, its `timestamp`, and `config.chainId`), transactions get their own gas limit and pay the base fee, failed transactions with a gas limit are mined with status 0, and `eth_estimateGas` finds the lowest gas a call succeeds with, as anvil's does.
 
 Semantics follow forge 1.x: `expectRevert(bytes4)` is an exact match (`expectPartialRevert` for selector-only), `testFail*` fails, invariants check the initial state and `afterInvariant()`, tests run under the configured `evm_version` (default: forge's osaka, compiled for the newest EVM the solc supports), `FOUNDRY_PROFILE` selects a profile. `--isolate` (or `isolate = true`) runs each call a test makes as a transaction of its own, as forge's does, and `--gas-limit` sets the gas each test and its block get. A file that `compilation_restrictions` rule out of the default settings compiles with the first of `additional_compiler_profiles` that fits, as in forge, and its tests deploy that profile's builds. `vm.ffi` needs `ffi = true` and file cheatcodes need `fs_permissions`, as in forge; `test/**/*.test.ts` runs only with `typescript = true` in plain.toml.
 
@@ -234,6 +240,6 @@ Where the speed comes from (solc itself is unchanged: what gets deployed is byte
 
 ## Not included (on purpose)
 
-Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, the `vm.deployCode` cheatcode (use `vm.getCode` + `create`), `targetArtifacts`/`targetInterfaces` (invariants using them fail rather than pass), OpenZeppelin 4 transparent proxies, and beacon proxies. Library linking only works for libraries under `src/`/`test/`/`script/`.
+Gas snapshot files, coverage, verifying contracts plain didn't deploy, the `vm.deployCode` cheatcode (use `vm.getCode` + `create`), `targetArtifacts`/`targetInterfaces` (invariants using them fail rather than pass), OpenZeppelin 4 transparent proxies, and beacon proxies. Library linking only works for libraries under `src/`/`test/`/`script/`.
 
 Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs (more so for tests you just edited, which compile without the optimizer until the file is re-split). Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).

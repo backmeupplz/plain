@@ -37,6 +37,9 @@ pub struct Artifact {
     /// the compiler profile it was compiled with (0: the default; see `profile_of`)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub profile: u32,
+    /// solc's methodIdentifiers, when the ABI doesn't give them (a library's struct and storage parameters)
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub methods: Value,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -418,7 +421,7 @@ fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (O
     let key = {
         use sha2::Digest;
         // bump the suffix when rewrites change what gets compiled
-        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings:?}{:?}{:?}{forced:?}rw6", salt(), p.restrictions, p.dirs).as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{}{version}{settings:?}{:?}{:?}{forced:?}rw8", salt(), p.restrictions, p.dirs).as_bytes()))
     };
     let cache_path = p.root.join(match forced {
         Some(k) => format!(".plain/cache-{k}.json"),
@@ -577,6 +580,43 @@ fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (O
             results.retain(|r| !(r.0.fast && r.1.is_err()));
             results.extend(run_jobs(&solc, &g, &retry, &settings, p, &plan.sources, &plan.gen_deps));
         }
+        // solc can fail a unit (via-IR's "stack too deep") that compiles fine as two: what it inlines depends on
+        // everything in the unit. A failing unit is split in halves, again while they fail, before the whole file
+        // falls back to its original sources (one big unsharded compile).
+        loop {
+            let failed: Vec<(Job, usize)> = results
+                .iter()
+                .filter(|r| r.1.is_err() && r.0.test)
+                .filter_map(|r| {
+                    let (k, _) = r.0.shard?;
+                    let f = &r.0.files[0];
+                    (plan.split.contains_key(f) && plan.units.get(f)?.1[k].0.owns.len() >= 2).then(|| (Job { files: r.0.files.clone(), only: r.0.only.clone(), ..r.0 }, k))
+                })
+                .collect();
+            if failed.is_empty() {
+                break;
+            }
+            results.retain(|r| !(r.1.is_err() && failed.iter().any(|(j, _)| j.files == r.0.files && j.shard == r.0.shard)));
+            let mut jobs = vec![];
+            for (job, k) in failed {
+                let f = job.files[0].clone();
+                let units = &mut plan.units.get_mut(&f).unwrap().1;
+                let owns = std::mem::take(&mut units[k].0.owns);
+                let (a, b) = owns.split_at(owns.len() / 2);
+                let part = |m: &UnitMeta, names: &[String]| UnitMeta { owns: names.to_vec(), tests: m.tests.iter().filter(|(n, _)| names.contains(n)).map(|(n, h)| (n.clone(), h.clone())).collect(), hot: m.hot, ms: 0 };
+                let (first, second) = (part(&units[k].0, a), part(&units[k].0, b));
+                units[k].0 = first;
+                units.push((second, None));
+                let m = units.len() - 1;
+                for (i, names) in [(k, a.to_vec()), (m, b.to_vec())] {
+                    let src = plan.unit_source(&f, &names);
+                    plan.sources.insert(format!("{f}#{i}"), src);
+                    let only = if i == 0 { vec![] } else { plan.split[&f].only.clone() };
+                    jobs.push(Job { files: vec![f.clone()], shard: Some((i, m + 1)), only, est: job.est / 2, fast: false, ..job });
+                }
+            }
+            results.extend(run_jobs(&solc, &g, &jobs, &settings, p, &plan.sources, &plan.gen_deps));
+        }
         phase("collect");
         // a rewrite that broke a test file: compile it again from the original sources (also reports real errors)
         let broken: Vec<String> = {
@@ -588,6 +628,11 @@ fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (O
         if !broken.is_empty() {
             if std::env::var_os("PLAIN_DEBUG").is_some() {
                 eprintln!("rewrite fallback: {broken:?}");
+                for r in results.iter().filter(|r| r.0.test) {
+                    if let Err(e) = &r.1 {
+                        eprintln!("  {:?} shard {:?}: {}", r.0.files, r.0.shard, e.replace('\u{0}', "\n"));
+                    }
+                }
             }
             results.retain(|r| !r.0.files.iter().any(|f| broken.contains(f)));
             let jobs: Vec<Job> = broken.iter().map(|f| Job { files: vec![f.clone()], shard: None, test: false, est: 0, fast: false, only: vec![], profile: profile_of(p, &g, f) }).collect();
@@ -739,9 +784,28 @@ struct Plan {
     rewritten: std::collections::HashSet<(String, String)>,
     /// sharded test files: shared hash and units, each reusing the previous build's unit (by index) or compiled
     units: HashMap<String, (String, Vec<(UnitMeta, Option<u32>)>)>,
+    /// sharded test files: what cutting one down to some of its tests takes (see `Plan::unit_source`)
+    split: HashMap<String, Splitter>,
+}
+
+struct Splitter {
+    content: String,
+    unit: crate::rewrite::Unit,
+    in_test: Vec<bool>,
+    removable: std::collections::HashSet<String>,
+    /// the test contracts, which units after the first compile
+    only: Vec<String>,
 }
 
 impl Plan {
+    /// A sharded file's source with only the tests `owns` (and everything else the file has).
+    fn unit_source(&self, f: &str, owns: &[String]) -> String {
+        let s = &self.split[f];
+        let keep = |x: &str| owns.iter().any(|o| o == x);
+        let in_test = |ci: usize| s.in_test.get(ci).copied().unwrap_or(false);
+        crate::rewrite::apply(&s.content, crate::rewrite::unit_edits(&s.content, &s.unit, &in_test, &keep, &s.removable))
+    }
+
     fn new(p: &Project, g: &Graph, files: &[String], dirty: &[&String], v: &semver::Version, cache: &Cache, own_hash: &HashMap<String, String>, force: bool) -> Plan {
         use crate::rewrite::{self, Unit};
         let workers = std::env::var("PLAIN_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
@@ -899,6 +963,7 @@ impl Plan {
         let mut jobs = vec![];
         let mut small: BTreeMap<(bool, usize), Vec<(String, u64)>> = BTreeMap::new();
         let mut unit_plans = HashMap::new();
+        let mut splitters = HashMap::new();
         for f in dirty {
             let (e, own, test_bytes) = est_own[f.as_str()];
             let test = is_test(f) && *v >= semver::Version::new(0, 8, 0);
@@ -988,6 +1053,9 @@ impl Plan {
                             jobs.push(Job { files: vec![f.to_string()], shard: Some((i, n)), test: true, est: e - split + split * sz(&u.owns) as u64 / total as u64, fast, only, profile: profile_of(p, g, f) });
                         }
                         unit_plans.insert(f.to_string(), (shared, units));
+                        let only = cu.contracts.iter().enumerate().filter(|(ci, c)| in_test(*ci) && !c.is_abstract && c.kind == "contract").map(|(_, c)| c.name.clone()).collect();
+                        let in_test = (0..cu.contracts.len()).map(in_test).collect();
+                        splitters.insert(f.to_string(), Splitter { content, unit: cu, in_test, removable: rm, only });
                         continue;
                     }
                     // compiled whole, but recorded as one unit: the next edit compiles only the tests it changed
@@ -1083,7 +1151,7 @@ impl Plan {
             code.insert(f.to_string(), out);
         }
         let rewritten = testish.iter().filter(|(_, t)| **t).map(|((f, ci), _)| (f.to_string(), units[*f].contracts[*ci].name.clone())).collect();
-        Plan { jobs, sources, est, deploys, gen_deps, code, rewritten, units: unit_plans }
+        Plan { jobs, sources, est, deploys, gen_deps, code, rewritten, units: unit_plans, split: splitters }
     }
 }
 
@@ -1304,17 +1372,35 @@ pub fn write_forge(p: &Project, dir: &std::path::Path, arts: &[&Artifact], layou
     // forge's names: <Contract>.json, and when a contract is compiled with several profiles, <Contract>.<profile>.json
     // for each but its file's own profile (a lib/ file has none, so all of its get one)
     let mut compiled: HashMap<(&str, &str), std::collections::BTreeSet<u32>> = HashMap::new();
-    for a in arts {
+    for a in arts.iter().filter(|a| a.shard == 0) {
         compiled.entry((&a.file, &a.name)).or_default().insert(a.profile);
     }
     let g = Graph::build(p, &p.project_files());
     let own = |f: &str| p.dirs.iter().any(|d| f.starts_with(&format!("{d}/"))).then(|| profile_of(p, &g, f) as u32);
-    for a in arts {
+    for a in arts.iter().filter(|a| a.shard == 0) {
+        // a sharded test file's units each have some of its tests
+        let mut entries = a.abi.as_array().cloned().unwrap_or_default();
+        for o in arts.iter().filter(|o| o.shard > 0 && o.file == a.file && o.name == a.name && o.profile == a.profile) {
+            for x in o.abi.as_array().into_iter().flatten() {
+                if !entries.contains(x) {
+                    entries.push(x.clone());
+                }
+            }
+        }
+        // forge writes the ABI as alloy's JsonAbi orders it (constructor, functions by name, events, errors), and
+        // tools hash it (veydrift's deployment manifest), so it's the same bytes here
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_value(Value::Array(entries.clone())).unwrap_or_else(|e| crate::die(&format!("{}:{}: abi: {e}", a.file, a.name)));
+        let ids = if a.methods.is_null() { json!(abi_methods(&Value::Array(entries))) } else { a.methods.clone() };
         let mut j = json!({
-            "abi": a.abi,
+            "abi": abi,
             "bytecode": {"object": format!("0x{}", a.bytecode), "linkReferences": refs(&a.links)},
-            "deployedBytecode": {"object": format!("0x{}", a.deployed), "linkReferences": refs(&a.deployed_links), "immutableReferences": refs(&a.immutables)},
+            "deployedBytecode": {"object": format!("0x{}", a.deployed), "linkReferences": refs(&a.deployed_links)},
+            "methodIdentifiers": ids,
         });
+        // forge leaves out an empty immutableReferences
+        if a.immutables.as_object().is_some_and(|m| !m.is_empty()) {
+            j["deployedBytecode"]["immutableReferences"] = a.immutables.clone();
+        }
         if let Some(l) = layouts.get(&(a.file.clone(), a.name.clone())).filter(|_| a.profile == 0) {
             j["storageLayout"] = l.clone();
         }
@@ -1323,8 +1409,14 @@ pub fn write_forge(p: &Project, dir: &std::path::Path, arts: &[&Artifact], layou
             true => format!("{}.{}.json", a.name, a.profile.checked_sub(1).and_then(|i| p.profiles.get(i as usize)).map_or("default", |x| x.name.as_str())),
             false => format!("{}.json", a.name),
         };
-        std::fs::create_dir_all(&d).and_then(|_| std::fs::write(d.join(name), serde_json::to_vec_pretty(&j).unwrap())).unwrap_or_else(|e| crate::die(&format!("{}: {e}", d.display())));
+        std::fs::create_dir_all(&d).and_then(|_| std::fs::write(d.join(name), serde_json::to_vec(&j).unwrap())).unwrap_or_else(|e| crate::die(&format!("{}: {e}", d.display())));
     }
+}
+
+/// solc's methodIdentifiers for the functions in an ABI: signature => selector in hex.
+fn abi_methods(abi: &Value) -> BTreeMap<String, String> {
+    let abi: alloy_json_abi::JsonAbi = serde_json::from_value(abi.clone()).unwrap_or_default();
+    abi.functions().map(|f| (f.signature(), hex::encode(f.selector()))).collect()
 }
 
 /// forge's `--sizes`: each contract's runtime and init code size against EIP-170 (24576 bytes) and EIP-3860 (49152),
@@ -1438,7 +1530,7 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
     if job.fast {
         settings["optimizer"]["enabled"] = json!(false);
     }
-    let out = json!(["abi", "evm.bytecode.object", "evm.bytecode.linkReferences", "evm.deployedBytecode.object", "evm.deployedBytecode.linkReferences", "evm.deployedBytecode.immutableReferences"]);
+    let out = json!(["abi", "evm.bytecode.object", "evm.bytecode.linkReferences", "evm.deployedBytecode.object", "evm.deployedBytecode.linkReferences", "evm.deployedBytecode.immutableReferences", "evm.methodIdentifiers"]);
     let sel: serde_json::Map<String, Value> = job
         .files
         .iter()
@@ -1485,6 +1577,11 @@ fn compile(solc: &PathBuf, g: &Graph, job: &Job, settings: &Value, p: &Project, 
                 deploys: vec![],
                 rewritten: false,
                 profile: 0,
+                // kept only where the ABI doesn't give them (libraries: struct and storage parameters by name)
+                methods: match serde_json::from_value::<BTreeMap<String, String>>(c["evm"]["methodIdentifiers"].clone()) {
+                    Ok(m) if m != abi_methods(&c["abi"]) => json!(m),
+                    _ => Value::Null,
+                },
             });
         }
     }

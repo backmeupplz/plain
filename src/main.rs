@@ -2,6 +2,7 @@ mod account;
 mod decode;
 mod deploy;
 mod evm;
+mod fmt;
 mod json;
 mod menu;
 mod node;
@@ -61,6 +62,8 @@ usage:
              [--sizes] [--skip test|script]  --check: confirm each contract matches solc's own compile;
              [--out dir] [--extra-output storageLayout]
                                              --sizes: fail past EIP-170/3860; --out: forge-style artifacts
+  plain fmt [paths] [--check]                format src/, test/, script/ (or the paths, - for stdin) exactly as
+                                             forge fmt does, with foundry.toml's [fmt]; --check: only list
   plain inspect <Contract> storage-layout    solc's storage layout, as JSON
   plain test [filter] [-v] [--fork net]      run *.t.sol tests (forge-std compatible) and test/**/*.test.ts;
              [--fuzz-runs N] [--seed N]      unchanged suites reuse their results (--rerun: run them anyway,
@@ -85,7 +88,9 @@ usage:
                                              verify by hand to verify/<network>/
   plain account [new|import <name>]          deployer keys, encrypted with a password (~/.plain/keystores;
                                              Foundry's keystores work too)
-  plain node [--port 8545] [--fork net]      local dev chain (anvil/hardhat compatible JSON-RPC)
+  plain node [--port 8545] [--fork net]      local dev chain (anvil/hardhat compatible JSON-RPC); anvil's
+             [--host ip] [--init genesis.json] --init loads a geth-style genesis' alloc and chainId
+             [--chain-id N] [--gas-limit N] [--base-fee N] [--silent]
   plain <name> [args]                        run plugin `plain-<name>` from PATH
 
 networks: any chain on chainlist.org by name or id (base, base-sepolia, arbitrum, linea, 8453, ...),
@@ -198,7 +203,9 @@ fn main() {
             let built: Vec<&solc::Artifact> = out.artifacts.iter().filter(|a| a.shard == 0 && out.built.contains(&a.file)).collect();
             if let Some(dir) = forge_out {
                 let layouts = if extra.is_empty() { Default::default() } else { solc::layouts(&p, &out.solc, &out.built) };
-                solc::write_forge(&p, &p.root.join(&dir), &built, &layouts);
+                // every unit of a sharded test file: its test contract's ABI is all of their tests
+                let all: Vec<&solc::Artifact> = out.artifacts.iter().filter(|a| out.built.contains(&a.file)).collect();
+                solc::write_forge(&p, &p.root.join(&dir), &all, &layouts);
             }
             if sizes && !solc::sizes(&built) {
                 die("some contracts exceed the size limits (EIP-170: 24576 bytes of runtime code, EIP-3860: 49152 of init code)");
@@ -443,15 +450,42 @@ fn main() {
         "account" => account::cli(&args),
         "node" => {
             let p = project::Project::load();
-            let port = flag(&mut args, "--port").map(|v| v.parse().unwrap_or_else(|_| die("--port N"))).unwrap_or(8545);
-            let fork = flag(&mut args, "--fork").map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
-            let (port, _chain) = node::start(fork, port, false);
-            println!("plain node on http://127.0.0.1:{port} (chain 31337); accounts are anvil/hardhat defaults, e.g.");
-            println!("  0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 key 0x{}", node::KEYS[0]);
-            println!("deploy to it with --network local; plain signs with the first account");
+            // anvil's flags, so scripts that start anvil can start plain node instead
+            let num = |args: &mut Vec<String>, name: &str| flag(args, name).map(|v| v.parse::<u64>().unwrap_or_else(|_| die(&format!("{name} N"))));
+            let port = num(&mut args, "--port").or_else(|| num(&mut args, "-p")).unwrap_or(8545) as u16;
+            let host = flag(&mut args, "--host").unwrap_or_else(|| "127.0.0.1".into());
+            let fork = flag(&mut args, "--fork").or_else(|| flag(&mut args, "--fork-url")).or_else(|| flag(&mut args, "-f")).map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
+            let genesis = flag(&mut args, "--init").map(|f| {
+                let text = std::fs::read_to_string(&f).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+                serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|e| die(&format!("{f}: {e}")))
+            });
+            let chain_id = num(&mut args, "--chain-id");
+            let gas_limit = num(&mut args, "--gas-limit");
+            let base_fee = num(&mut args, "--base-fee").or_else(|| num(&mut args, "--block-base-fee-per-gas"));
+            let silent = switch(&mut args, &["--silent", "-q", "--quiet"]);
+            no_options(&args);
+            let mut chain = node::Chain::new(fork);
+            chain.quiet = silent;
+            if let Some(g) = &genesis {
+                chain.init(g).unwrap_or_else(|e| die(&format!("--init: {e}")));
+            }
+            chain.configure(chain_id, gas_limit, base_fee);
+            let id = chain.chain_id();
+            let (port, _chain) = node::serve_on(chain, &host, port);
+            if !silent {
+                println!("plain node on http://{host}:{port} (chain {id}); accounts are anvil/hardhat defaults, e.g.");
+                println!("  0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 key 0x{}", node::KEYS[0]);
+                println!("deploy to it with --network local; plain signs with the first account");
+            }
             loop {
                 std::thread::park();
             }
+        }
+        "fmt" => {
+            let check = switch(&mut args, &["--check"]);
+            switch(&mut args, &["--raw", "-r"]); // forge's: stdin is always printed raw here
+            no_options(&args.iter().filter(|a| *a != "-").cloned().collect::<Vec<_>>());
+            fmt::run(&args, check);
         }
         "init" => {
             no_options(&args);

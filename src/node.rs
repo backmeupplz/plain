@@ -29,6 +29,7 @@ struct Block {
     hash: B256,
     timestamp: u64,
     txs: Vec<B256>,
+    base_fee: u64,
 }
 
 #[derive(Clone)]
@@ -44,6 +45,8 @@ struct TxRec {
     logs: Vec<Log>,
     contract: Option<Address>,
     block: u64,
+    status: bool,
+    gas_price: u128,
 }
 
 #[derive(Clone)]
@@ -63,7 +66,7 @@ pub struct Chain {
     accounts: Vec<Address>,
     offset: i64,
     next_ts: Option<u64>,
-    quiet: bool,
+    pub quiet: bool,
 }
 
 fn now() -> u64 {
@@ -97,8 +100,70 @@ impl Chain {
         let mut env = Env::new(31337);
         env.block.number = U256::ZERO;
         env.block.timestamp = U256::from(now());
-        let genesis = Block { hash: keccak256(b"plain genesis"), timestamp: now(), txs: vec![] };
+        let genesis = Block { hash: keccak256(b"plain genesis"), timestamp: now(), txs: vec![], base_fee: 0 };
         Chain { db, env, blocks: vec![genesis], txs: HashMap::new(), snapshots: vec![], accounts, offset: 0, next_ts: None, quiet: false }
+    }
+
+    /// anvil's `--init genesis.json`: a geth-style genesis's alloc (balance, code, nonce, storage) on top of the dev
+    /// accounts, its timestamp, number and base fee for the genesis block, and config.chainId.
+    pub fn init(&mut self, g: &Value) -> Result<(), String> {
+        let num = |v: &Value| -> Result<U256, String> {
+            match v {
+                Value::Null => Ok(U256::ZERO),
+                Value::Number(n) => n.as_u64().map(U256::from).ok_or(format!("{n} isn't a quantity")),
+                Value::String(s) => match s.strip_prefix("0x") {
+                    Some(h) => U256::from_str_radix(if h.is_empty() { "0" } else { h }, 16),
+                    None => U256::from_str_radix(s, 10),
+                }
+                .map_err(|_| format!("{s:?} isn't a quantity")),
+                v => Err(format!("{v} isn't a quantity")),
+            }
+        };
+        let bytes = |v: &Value| hex::decode(v.as_str().unwrap_or_default().trim_start_matches("0x")).map_err(|e| format!("code: {e}"));
+        for (a, acc) in g["alloc"].as_object().into_iter().flatten() {
+            let addr: Address = (if a.starts_with("0x") { a.clone() } else { format!("0x{a}") }).parse().map_err(|_| format!("alloc: {a:?} isn't an address"))?;
+            let mut info = revm::state::AccountInfo::from_balance(num(&acc["balance"])?);
+            info.nonce = num(&acc["nonce"])?.saturating_to();
+            let code = bytes(&acc["code"])?;
+            if !code.is_empty() {
+                let code = revm::state::Bytecode::new_raw(code.into());
+                info.code_hash = code.hash_slow();
+                info.code = Some(code);
+            }
+            self.db.insert_account_info(addr, info);
+            for (k, v) in acc["storage"].as_object().into_iter().flatten() {
+                self.db.insert_account_storage(addr, num(&json!(k))?, num(v)?).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(id) = g["config"]["chainId"].as_u64() {
+            self.env.chain_id = id;
+        }
+        if !g["timestamp"].is_null() {
+            self.blocks[0].timestamp = num(&g["timestamp"])?.saturating_to();
+            self.env.block.timestamp = U256::from(self.blocks[0].timestamp);
+        }
+        if !g["baseFeePerGas"].is_null() {
+            self.env.block.basefee = num(&g["baseFeePerGas"])?.saturating_to();
+            self.blocks[0].base_fee = self.env.block.basefee;
+        }
+        Ok(())
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.env.chain_id
+    }
+
+    pub fn configure(&mut self, chain_id: Option<u64>, gas_limit: Option<u64>, base_fee: Option<u64>) {
+        if let Some(id) = chain_id {
+            self.env.chain_id = id;
+        }
+        if let Some(g) = gas_limit {
+            self.env.block.gas_limit = g;
+        }
+        if let Some(b) = base_fee {
+            self.env.block.basefee = b;
+            self.blocks[0].base_fee = b;
+        }
     }
 
     fn next_block_env(&mut self) {
@@ -118,12 +183,21 @@ impl Chain {
                 r.block = n;
             }
         }
-        self.blocks.push(Block { hash, timestamp: ts, txs });
+        // EIP-1559, as anvil: the next block's base fee follows how full this one was (plain's default 0 stays 0)
+        let base_fee = self.env.block.basefee;
+        let used: u64 = txs.iter().map(|t| self.txs[t].gas_used).sum();
+        if base_fee > 0 {
+            self.env.block.basefee = alloy_eips::eip1559::calc_next_block_base_fee(used, self.env.block.gas_limit, base_fee, alloy_eips::eip1559::BaseFeeParams::ethereum());
+        }
+        self.blocks.push(Block { hash, timestamp: ts, txs, base_fee });
     }
 
-    fn exec(&mut self, from: Address, to: Option<Address>, data: Bytes, value: U256, commit: Commit) -> evm::Exec {
+    /// `gas` 0: the block's gas limit
+    fn exec(&mut self, from: Address, to: Option<Address>, data: Bytes, value: U256, gas: u64, gas_price: u128, commit: Commit) -> evm::Exec {
         let mut cheats = Cheats::default();
         let mut env = self.env.clone();
+        env.tx_gas = (gas > 0).then_some(gas);
+        env.gas_price = gas_price;
         // execute in the context of the next block
         env.block.number = U256::from(self.blocks.len());
         let db = std::mem::replace(&mut self.db, Db::new(Default::default()));
@@ -137,17 +211,25 @@ impl Chain {
         r
     }
 
-    fn send(&mut self, from: Address, to: Option<Address>, data: Bytes, value: U256, gas: u64, hash: Option<B256>) -> Result<Value, Value> {
+    /// Mines a transaction. With an explicit gas limit (a signed transaction always has one) a failing one is mined
+    /// too, with status 0, as in anvil; without one it is refused, as anvil's gas estimate would be.
+    #[allow(clippy::too_many_arguments)]
+    fn send(&mut self, from: Address, to: Option<Address>, data: Bytes, value: U256, gas: u64, gas_price: u128, hash: Option<B256>) -> Result<Value, Value> {
         use revm::database_interface::DatabaseRef;
+        if gas > self.env.block.gas_limit {
+            return Err(rpc_err(-32003, format!("gas limit {gas} exceeds the block gas limit {}", self.env.block.gas_limit), None));
+        }
         let nonce = self.db.basic_ref(from).ok().flatten().map(|a| a.nonce).unwrap_or(0);
         self.next_block_env();
-        let r = self.exec(from, to, data.clone(), value, Commit::OnSuccess);
-        if !r.ok {
+        let r = self.exec(from, to, data.clone(), value, gas, gas_price, if gas == 0 { Commit::OnSuccess } else { Commit::Always });
+        // gas 0: revm refused it before running (funds, gas below intrinsic): not a transaction to mine
+        if !r.ok && (gas == 0 || r.gas == 0) {
             return Err(revert_err(&r.output));
         }
         let hash = hash.unwrap_or_else(|| keccak256([from.as_slice(), &nonce.to_be_bytes(), &data].concat()));
-        let contract = if to.is_none() { r.address } else { None };
-        self.txs.insert(hash, TxRec { hash, from, to, nonce, value, input: data, gas, gas_used: r.gas, logs: r.logs, contract, block: 0 });
+        let contract = if to.is_none() && r.ok { r.address } else { None };
+        let gas = if gas == 0 { self.env.block.gas_limit } else { gas };
+        self.txs.insert(hash, TxRec { hash, from, to, nonce, value, input: data, gas, gas_used: r.gas, logs: r.logs, contract, block: 0, status: r.ok, gas_price });
         self.mine(vec![hash]);
         Ok(json!(hash))
     }
@@ -159,7 +241,7 @@ impl Chain {
         let used: u64 = b.txs.iter().map(|h| self.txs[h].gas_used).sum();
         json!({
             "number": hx(n), "hash": b.hash, "parentHash": parent, "timestamp": hx(b.timestamp),
-            "gasLimit": hx(evm::GAS_LIMIT), "gasUsed": hx(used), "baseFeePerGas": "0x0", "miner": Address::ZERO,
+            "gasLimit": hx(self.env.block.gas_limit), "gasUsed": hx(used), "baseFeePerGas": hx(b.base_fee), "miner": Address::ZERO,
             "difficulty": "0x0", "totalDifficulty": "0x0", "extraData": "0x", "nonce": "0x0000000000000000",
             "mixHash": B256::ZERO, "sha3Uncles": B256::ZERO, "stateRoot": B256::ZERO, "receiptsRoot": B256::ZERO,
             "transactionsRoot": B256::ZERO, "logsBloom": format!("0x{}", "0".repeat(512)), "size": "0x0",
@@ -170,8 +252,8 @@ impl Chain {
     fn tx_json(&self, t: &TxRec) -> Value {
         json!({
             "hash": t.hash, "nonce": hx(t.nonce), "blockHash": self.blocks[t.block as usize].hash, "blockNumber": hx(t.block),
-            "transactionIndex": "0x0", "from": t.from, "to": t.to, "value": hx(t.value), "gas": hx(t.gas), "gasPrice": "0x0",
-            "maxFeePerGas": "0x0", "maxPriorityFeePerGas": "0x0", "input": t.input, "type": "0x2", "chainId": hx(self.env.chain_id),
+            "transactionIndex": "0x0", "from": t.from, "to": t.to, "value": hx(t.value), "gas": hx(t.gas), "gasPrice": hx(t.gas_price),
+            "maxFeePerGas": hx(t.gas_price), "maxPriorityFeePerGas": hx(t.gas_price.saturating_sub(self.env.block.basefee as u128)), "input": t.input, "type": "0x2", "chainId": hx(self.env.chain_id),
             "v": "0x0", "r": "0x0", "s": "0x0", "yParity": "0x0", "accessList": [],
         })
     }
@@ -189,7 +271,7 @@ impl Chain {
             "transactionHash": t.hash, "transactionIndex": "0x0", "blockHash": self.blocks[t.block as usize].hash,
             "blockNumber": hx(t.block), "from": t.from, "to": t.to, "cumulativeGasUsed": hx(t.gas_used), "gasUsed": hx(t.gas_used),
             "contractAddress": t.contract, "logs": t.logs.iter().enumerate().map(|(i, l)| self.log_json(t, i, l)).collect::<Vec<_>>(),
-            "logsBloom": format!("0x{}", "0".repeat(512)), "status": "0x1", "effectiveGasPrice": "0x0", "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)), "status": if t.status { "0x1" } else { "0x0" }, "effectiveGasPrice": hx(t.gas_price), "type": "0x2",
         })
     }
 
@@ -219,8 +301,9 @@ impl Chain {
             "eth_chainId" => json!(hx(self.env.chain_id)),
             "eth_blockNumber" => json!(hx(self.blocks.len() - 1)),
             "eth_accounts" | "eth_requestAccounts" => json!(self.accounts),
-            "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_blobBaseFee" => json!("0x0"),
-            "eth_feeHistory" => json!({"oldestBlock": hx(self.blocks.len() - 1), "baseFeePerGas": ["0x0", "0x0"], "gasUsedRatio": [0.0], "reward": [["0x0"]]}),
+            "eth_gasPrice" => json!(hx(self.env.block.basefee)),
+            "eth_maxPriorityFeePerGas" | "eth_blobBaseFee" => json!("0x0"),
+            "eth_feeHistory" => json!({"oldestBlock": hx(self.blocks.len() - 1), "baseFeePerGas": [hx(self.env.block.basefee), hx(self.env.block.basefee)], "gasUsedRatio": [0.0], "reward": [["0x0"]]}),
             "eth_syncing" | "eth_mining" => json!(false),
             "eth_getBalance" => json!(hx(self.db.basic_ref(addr(0)?).ok().flatten().map(|a| a.balance).unwrap_or_default())),
             "eth_getTransactionCount" => json!(hx(self.db.basic_ref(addr(0)?).ok().flatten().map(|a| a.nonce).unwrap_or(0))),
@@ -233,17 +316,27 @@ impl Chain {
                 let v = self.db.storage_ref(addr(0)?, num(&p[1])).unwrap_or_default();
                 json!(B256::from(v))
             }
-            "eth_call" | "eth_estimateGas" => {
-                let (from, to, data, value, _) = call_args(&p[0]);
-                let r = self.exec(from, to, data, value, Commit::Never);
+            "eth_call" => {
+                let (from, to, data, value, gas) = call_args(&p[0]);
+                let r = self.exec(from, to, data, value, gas, 0, Commit::Never);
                 if !r.ok {
                     return Err(revert_err(&r.output));
                 }
-                if method == "eth_call" { json!(r.output) } else { json!(hx((r.gas * 13 / 10).max(21_000))) }
+                json!(r.output)
+            }
+            "eth_estimateGas" => {
+                let (from, to, data, value, gas) = call_args(&p[0]);
+                json!(hx(self.estimate(from, to, data, value, gas)?))
             }
             "eth_sendTransaction" => {
                 let (from, to, data, value, gas) = call_args(&p[0]);
-                return self.send(from, to, data, value, gas, None);
+                let base = self.env.block.basefee as u128;
+                let price = match (num(&p[0]["maxFeePerGas"]), num(&p[0]["gasPrice"])) {
+                    (m, _) if m > U256::ZERO => m.saturating_to::<u128>().min(base + num(&p[0]["maxPriorityFeePerGas"]).saturating_to::<u128>()),
+                    (_, g) if g > U256::ZERO => g.saturating_to(),
+                    _ => base,
+                };
+                return self.send(from, to, data, value, gas, price, None);
             }
             "eth_sendRawTransaction" => {
                 let raw = bytes(&p[0]);
@@ -253,8 +346,14 @@ impl Chain {
                 if tx.nonce() != nonce {
                     return Err(rpc_err(-32000, format!("nonce mismatch: tx {} expected {nonce}", tx.nonce()), None));
                 }
-                let to = tx.to();
-                return self.send(from, to, tx.input().clone(), tx.value(), tx.gas_limit(), Some(*tx.tx_hash()));
+                if tx.chain_id().is_some_and(|c| c != self.env.chain_id) {
+                    return Err(rpc_err(-32000, format!("invalid chain id {} (this chain is {})", tx.chain_id().unwrap(), self.env.chain_id), None));
+                }
+                if tx.max_fee_per_gas() < self.env.block.basefee as u128 {
+                    return Err(rpc_err(-32003, format!("max fee per gas {} is below the block base fee {}", tx.max_fee_per_gas(), self.env.block.basefee), None));
+                }
+                let price = tx.effective_gas_price(Some(self.env.block.basefee));
+                return self.send(from, tx.to(), tx.input().clone(), tx.value(), tx.gas_limit(), price, Some(*tx.tx_hash()));
             }
             "eth_getTransactionByHash" => p.first().and_then(|h| h.as_str()?.parse::<B256>().ok()).and_then(|h| self.txs.get(&h)).map(|t| self.tx_json(t)).unwrap_or(Value::Null),
             "eth_getTransactionReceipt" => p.first().and_then(|h| h.as_str()?.parse::<B256>().ok()).and_then(|h| self.txs.get(&h)).map(|t| self.receipt_json(t)).unwrap_or(Value::Null),
@@ -381,6 +480,33 @@ impl Chain {
         })
     }
 
+    /// anvil's gas estimate: the lowest gas limit the call succeeds with (a binary search), not just what it used,
+    /// so code that checks gasleft() gets what it needs.
+    fn estimate(&mut self, from: Address, to: Option<Address>, data: Bytes, value: U256, gas: u64) -> Result<u64, Value> {
+        if data.is_empty() && to.is_some_and(|t| {
+            use revm::database_interface::DatabaseRef;
+            self.db.basic_ref(t).ok().flatten().is_none_or(|a| a.code.as_ref().is_none_or(|c| c.is_empty()))
+        }) {
+            return Ok(21_000);
+        }
+        let mut hi = if gas > 0 { gas } else { self.env.block.gas_limit };
+        let r = self.exec(from, to, data.clone(), value, hi, 0, Commit::Never);
+        if !r.ok {
+            return Err(revert_err(&r.output));
+        }
+        let mut lo = if to.is_none() { 53_000 } else { 21_000 };
+        let mut mid = (r.gas * 3).min((hi + lo) / 2);
+        while hi - lo > 1 {
+            if self.exec(from, to, data.clone(), value, mid, 0, Commit::Never).ok {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+            mid = (hi + lo) / 2;
+        }
+        Ok(hi)
+    }
+
     pub fn dispatch(&mut self, req: &Value) -> Value {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req["method"].as_str().unwrap_or_default();
@@ -455,11 +581,16 @@ pub fn serve(listener: TcpListener, chain: Arc<Mutex<Chain>>) {
 }
 
 pub fn start(fork: Option<String>, port: u16, quiet: bool) -> (u16, Arc<Mutex<Chain>>) {
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| crate::die(&format!("bind 127.0.0.1:{port}: {e}")));
-    let port = listener.local_addr().unwrap().port();
     let mut c = Chain::new(fork);
     c.quiet = quiet;
-    let chain = Arc::new(Mutex::new(c));
+    serve_on(c, "127.0.0.1", port)
+}
+
+/// Serves `chain` on host:port (port 0: any free one) in the background.
+pub fn serve_on(chain: Chain, host: &str, port: u16) -> (u16, Arc<Mutex<Chain>>) {
+    let listener = TcpListener::bind((host, port)).unwrap_or_else(|e| crate::die(&format!("bind {host}:{port}: {e}")));
+    let port = listener.local_addr().unwrap().port();
+    let chain = Arc::new(Mutex::new(chain));
     let ch = chain.clone();
     std::thread::spawn(move || serve(listener, ch));
     (port, chain)

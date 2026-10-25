@@ -53,6 +53,7 @@ pub fn run() {
         let list = items(&[
             ("Build", "compile the contracts"),
             ("Test", "run the tests, once or on every save"),
+            ("Format", "lay out the code as forge fmt does"),
             ("Deploy", "put a contract on a chain, local or live"),
             ("Verify", "publish the source code on block explorers"),
             ("Upgrade", "point a proxy at a new implementation"),
@@ -68,10 +69,14 @@ pub fn run() {
                 plain(&strs(&["build"]));
             }
             Some(1) => test(),
-            Some(2) => deploy(&p, &mut last),
-            Some(3) => verify(&p),
-            Some(4) => upgrade(&p, &mut last),
-            Some(5) => settings(&p),
+            Some(2) => {
+                say("Formats src/, test/ and script/ in place, with foundry.toml's [fmt] settings.");
+                plain(&strs(&["fmt"]));
+            }
+            Some(3) => deploy(&p, &mut last),
+            Some(4) => verify(&p),
+            Some(5) => upgrade(&p, &mut last),
+            Some(6) => settings(&p),
             _ => return,
         }
         std::fs::create_dir_all(path.parent().unwrap()).ok();

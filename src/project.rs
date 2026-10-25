@@ -36,6 +36,8 @@ pub struct Project {
     pub libraries: HashMap<String, alloy_primitives::Address>,
     /// forge's `create2_library_salt`: where a script's libraries go through the CREATE2 deployer
     pub create2_library_salt: alloy_primitives::B256,
+    /// forge's `libs`, lib/ by default
+    pub libs: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,7 +276,7 @@ impl Project {
             t.lines().for_each(|l| add(l, ""));
         }
         // auto-detect lib/<name> like forge: name/ => lib/name/src/ (or lib/name/), plus nested remappings.txt
-        for lib in &libs {
+        for lib in libs.iter() {
             let Ok(rd) = std::fs::read_dir(root.join(lib)) else { continue };
             let mut entries: Vec<_> = rd.flatten().filter(|e| e.path().is_dir()).collect();
             entries.sort_by_key(|e| e.file_name());
@@ -398,6 +400,7 @@ impl Project {
                     (id.strip_prefix("./").unwrap_or(id).to_string(), a.trim().parse().unwrap_or_else(|_| crate::die(&format!("libraries: {l:?} isn't path:Name:address"))))
                 })
                 .collect(),
+            libs: libs.clone(),
             create2_library_salt: s("create2_library_salt").map(|v| v.parse().unwrap_or_else(|_| crate::die(&format!("create2_library_salt: {v:?} isn't 32 bytes of hex")))).unwrap_or_default(),
             root,
         }

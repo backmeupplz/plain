@@ -378,7 +378,7 @@ pub fn link_news<'t>(src: &str, u: &Unit, file: &str, in_test: &dyn Fn(usize) ->
     if !edits.is_empty() {
         let safe = if memory_safe { " (\"memory-safe\")" } else { "" };
         let mut tail = format!(
-            "\n\n// added by plain for tests: deploy from the compiled artifact instead of embedding its bytecode\nfunction {helper}Code(string memory id) view returns (bytes memory) {{\n    (bool ok, bytes memory code) = address(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D).staticcall(abi.encodeWithSignature(\"getCode(string)\", id));\n    require(ok, \"plain: getCode failed\");\n    return abi.decode(code, (bytes));\n}}\n\nfunction {helper}(uint256 value, bytes32 salt, bool useSalt, string memory id, bytes memory args) returns (address addr) {{\n    bytes memory code = {helper}Code(id);\n    assembly{safe} {{\n        // args comes from abi.encodeCall: drop its 4-byte selector\n        mstore(add(args, 4), sub(mload(args), 4))\n        args := add(args, 4)\n    }}\n    code = abi.encodePacked(code, args);\n    assembly{safe} {{\n        switch useSalt\n        case 0 {{ addr := create(value, add(code, 0x20), mload(code)) }}\n        default {{ addr := create2(value, add(code, 0x20), mload(code), salt) }}\n        if iszero(addr) {{\n            let p := mload(0x40)\n            returndatacopy(p, 0, returndatasize())\n            revert(p, returndatasize())\n        }}\n    }}\n}}\n"
+            "\n\n// added by plain for tests: deploy from the compiled artifact instead of embedding its bytecode\nfunction {helper}Code(string memory id) view returns (bytes memory) {{\n    (bool ok, bytes memory code) = address(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D).staticcall(abi.encodeWithSignature(\"getCode(string)\", id));\n    require(ok, \"plain: getCode failed\");\n    return abi.decode(code, (bytes));\n}}\n\nfunction {helper}New(string memory id, bytes memory args) returns (address) {{\n    return {helper}(0, bytes32(0), false, id, args);\n}}\n\nfunction {helper}(uint256 value, bytes32 salt, bool useSalt, string memory id, bytes memory args) returns (address addr) {{\n    bytes memory code = {helper}Code(id);\n    assembly{safe} {{\n        // args comes from abi.encodeCall: drop its 4-byte selector\n        mstore(add(args, 4), sub(mload(args), 4))\n        args := add(args, 4)\n    }}\n    code = abi.encodePacked(code, args);\n    assembly{safe} {{\n        switch useSalt\n        case 0 {{ addr := create(value, add(code, 0x20), mload(code)) }}\n        default {{ addr := create2(value, add(code, 0x20), mload(code), salt) }}\n        if iszero(addr) {{\n            let p := mload(0x40)\n            returndatacopy(p, 0, returndatasize())\n            revert(p, returndatasize())\n        }}\n    }}\n}}\n"
         );
         let mut imports: Vec<&Target> = ids.iter().map(|(_, t)| *t).collect();
         imports.sort_by(|a, b| a.check.cmp(&b.check));
@@ -434,7 +434,13 @@ fn site<'t>(src: &str, u: &Unit, i: usize, helper: &str, target: &dyn Fn(&str) -
     let value = value.map_or("0".to_string(), |(a, b)| sub(a, b));
     let (salt, use_salt) = salt.map_or(("bytes32(0)".to_string(), false), |(a, b)| (sub(a, b), true));
     let args = sub(j + 1, close);
-    Some((close, format!("{name}(payable({helper}({value}, {salt}, {use_salt}, \"{}\", abi.encodeCall({}.__plainCtor, ({args})))))", tg.id, tg.check)))
+    let ctor = format!("\"{}\", abi.encodeCall({}.__plainCtor, ({args}))", tg.id, tg.check);
+    // the common `new X(args)` takes the two-argument helper: fewer stack slots at the call site, where via-IR's
+    // stack can be one variable short of "too deep" in a big test function
+    Some((close, match (value.as_str(), use_salt) {
+        ("0", false) => format!("{name}(payable({helper}New({ctor})))"),
+        _ => format!("{name}(payable({helper}({value}, {salt}, {use_salt}, {ctor})))"),
+    }))
 }
 
 /// Source text of tokens [a, b) with nested `new` sites rewritten.

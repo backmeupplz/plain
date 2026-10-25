@@ -281,6 +281,8 @@ pub struct Env {
     pub spec: SpecId,
     /// enforce the contract size limits (EIP-170, EIP-3860), as a chain does: deploys, not tests
     pub strict: bool,
+    /// a transaction's own gas limit (a node's eth_call/eth_sendTransaction); else the block's
+    pub tx_gas: Option<u64>,
 }
 
 impl Env {
@@ -291,7 +293,7 @@ impl Env {
         block.gas_limit = GAS_LIMIT;
         block.basefee = 0;
         block.prevrandao = Some(B256::ZERO);
-        Env { block, chain_id, gas_price: 0, spec: SpecId::OSAKA, strict: false }
+        Env { block, chain_id, gas_price: 0, spec: SpecId::OSAKA, strict: false, tx_gas: None }
     }
 }
 
@@ -343,6 +345,7 @@ pub fn transact(db: Db, env: &mut Env, cheats: &mut Cheats, from: Address, to: T
 pub struct Vm<'c> {
     evm: revm::MainnetEvm<Ctx, &'c mut Cheats>,
     gas_price: u128,
+    tx_gas: Option<u64>,
 }
 
 impl<'c> Vm<'c> {
@@ -359,7 +362,7 @@ impl<'c> Vm<'c> {
             ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
         }
         ctx.cfg.disable_eip3607 = true; // pranked/broadcast senders may be contracts
-        Vm { evm: ctx.build_mainnet_with_inspector(cheats), gas_price: env.gas_price }
+        Vm { evm: ctx.build_mainnet_with_inspector(cheats), gas_price: env.gas_price, tx_gas: env.tx_gas }
     }
 
     pub fn call(&mut self, from: Address, to: TxKind, data: Bytes, value: U256, commit: impl Into<Commit>) -> Exec {
@@ -367,7 +370,7 @@ impl<'c> Vm<'c> {
         let mut tx = TxEnv::default();
         tx.caller = from;
         // a test's gas is the block's (forge's gas_limit, --gas-limit)
-        tx.gas_limit = self.evm.ctx.block.gas_limit;
+        tx.gas_limit = self.tx_gas.unwrap_or(self.evm.ctx.block.gas_limit);
         tx.gas_price = self.gas_price;
         tx.kind = to;
         tx.data = data;
@@ -2024,7 +2027,7 @@ mod tests {
 
     #[test]
     fn artifact_ids() {
-        let art = |file: &str, name: &str| Artifact { name: name.into(), file: file.into(), abi: json!([]), bytecode: "00".into(), deployed: "00".into(), links: Value::Null, deployed_links: Value::Null, immutables: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false, profile: 0 };
+        let art = |file: &str, name: &str| Artifact { name: name.into(), file: file.into(), abi: json!([]), bytecode: "00".into(), deployed: "00".into(), links: Value::Null, deployed_links: Value::Null, immutables: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false, profile: 0, methods: Value::Null };
         let arts = [art("src/Game.sol", "Game"), art("src/Game.sol", "Lib"), art("src/v2/Game.sol", "Game")];
         let find = |what: &str| find_artifact(&arts, what, "0.8.28", 0).map(|a| format!("{}:{}", a.file, a.name));
         // forge's ids: a version and a profile may follow; the profile isn't read

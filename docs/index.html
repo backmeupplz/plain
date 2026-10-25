@@ -218,7 +218,7 @@ plain</pre>
     <h2>Nothing to set up before your first test</h2>
     <p class="sub">plain replaces a toolchain with a single command, so a new project or a fresh clone is ready as soon as the binary is on your PATH.</p>
     <div class="cards">
-      <div class="card"><h3>One binary and nothing around it</h3><p>plain is a single 7 MB executable. You don't need Node, npm or git submodules, and forge-std is built in, so <code>import {Test} from "forge-std/Test.sol"</code> works in an empty folder.</p></div>
+      <div class="card"><h3>One binary and nothing around it</h3><p>plain is a single 9 MB executable. You don't need Node, npm or git submodules, and forge-std is built in, so <code>import {Test} from "forge-std/Test.sol"</code> works in an empty folder.</p></div>
       <div class="card"><h3>Your Foundry project already works</h3><p>plain reads <code>foundry.toml</code>, remappings and <code>lib/</code> the way they are, picks the solc version your pragmas ask for, and downloads it the first time you build.</p></div>
       <div class="card"><h3>A menu when you want one</h3><p>Run <code>plain</code> on its own to build, test, deploy, verify and upgrade from a menu. It asks only what each step needs and prints the command it runs, so the next time you can type it yourself.</p></div>
       <div class="card"><h3>Keys that stay encrypted</h3><p><code>plain account new</code> makes a deployer key encrypted with your password, in the keystore format Foundry's cast uses, so no private key has to sit in a <code>.env</code> file.</p></div>

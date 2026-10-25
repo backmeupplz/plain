@@ -58,6 +58,11 @@ pub fn path_matches(pat: &str, path: &str) -> bool {
     path.rsplit('/').next().is_some_and(|name| name.contains(pat)) || alternatives(pat).iter().any(|p| glob(p.as_bytes(), path.as_bytes()))
 }
 
+/// `pat` as a glob over the whole of `path` (`*` crosses `/`).
+pub fn glob_matches(pat: &str, path: &str) -> bool {
+    alternatives(pat).iter().any(|p| glob(p.as_bytes(), path.as_bytes()))
+}
+
 /// A glob with each `{a,b}` spelled out.
 fn alternatives(p: &str) -> Vec<String> {
     let Some(i) = p.find('{') else { return vec![p.to_string()] };

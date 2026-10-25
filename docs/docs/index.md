@@ -117,7 +117,17 @@ plain build --out out --extra-output storageLayout            # forge's out/ lay
 plain inspect Vault storage-layout --json
 ```
 
-The first build downloads the newest solc that satisfies your pragmas, or reuses one Foundry already downloaded, and `solc = "0.8.28"` in the config pins a version. Artifacts land in `.plain/out/<Contract>.json` with each contract's `abi` and `bytecode`. Builds are cached by content: a build with nothing changed takes about 20 ms, and a new clone or worktree of sources that any checkout already compiled compiles nothing, because every checkout shares `~/.plain/cache`.
+The first build downloads the newest solc that satisfies your pragmas, or reuses one Foundry already downloaded, and `solc = "0.8.28"` in the config pins a version. Artifacts land in `.plain/out/<Contract>.json` with each contract's `abi` and `bytecode`. Builds are cached by content: a build with nothing changed takes about 20 ms, and a new clone or worktree of sources that any checkout already compiled compiles nothing, because every checkout shares `~/.plain/cache`. With `--out out`, plain also writes Foundry's `out/` for scripts and tools that read it: the same paths (`out/<File.sol>/<Contract>.json`), the ABI in forge's order, bytecode and deployed bytecode with their link and immutable references, `methodIdentifiers`, and storage layouts with `--extra-output storageLayout`. Contracts in `src/` and libraries match forge's byte for byte; test and script contracts are plain's own faster builds of them.
+
+### Format
+
+```sh
+plain fmt             # format src/, test/ and script/ in place
+plain fmt --check     # for CI: list what isn't formatted and exit 1
+plain fmt src/Vault.sol test/   # just these files and folders
+```
+
+`plain fmt` is `forge fmt`: the same formatter, so the output is forge's byte for byte, and `foundry.toml`'s `[fmt]` settings (`line_length`, `tab_width`, `sort_imports`, `ignore` and the rest) and `// forgefmt: disable-next-line` comments work as they do there. A setting forge doesn't have is an error rather than something quietly ignored. It takes about a third of forge's time, about 50 ms for a project of 200 files.
 
 ## 3. Test
 
@@ -292,6 +302,8 @@ plain deploy Counter --network local --broadcast
 ```
 
 The menu starts a local chain by itself when you pick `local` and none is running, and that chain lasts as long as the menu does.
+
+`plain node` also takes anvil's flags, so scripts written for anvil can start it instead: `--host`, `--port`, `--chain-id`, `--gas-limit`, `--base-fee`, `--silent`, and `--init genesis.json`, which loads a geth-style genesis (each `alloc` account's balance, nonce, code and storage, the `timestamp`, and `config.chainId`). As in anvil, a transaction with a gas limit runs with that much gas and pays the base fee, one that fails is still mined with status 0, and `eth_estimateGas` finds the lowest gas a call succeeds with.
 
 ### With a script
 
@@ -569,4 +581,4 @@ Building and testing a repository with plain stays inside the EVM and the reposi
 
 ## What plain doesn't do yet
 
-Gas snapshot files, coverage, formatting, verifying contracts plain didn't deploy, the `vm.deployCode` cheatcode (forge-std's `deployCode` works), `targetArtifacts`/`targetInterfaces` in invariant tests, OpenZeppelin 4's transparent proxies, beacon proxies, and Windows. Library linking only works for libraries under `src/`, `test/` or `script/`. If you need one of these, [open an issue](https://github.com/backmeupplz/plain/issues).
+Gas snapshot files, coverage, verifying contracts plain didn't deploy, the `vm.deployCode` cheatcode (forge-std's `deployCode` works), `targetArtifacts`/`targetInterfaces` in invariant tests, OpenZeppelin 4's transparent proxies, beacon proxies, and Windows. Library linking only works for libraries under `src/`, `test/` or `script/`. If you need one of these, [open an issue](https://github.com/backmeupplz/plain/issues).

@@ -295,7 +295,7 @@ pub fn run(p: &Project, out: crate::solc::Output, conn: Option<Conn>, o: Opts) {
             "inputs": [{"name": "proxy", "type": "address"}, {"name": "implementation", "type": "address"}, {"name": "data", "type": "bytes"}]},
             {"type": "function", "name": "upgrade", "stateMutability": "nonpayable", "outputs": [],
             "inputs": [{"name": "proxy", "type": "address"}, {"name": "implementation", "type": "address"}]}]);
-        arts.push(Artifact { name: "ProxyAdmin".into(), file: String::new(), abi, bytecode: String::new(), deployed: String::new(), links: Value::Null, deployed_links: Value::Null, immutables: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false, profile: 0 });
+        arts.push(Artifact { name: "ProxyAdmin".into(), file: String::new(), abi, bytecode: String::new(), deployed: String::new(), links: Value::Null, deployed_links: Value::Null, immutables: Value::Null, shard: 0, tests: vec![], deploys: vec![], rewritten: false, profile: 0, methods: Value::Null });
     }
     decode::init(&arts);
     if o.broadcast && conn.is_none() {
