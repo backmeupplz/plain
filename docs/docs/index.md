@@ -1,5 +1,7 @@
 ---
 layout: docs
+og_image: /og-docs.png
+og_image_alt: "plain docs: install plain, then write, test, deploy, verify and upgrade Solidity contracts."
 title: "plain docs: write, test, deploy, verify, upgrade"
 description: "How to install plain and go from an empty folder to a verified, upgradeable deployment: write contracts, compile, test on every save, deploy with an encrypted account, verify on Etherscan and others, and upgrade OpenZeppelin proxies."
 ---
@@ -22,14 +24,12 @@ The installer puts the latest release in `~/.plain/bin` and adds that folder to 
 
 The same binaries come through package managers too, if you'd rather update plain along with everything else:
 
-| Package manager | Install |
-|---|---|
-| Homebrew | `brew install backmeupplz/tap/plain` |
-| npm | `npm install -g plain-evm`, or `npx plain-evm test` to run it without installing |
-| mise | `mise use -g github:backmeupplz/plain`, with `@<version>` on release day because mise hides releases younger than a day |
-| Nix | `nix profile install github:backmeupplz/plain` on Apple silicon Macs and Linux, where it builds from source |
-| Cargo | `cargo binstall plain-evm` downloads the release binary, and `cargo install plain-evm` builds it |
-| Arch Linux | `yay -S plain-bin`, or `plain-bin` from the AUR with any other helper |
+- **Homebrew:** `brew install backmeupplz/tap/plain`
+- **npm:** `npm install -g plain-evm`, or `npx plain-evm test` to run it without installing
+- **mise:** `mise use -g github:backmeupplz/plain`, with `@<version>` on release day because mise hides releases younger than a day
+- **Nix:** `nix profile install github:backmeupplz/plain` on Apple silicon Macs and Linux, where it builds from source
+- **Cargo:** `cargo binstall plain-evm` downloads the release binary, and `cargo install plain-evm` builds it
+- **Arch Linux:** `yay -S plain-bin`, or `plain-bin` from the AUR with any other helper
 
 On Debian and Ubuntu, add the signed apt repository at pkg.getplain.org:
 

@@ -17,17 +17,19 @@
 <meta property="og:url" content="https://getplain.org{{ page.url }}">
 <meta property="og:title" content="{{ page.title }}">
 <meta property="og:description" content="{{ page.description }}">
-<meta property="og:image" content="https://getplain.org/og.png">
+<meta property="og:image" content="https://getplain.org{{ page.og_image | default: '/og.png' }}">
 <meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="plain: Solidity in seconds, not minutes. Editing a test and rerunning the suite takes 0.99 s with plain and 56 s with Foundry, and a build from scratch takes 15 s against 116 s.">
+{% capture og_alt %}{{ page.og_image_alt | default: "plain: Solidity in seconds, not minutes." }}{% endcapture %}
+<meta property="og:image:alt" content="{{ og_alt }}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@backmeupplz">
 <meta name="twitter:creator" content="@backmeupplz">
 <meta name="twitter:title" content="{{ page.title }}">
 <meta name="twitter:description" content="{{ page.description }}">
-<meta name="twitter:image" content="https://getplain.org/og.png">
+<meta name="twitter:image" content="https://getplain.org{{ page.og_image | default: '/og.png' }}">
+<meta name="twitter:image:alt" content="{{ og_alt }}">
 <style>
 :root {
   --bg: #fbfbf8; --fg: #1b1b19; --muted: #66665f; --line: #e4e3dc; --card: #f3f2ec;
