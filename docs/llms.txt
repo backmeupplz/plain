@@ -1,0 +1,21 @@
+# plain
+
+> plain is one small binary that compiles, tests, deploys, verifies and upgrades Solidity contracts. It runs Foundry projects as they are and turns the minute-long edit-and-test loop into about a second.
+
+Editing a test and rerunning the suite takes about 1 second where Foundry takes 56. plain is MIT licensed and made by Nikita Kolmogorov.
+
+## Docs
+
+- [Documentation](https://getplain.org/docs/): installing, the edit-and-test loop, compiling, testing, deploying, verifying and upgrading contracts, networks, existing Foundry projects, dependencies, configuration, security and plugins.
+- [README](https://raw.githubusercontent.com/backmeupplz/plain/main/README.md): the project overview in Markdown.
+
+## Install
+
+- Script: `curl -fsSL https://getplain.org/install | sh` (macOS on Apple silicon and Intel, Linux x86_64 with glibc 2.34 or newer).
+- Homebrew: `brew install backmeupplz/tap/plain`. npm: `npm install -g plain-evm`. Cargo: `cargo binstall plain-evm`. Nix: `nix profile install github:backmeupplz/plain`. Arch Linux: `plain-bin` from the AUR. Debian and Ubuntu: the signed apt repository at pkg.getplain.org.
+
+## Links
+
+- [Home page](https://getplain.org/)
+- [Source code](https://github.com/backmeupplz/plain)
+- [Releases](https://github.com/backmeupplz/plain/releases)
