@@ -7,6 +7,7 @@ Editing a test and rerunning the suite takes about 1 second where Foundry takes 
 ## Docs
 
 - [Documentation](https://getplain.org/docs/): installing, the edit-and-test loop, compiling, testing, deploying, verifying and upgrading contracts, networks, existing Foundry projects, dependencies, configuration, security and plugins.
+- [Run Solidity tests in CI](https://getplain.org/docs/ci/): a GitHub Actions workflow for plain, what to cache, and measured times on Uniswap v4-core (1m43s cold against 8m57s for forge 1.8.6, 4.9 s with a restored cache), tested 2026-10-29.
 - [README](https://raw.githubusercontent.com/backmeupplz/plain/main/README.md): the project overview in Markdown.
 
 ## Install
