@@ -11,12 +11,12 @@ jobs:
   test:
     # Our pushes and PRs run on the Mac runners with a persistent, incremental target dir; outsider PRs (bridged in by
     # the `github` bot) never touch the Mac and run on Linux.
-    runs-on: ${{ (github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude"]'), github.event.pull_request.user.login)) && 'macos-latest' || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)) && 'macos-latest' || 'ubuntu-latest' }}
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
-      - name: Persistent target dir and solc cache (Mac)
+      - name: Persistent target dir, source dir and solc cache (Mac)
         if: runner.os == 'macOS'
         run: |
           # One per runner instance (each runs one job at a time); the target is wiped past 10 GB, since cargo never prunes it.
@@ -24,6 +24,10 @@ jobs:
           [ ! -d "$d" ] || [ "$(du -sm "$d" | cut -f1)" -lt 10000 ] || rm -rf "$d"
           echo "CARGO_TARGET_DIR=$d" >> "$GITHUB_ENV"
           echo "PLAIN_HOME=$RUNNER_TOOL_CACHE/plain-home" >> "$GITHUB_ENV"
+          # rustc's incremental cache is only reused from the same directory, and every job checks out to a new one:
+          # build from a fixed copy (55-70 s rebuilding plain from a new path under load vs 11-19 s from the same one)
+          rsync -a --delete --exclude /.git --exclude node_modules ./ "$RUNNER_TOOL_CACHE/plain-src/"
+          echo "PLAIN_SRC=$RUNNER_TOOL_CACHE/plain-src" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         if: runner.os == 'Linux'
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -31,9 +35,11 @@ jobs:
         with:
           cache-directories: ~/.plain/solc
       - run: |
-          rustc --version; node --version
-          # the TS fixture test imports viem; install it while the tests compile
-          npm install --prefix tests/fixture --no-package-lock --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 &
+          cd "${PLAIN_SRC:-.}"
+          rustc --version; node --version; command -v bun || true
+          # the TS fixture test imports viem; install it while the tests compile: bun from its lockfile and cache (under
+          # a second warm, a few seconds cold), else npm (~25 s)
+          (cd tests/fixture && if command -v bun > /dev/null; then bun install --frozen-lockfile; else npm install --no-package-lock --no-audit --no-fund; fi) > "$RUNNER_TEMP/npm.log" 2>&1 &
           npm=$!
           cargo test --locked --no-run
           wait $npm || { cat "$RUNNER_TEMP/npm.log"; exit 1; }

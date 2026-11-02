@@ -265,37 +265,39 @@ fn node_like_anvil() {
     std::fs::create_dir_all(dir).unwrap();
     // runtime: return storage slot 0 (PUSH0 SLOAD PUSH0 MSTORE PUSH1 32 PUSH0 RETURN)
     std::fs::write(format!("{dir}/genesis.json"), r#"{"config":{"chainId":8453},"timestamp":"0x6553f100","alloc":{"0x000000000000000000000000000000000000bEEF":{"balance":"0x2a","nonce":"0x3","code":"0x5f545f5260205ff3","storage":{"0x0":"0x07"}}}}"#).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+    // port 0: the node takes a free port itself and names it in its first line, printed once it listens (a port
+    // picked here and freed again could be taken by a concurrent test before the node binds it)
     let mut child = Command::new(env!("CARGO_BIN_EXE_plain"))
-        .args(["node", "--host", "127.0.0.1", "--port", &port, "--init", "genesis.json", "--gas-limit", "16777216", "--base-fee", "100", "--silent"])
+        .args(["node", "--host", "127.0.0.1", "--port", "0", "--init", "genesis.json", "--gas-limit", "16777216", "--base-fee", "100"])
         .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // (the pipe stays open until the node is killed: it prints two more lines)
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    let port = first.split("http://127.0.0.1:").nth(1).and_then(|r| r.split(' ').next()).unwrap_or_else(|| panic!("plain node: {first:?}")).to_string();
     let rpc = |method: &str, params: serde_json::Value| -> serde_json::Value {
         let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
-        for _ in 0..100 {
-            if let Ok(mut s) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-                write!(s, "POST / HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
-                let mut r = std::io::BufReader::new(s);
-                let mut len = 0;
-                loop {
-                    let mut line = String::new();
-                    r.read_line(&mut line).unwrap();
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
-                        len = v.trim().parse().unwrap();
-                    }
-                }
-                let mut out = vec![0; len];
-                r.read_exact(&mut out).unwrap();
-                let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-                return v["result"].clone();
+        let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        write!(s, "POST / HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut r = std::io::BufReader::new(s);
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap();
+            }
         }
-        panic!("plain node didn't start");
+        let mut out = vec![0; len];
+        r.read_exact(&mut out).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["result"].clone()
     };
     let beef = "0x000000000000000000000000000000000000beef";
     let checks = [
@@ -308,6 +310,7 @@ fn node_like_anvil() {
         (rpc("eth_getBlockByNumber", serde_json::json!(["0x0", false]))["timestamp"].clone(), "0x6553f100"),
     ];
     child.kill().ok();
+    drop(stdout);
     for (got, want) in checks {
         assert_eq!(got, want);
     }
