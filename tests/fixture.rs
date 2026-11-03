@@ -118,6 +118,111 @@ fn invariant_skips_like_forge() {
 }
 
 #[test]
+fn skip_reasons_like_forge() {
+    // vm.skip(true, reason) skips with the reason shown (it used to fail as an unsupported cheatcode), in a test, a
+    // fuzz test, setUp and an invariant's setUp-state check; checked against forge 1.7.1, where a skip first reached
+    // mid-campaign breaks the invariant ("FOUNDRY::SKIP" then the reason) and a handler's skip is a reverted call,
+    // which breaks it only with fail_on_revert; a revert carrying the marker that no vm.skip made, or a vm.skip in a
+    // contract the test calls, fails
+    let dir = "tests/fixture/tmp/skip-reasons";
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::create_dir_all(format!("{dir}/test")).unwrap();
+    std::fs::write(format!("{dir}/foundry.toml"), "[profile.default]\n").unwrap();
+    std::fs::write(
+        format!("{dir}/test/Reasons.t.sol"),
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
+contract Bump {
+    uint256 public n;
+    function bump() external { n += 1; }
+}
+contract SkipHandler {
+    uint256 public n;
+    function go() external {
+        n += 1;
+        if (n > 2) Vm(address(uint160(uint256(keccak256("hevm cheat code"))))).skip(true, "handler says skip");
+    }
+}
+contract Spoof {
+    function marker() external pure { assembly { mstore(0, "FOUNDRY::SKIP") revert(0, 13) } }
+    function markerX() external pure { assembly { mstore(0, "FOUNDRY::SKIPx") revert(0, 14) } }
+    function deep() external { Vm(address(uint160(uint256(keccak256("hevm cheat code"))))).skip(true, "deep"); }
+}
+contract EdgeTest is Test {
+    Spoof s;
+    function setUp() public { s = new Spoof(); }
+    function test_spoofMarker() public view { s.marker(); }
+    function test_spoofMarkerX() public view { s.markerX(); }
+    function test_skipInHelper() public { s.deep(); }
+    /// forge-config: default.isolate = true
+    function test_isolatedSpoof() public view { s.markerX(); }
+    /// forge-config: default.isolate = true
+    function test_isolatedSkip() public { vm.skip(true, "iso"); }
+}
+contract ReasonTest is Test {
+    function test_reason() public { vm.skip(true, "plain reason"); }
+    function test_noReason() public { vm.skip(true); }
+    function test_falseReason() public { vm.skip(false, "nope"); }
+    function testFuzz_reason(uint256 x) public { vm.skip(x % 2 == 0, "even input"); }
+}
+contract SetUpReasonTest is Test {
+    function setUp() public { vm.skip(true, "setup reason"); }
+    function test_a() public {}
+}
+contract InvariantReasonTest is Test {
+    Bump b;
+    function setUp() public { b = new Bump(); }
+    function invariant_pre() public { vm.skip(true, "pre reason"); }
+}
+contract MidCampaignReasonTest is Test {
+    Bump b;
+    function setUp() public { b = new Bump(); }
+    function invariant_later() public { vm.skip(b.n() != 0, "later reason"); }
+}
+contract HandlerSkipTest is Test {
+    SkipHandler h;
+    function setUp() public { h = new SkipHandler(); }
+    /// forge-config: default.invariant.runs = 16
+    /// forge-config: default.invariant.depth = 16
+    function invariant_holds() public view { assertLe(h.n(), 1000); }
+}
+contract HandlerSkipFailOnRevertTest is Test {
+    SkipHandler h;
+    function setUp() public { h = new SkipHandler(); }
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_holdsStrict() public view { assertLe(h.n(), 1000); }
+}
+"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["test", "-v"]).current_dir(dir).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success() && text.contains("2 passed, 6 failed, 6 skipped"), "{text}");
+    for line in [
+        "skip test_reason(): plain reason",
+        "skip test_noReason(): skipped",
+        "pass test_falseReason()",
+        "skip testFuzz_reason(uint256): even input",
+        "skip test_a(): skipped in setUp: setup reason",
+        "skip invariant_pre(): pre reason",
+        "FAIL invariant_later(): invariant broken: FOUNDRY::SKIPlater reason",
+        "pass invariant_holds()",
+        "FAIL invariant_holdsStrict(): invariant broken: call reverted: FOUNDRY::SKIPhandler says skip",
+        // a revert that merely carries the marker is no skip, nor is a skip from a contract the test calls
+        "FAIL test_spoofMarker(): FOUNDRY::SKIP",
+        "FAIL test_spoofMarkerX(): FOUNDRY::SKIPx",
+        "FAIL test_isolatedSpoof(): FOUNDRY::SKIPx",
+        "FAIL test_skipInHelper(): vm.skip: `skip` can only be used at test level",
+        "skip test_isolatedSkip(): iso",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    assert!(!text.contains("unsupported cheatcode"), "{text}");
+}
+
+#[test]
 fn build_outputs() {
     std::fs::create_dir_all("tests/fixture/tmp").unwrap();
     // forge's --sizes table and EIP-170 check, its artifact layout with storage layouts, and inspect

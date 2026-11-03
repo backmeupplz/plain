@@ -545,8 +545,8 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
         let r;
         (db, r) = evm::transact(db, &mut env, &mut cheats, SENDER, TxKind::Call(addr), Bytes::from_static(&[0x0a, 0x92, 0x54, 0xe4]), U256::ZERO, true);
         let pending = cheats.finish();
-        if let Some(why) = evm::skipped(&r.output) {
-            let why = if why == "skipped" { "skipped in setUp".into() } else { format!("skipped in setUp: {why}") };
+        if let Some(why) = cheats.skipped(r.ok, &r.output) {
+            let why = if why.is_empty() { "skipped in setUp".into() } else { format!("skipped in setUp: {why}") };
             return tests.iter().map(|f| TestResult { name: sig(f), status: Status::Skip(why.clone()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![], seed: None }).collect();
         }
         if !r.ok || pending.is_some() {
@@ -678,6 +678,11 @@ fn inline_config(path: &std::path::Path) -> HashMap<String, Inline> {
     out
 }
 
+/// How a skip shows: its reason, or "skipped" without one.
+fn skip_text(reason: &str) -> String {
+    if reason.is_empty() { "skipped".into() } else { reason.into() }
+}
+
 fn sig(f: &Function) -> String {
     format!("{}({})", f.name, f.inputs.iter().map(|p| p.ty.as_str()).collect::<Vec<_>>().join(","))
 }
@@ -690,6 +695,7 @@ fn failed_slot(db: &Db) -> bool {
 /// One call of the test function on a fresh copy of the post-setUp state.
 fn exec_once(data: Bytes, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats) -> (Exec, Cheats, Option<String>) {
     let mut c = cheats.clone();
+    c.skip = None;
     let mut e = env.clone();
     let (db, r) = evm::transact(evm::overlay(db), &mut e, &mut c, SENDER, TxKind::Call(addr), data, U256::ZERO, true);
     let mut why = None;
@@ -711,13 +717,14 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
     if f.inputs.is_empty() {
         let data = Bytes::copy_from_slice(sel.as_slice());
         let (r, c, why) = exec_once(data.clone(), addr, db, env, cheats);
+        let skip = c.skipped(r.ok, &r.output).map(skip_text);
         res.gas = r.gas;
         res.logs = c.console;
-        res.status = match (evm::skipped(&r.output), why) {
-            (Some(skip), _) => Status::Skip(skip),
+        res.status = match (why, skip) {
+            (_, Some(skip)) => Status::Skip(skip),
             _ if r.output.as_ref() == ASSUME_MAGIC => Status::Fail("vm.assume rejected the inputs of a test that takes none".into()),
-            (_, Some(w)) => Status::Fail(w),
-            (_, None) => Status::Pass,
+            (Some(w), _) => Status::Fail(w),
+            (None, _) => Status::Pass,
         };
         if matches!(res.status, Status::Fail(_)) && !f.name.starts_with("testFail") {
             let (lines, root) = trace(data, addr, db, env, cheats);
@@ -761,7 +768,7 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                     }
                     continue;
                 }
-                let skip = evm::skipped(&r.output);
+                let skip = c.skipped(r.ok, &r.output).map(skip_text);
                 // vm.skip(true) reverts with the skip marker: that's a skip, not a failure
                 let fail = why.filter(|_| skip.is_none()).map(|w| (w, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), c.console, data.clone()));
                 if fail.is_some() || skip.is_some() {
@@ -788,8 +795,8 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 }
             }
         }
-    } else if let Some((_, _, _, Some(skip))) = first {
-        res.status = Status::Skip(skip);
+    } else if let Some((_, _, _, Some(why))) = first {
+        res.status = Status::Skip(why);
     }
     res.runs = Some(runs);
     res.gas = gas_sum / runs.max(1) as u64;
@@ -1016,20 +1023,22 @@ fn view(addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, sig: &str, ty: 
 }
 
 /// forge's skip check: each invariant is first called on the state setUp left, and one that `vm.skip(true)`s there
-/// is reported skipped while the others are fuzzed without it. A skip first reached mid-campaign is no skip: forge
-/// reports it as a broken invariant (`FOUNDRY::SKIP`), and so does plain.
+/// is reported skipped (with its reason) while the others are fuzzed without it. A skip first reached mid-campaign is
+/// no skip: forge 1.7 reports it as a broken invariant (`FOUNDRY::SKIP` then the reason), and so does plain; a handler
+/// that skips is a reverted call, which breaks the invariant only with `fail_on_revert`, as in forge.
 #[allow(clippy::too_many_arguments)]
 fn run_invariants(invs: &[&Function], key: (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
     let mut skipped = vec![];
     let mut live = vec![];
-    for f in invs {
-        match evm::skipped(&exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats).0.output) {
-            Some(why) => skipped.push(TestResult { name: sig(f), status: Status::Skip(why), gas: 0, runs: None, logs: vec![], args: None, trace: vec![], seed: None }),
-            None => live.push(*f),
+    for f in invs.iter().copied() {
+        let (r, c, _) = exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats);
+        match c.skipped(r.ok, &r.output) {
+            Some(why) => skipped.push((f, skip_text(why))),
+            None => live.push(f),
         }
     }
     let mut out = if live.is_empty() { vec![] } else { fuzz_invariants(&live, key, addr, db, env, cheats, opts, abi, dict) };
-    out.extend(skipped);
+    out.extend(skipped.into_iter().map(|(f, why)| TestResult { name: sig(f), status: Status::Skip(why), gas: 0, runs: None, logs: vec![], args: None, trace: vec![], seed: None }));
     out.sort_by_key(|r| invs.iter().position(|f| sig(f) == r.name));
     out
 }

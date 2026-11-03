@@ -28,13 +28,6 @@ pub const GAS_LIMIT: u64 = 1 << 30;
 pub const ASSUME_MAGIC: &[u8] = b"FOUNDRY::ASSUME";
 pub const SKIP_MAGIC: &[u8] = b"FOUNDRY::SKIP";
 
-/// What a test reports when `out` is a vm.skip(true) revert: forge's marker, with vm.skip(true, reason)'s reason
-/// right after it; None for any other output
-pub fn skipped(out: &[u8]) -> Option<String> {
-    let why = String::from_utf8_lossy(out.strip_prefix(SKIP_MAGIC)?).into_owned();
-    Some(if why.is_empty() { "skipped".into() } else { why })
-}
-
 // ---------- database ----------
 
 #[derive(Debug)]
@@ -553,6 +546,8 @@ pub struct Cheats {
     bc_creates: Vec<Option<usize>>,
     /// set when ds-test/forge-std `fail()` writes the global "failed" slot
     pub failed: bool,
+    /// the reason of this run's `vm.skip(true[, reason])` ("" without one), which reverts with forge's marker then it
+    pub skip: Option<String>,
     /// libraries deployed for the suite ("file:Name" -> address), used to link getCode results
     pub libs: HashMap<String, Address>,
     /// what the suite read from outside the EVM, when its results may be cached (see test.rs)
@@ -814,6 +809,13 @@ impl Cheats {
         Cheats { artifacts, root, access, ..Default::default() }
     }
 
+    /// The reason ("" without one) if a call that ended `ok` with `out` was skipped: it reverted with what this run's
+    /// `vm.skip(true[, reason])` reverted with. As in forge, a revert that merely carries the skip marker is no skip.
+    pub fn skipped(&self, ok: bool, out: &[u8]) -> Option<&str> {
+        let reason = self.skip.as_deref().filter(|_| !ok)?;
+        (out.strip_prefix(SKIP_MAGIC)? == reason.as_bytes()).then_some(reason)
+    }
+
     /// The next top-level call comes from `who` (msg.sender and tx.origin), though the transaction stays the original
     /// sender's: how a script's run() sees its deployer without spending the deployer's nonce.
     pub fn act_as(&mut self, who: Address) {
@@ -1020,7 +1022,14 @@ impl Cheats {
             }
             "skip(bool)" | "skip(bool,string)" => {
                 if args[0].as_bool() == Some(true) {
-                    Err(String::from_utf8_lossy(SKIP_MAGIC).into_owned() + &args.get(1).map(st).unwrap_or_default())
+                    // forge: only the test (or setUp, or a fuzzed handler) itself may skip, not a contract it calls
+                    if depth > 1 {
+                        return Err("vm.skip: `skip` can only be used at test level".into());
+                    }
+                    let reason = args.get(1).and_then(|r| r.as_str()).unwrap_or_default().to_string();
+                    let marked = format!("{}{reason}", String::from_utf8_lossy(SKIP_MAGIC));
+                    self.skip = Some(reason);
+                    Err(marked)
                 } else {
                     ok
                 }
@@ -1761,7 +1770,7 @@ impl Inspector<Ctx> for Cheats {
             let caller = inputs.caller;
             let out = match self.cheat(ctx, caller, depth, &data) {
                 Ok(out) => outcome(true, out, inputs),
-                Err(msg) if msg.as_bytes() == ASSUME_MAGIC || msg.as_bytes().starts_with(SKIP_MAGIC) => outcome(false, msg.into_bytes(), inputs),
+                Err(msg) if msg.as_bytes() == ASSUME_MAGIC || self.skip.as_ref().is_some_and(|r| msg.as_bytes().strip_prefix(SKIP_MAGIC) == Some(r.as_bytes())) => outcome(false, msg.into_bytes(), inputs),
                 Err(msg) => outcome(false, revert_bytes(&msg), inputs),
             };
             if let Some(t) = &mut self.trace {
