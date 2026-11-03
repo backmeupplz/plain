@@ -44,6 +44,22 @@ contract ForgeTest is Test {
         assertEq(x - x, 0);
     }
 
+    // vm.skip(true, reason) skips with that reason, and vm.skip(false, reason) runs on
+    function test_skipWithReason() public {
+        vm.skip(true, "needs mainnet");
+        revert("ran after vm.skip(true, reason)");
+    }
+
+    function test_skipFalseWithReasonRuns() public {
+        vm.skip(false, "never shown");
+        assertEq(block.chainid, 31337);
+    }
+
+    function testFuzz_skipWithReason(uint256 x) public {
+        vm.skip(x % 2 == 0, "even input");
+        assertEq(x % 2, 1);
+    }
+
     /// forge-config: default.isolate = true
     function test_isolatedCallsAreTransactions() public {
         Probe p = new Probe();
@@ -165,5 +181,16 @@ contract ForkTest is Test {
         vm.createSelectFork(rpc);
         assertEq(block.number, 100);
         assertEq(vm.activeFork(), id + 1);
+    }
+}
+
+// vm.skip(true, reason) in setUp skips every test of the contract with that reason
+contract ForgeSkipSetUpTest is Test {
+    function setUp() public {
+        vm.skip(true, "no fork configured");
+    }
+
+    function test_skippedBySetUp() public pure {
+        revert("ran after setUp skipped");
     }
 }

@@ -28,6 +28,13 @@ pub const GAS_LIMIT: u64 = 1 << 30;
 pub const ASSUME_MAGIC: &[u8] = b"FOUNDRY::ASSUME";
 pub const SKIP_MAGIC: &[u8] = b"FOUNDRY::SKIP";
 
+/// What a test reports when `out` is a vm.skip(true) revert: forge's marker, with vm.skip(true, reason)'s reason
+/// right after it; None for any other output
+pub fn skipped(out: &[u8]) -> Option<String> {
+    let why = String::from_utf8_lossy(out.strip_prefix(SKIP_MAGIC)?).into_owned();
+    Some(if why.is_empty() { "skipped".into() } else { why })
+}
+
 // ---------- database ----------
 
 #[derive(Debug)]
@@ -610,7 +617,7 @@ const SUPPORTED: &[&str] = sigs![
     "getBlockTimestamp()", "getBlockNumber()", "store(address,bytes32,bytes32)", "load(address,bytes32)", "etch(address,bytes)",
     "getNonce(address)", "setNonce(address,uint64)", "setNonceUnsafe(address,uint64)", "resetNonce(address)",
     "addr(uint256)", "sign(uint256,bytes32)", "signCompact(uint256,bytes32)", "rememberKey(uint256)", "label(address,string)", "getLabel(address)",
-    "assume(bool)", "skip(bool)", "expectRevert()", "expectRevert(bytes4)", "expectRevert(bytes)", "expectRevert(address)",
+    "assume(bool)", "skip(bool)", "skip(bool,string)", "expectRevert()", "expectRevert(bytes4)", "expectRevert(bytes)", "expectRevert(address)",
     "expectRevert(bytes4,address)", "expectRevert(bytes,address)", "expectPartialRevert(bytes4)", "expectPartialRevert(bytes4,address)",
     "expectEmit()", "expectEmit(address)", "expectEmit(bool,bool,bool,bool)", "expectEmit(bool,bool,bool,bool,address)",
     "recordLogs()", "getRecordedLogs()", "snapshotState()", "snapshot()", "revertToState(uint256)", "revertTo(uint256)",
@@ -1011,9 +1018,9 @@ impl Cheats {
                     Err(String::from_utf8_lossy(ASSUME_MAGIC).into())
                 }
             }
-            "skip(bool)" => {
+            "skip(bool)" | "skip(bool,string)" => {
                 if args[0].as_bool() == Some(true) {
-                    Err(String::from_utf8_lossy(SKIP_MAGIC).into())
+                    Err(String::from_utf8_lossy(SKIP_MAGIC).into_owned() + &args.get(1).map(st).unwrap_or_default())
                 } else {
                     ok
                 }
@@ -1754,7 +1761,7 @@ impl Inspector<Ctx> for Cheats {
             let caller = inputs.caller;
             let out = match self.cheat(ctx, caller, depth, &data) {
                 Ok(out) => outcome(true, out, inputs),
-                Err(msg) if msg.as_bytes() == ASSUME_MAGIC || msg.as_bytes() == SKIP_MAGIC => outcome(false, msg.into_bytes(), inputs),
+                Err(msg) if msg.as_bytes() == ASSUME_MAGIC || msg.as_bytes().starts_with(SKIP_MAGIC) => outcome(false, msg.into_bytes(), inputs),
                 Err(msg) => outcome(false, revert_bytes(&msg), inputs),
             };
             if let Some(t) = &mut self.trace {

@@ -73,7 +73,7 @@ fn fixture() {
         let should_fail = line.contains("testBad") || line.contains("testFail") || line.contains("invariantBad");
         assert_eq!(failed, should_fail, "{line}\n{text}");
     }
-    assert!(text.contains("28 passed, 10 failed, 1 skipped"), "{text}");
+    assert!(text.contains("29 passed, 10 failed, 4 skipped"), "{text}");
     assert!(text.contains("Breakable.poke(7)"), "{text}");
     assert!(text.contains("panic: arithmetic underflow"), "{text}");
     assert!(text.contains("log: value is 99"), "{text}");
@@ -88,10 +88,14 @@ fn forge_options() {
     assert!(!ok && text.contains("0 passed, 1 failed") && text.contains("warm and dirty"), "{text}");
     let (ok, text) = plain(&["test", "--match-path", "Forge.t.sol", "--match-test", "isolated", "--rerun"]);
     assert!(ok && text.contains("1 passed, 0 failed"), "{text}");
-    // vm.skip(true) on some fuzz inputs skips the test (it used to fail with the skip marker as its reason)
-    let (ok, text) = plain(&["test", "--match-path", "Forge.t.sol", "--match-test", "testFuzz_skip", "-v", "--rerun"]);
-    assert!(ok && text.contains("1 passed, 0 failed, 1 skipped") && text.contains("skip testFuzz_skipsSomeInputs(uint256): skipped"), "{text}");
-    assert!(text.contains("pass testFuzz_skipFalseRuns(uint256)") && !text.contains("FOUNDRY::"), "{text}");
+    // vm.skip(true) on some fuzz inputs skips the test (it used to fail with the skip marker as its reason), and
+    // vm.skip(true, reason) skips with that reason in a unit test, a fuzz test and setUp
+    let (ok, text) = plain(&["test", "--match-path", "Forge.t.sol", "--match-test", "skip", "-v", "--rerun"]);
+    assert!(ok && text.contains("2 passed, 0 failed, 4 skipped") && text.contains("skip testFuzz_skipsSomeInputs(uint256): skipped"), "{text}");
+    assert!(text.contains("pass testFuzz_skipFalseRuns(uint256)") && text.contains("pass test_skipFalseWithReasonRuns()"), "{text}");
+    assert!(text.contains("skip test_skipWithReason(): needs mainnet") && text.contains("skip testFuzz_skipWithReason(uint256): even input"), "{text}");
+    assert!(text.contains("skip test_skippedBySetUp(): skipped in setUp: no fork configured"), "{text}");
+    assert!(!text.contains("FOUNDRY::") && !text.contains("never shown"), "{text}");
     let (ok, text) = plain(&["test", "--match-test", "nothing_by_this_name"]);
     assert!(!ok && text.contains("no test matches"), "{text}");
 }
@@ -104,12 +108,12 @@ fn invariant_skips_like_forge() {
     std::fs::remove_dir_all(dir).ok();
     std::fs::create_dir_all(format!("{dir}/test")).unwrap();
     std::fs::write(format!("{dir}/foundry.toml"), "[profile.default]\n").unwrap();
-    std::fs::write(format!("{dir}/test/Skip.t.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\ncontract Bump {\n    uint256 public n;\n    function bump() external { n += 1; }\n}\ncontract SkipTest is Test {\n    Bump b;\n    function setUp() public { b = new Bump(); }\n    function invariant_a_skips() public { vm.skip(true); }\n    function invariant_b_holds() public view { assertLe(b.n(), 1000); }\n}\ncontract NothingToFuzzSkipTest is Test {\n    function invariant_skips() public { vm.skip(true); }\n}\ncontract MidCampaignSkipTest is Test {\n    Bump b;\n    function setUp() public { b = new Bump(); }\n    function invariant_skips_later() public { vm.skip(b.n() != 0); }\n}\n").unwrap();
+    std::fs::write(format!("{dir}/test/Skip.t.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\ncontract Bump {\n    uint256 public n;\n    function bump() external { n += 1; }\n}\ncontract SkipTest is Test {\n    Bump b;\n    function setUp() public { b = new Bump(); }\n    function invariant_a_skips() public { vm.skip(true); }\n    function invariant_c_skips_why() public { vm.skip(true, \"no fork configured\"); }\n    function invariant_b_holds() public view { assertLe(b.n(), 1000); }\n}\ncontract NothingToFuzzSkipTest is Test {\n    function invariant_skips() public { vm.skip(true); }\n}\ncontract MidCampaignSkipTest is Test {\n    Bump b;\n    function setUp() public { b = new Bump(); }\n    function invariant_skips_later() public { vm.skip(b.n() != 0); }\n}\n").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["test", "-v"]).current_dir(dir).output().unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(!out.status.success() && text.contains("1 passed, 1 failed, 2 skipped"), "{text}");
+    assert!(!out.status.success() && text.contains("1 passed, 1 failed, 3 skipped"), "{text}");
     assert!(text.contains("skip invariant_a_skips(): skipped") && text.contains("skip invariant_skips(): skipped"), "{text}");
-    assert!(text.contains("pass invariant_b_holds()"), "{text}");
+    assert!(text.contains("pass invariant_b_holds()") && text.contains("skip invariant_c_skips_why(): no fork configured"), "{text}");
     assert!(text.contains("FAIL invariant_skips_later(): invariant broken: FOUNDRY::SKIP"), "{text}");
 }
 

@@ -1,6 +1,6 @@
 //! Solidity test runner (forge-std compatible): parallel suites, parallel tests, fuzzing.
 use crate::decode;
-use crate::evm::{self, ASSUME_MAGIC, CHEATS, Cheats, Db, Env, Exec, SENDER, SKIP_MAGIC};
+use crate::evm::{self, ASSUME_MAGIC, CHEATS, Cheats, Db, Env, Exec, SENDER};
 use crate::solc::Artifact;
 use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt, Specifier};
 use alloy_json_abi::{Function, JsonAbi};
@@ -510,8 +510,9 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
         let r;
         (db, r) = evm::transact(db, &mut env, &mut cheats, SENDER, TxKind::Call(addr), Bytes::from_static(&[0x0a, 0x92, 0x54, 0xe4]), U256::ZERO, true);
         let pending = cheats.finish();
-        if r.output.as_ref() == SKIP_MAGIC {
-            return tests.iter().map(|f| TestResult { name: sig(f), status: Status::Skip("skipped in setUp".into()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }).collect();
+        if let Some(why) = evm::skipped(&r.output) {
+            let why = if why == "skipped" { "skipped in setUp".into() } else { format!("skipped in setUp: {why}") };
+            return tests.iter().map(|f| TestResult { name: sig(f), status: Status::Skip(why.clone()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }).collect();
         }
         if !r.ok || pending.is_some() {
             let why = if r.ok { pending.unwrap() } else { decode::reason(&r.output) };
@@ -677,11 +678,11 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
         let (r, c, why) = exec_once(data.clone(), addr, db, env, cheats);
         res.gas = r.gas;
         res.logs = c.console;
-        res.status = match why {
-            _ if r.output.as_ref() == SKIP_MAGIC => Status::Skip("skipped".into()),
+        res.status = match (evm::skipped(&r.output), why) {
+            (Some(skip), _) => Status::Skip(skip),
             _ if r.output.as_ref() == ASSUME_MAGIC => Status::Fail("vm.assume rejected the inputs of a test that takes none".into()),
-            Some(w) => Status::Fail(w),
-            None => Status::Pass,
+            (_, Some(w)) => Status::Fail(w),
+            (_, None) => Status::Pass,
         };
         if matches!(res.status, Status::Fail(_)) && !f.name.starts_with("testFail") {
             let (lines, root) = trace(data, addr, db, env, cheats);
@@ -705,7 +706,7 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
     let cut = std::sync::atomic::AtomicU32::new(u32::MAX);
     let rejects = std::sync::atomic::AtomicU32::new(0);
     // each run gets its own deterministic stream; runs execute in parallel
-    let outcomes: Vec<(u32, u64, Option<(String, String, Vec<String>, Vec<u8>)>, bool)> = (0..fuzz_runs)
+    let outcomes: Vec<(u32, u64, Option<(String, String, Vec<String>, Vec<u8>)>, Option<String>)> = (0..fuzz_runs)
         .into_par_iter()
         .filter_map(|i| {
             if i > cut.load(std::sync::atomic::Ordering::Relaxed) {
@@ -721,14 +722,14 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 if r.output.as_ref() == ASSUME_MAGIC {
                     if rejects.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 65536 {
                         cut.store(0, std::sync::atomic::Ordering::Relaxed);
-                        return Some((i, 0, Some(("too many vm.assume rejections".into(), String::new(), vec![], vec![])), false));
+                        return Some((i, 0, Some(("too many vm.assume rejections".into(), String::new(), vec![], vec![])), None));
                     }
                     continue;
                 }
-                let skip = r.output.as_ref() == SKIP_MAGIC;
+                let skip = evm::skipped(&r.output);
                 // vm.skip(true) reverts with the skip marker: that's a skip, not a failure
-                let fail = why.filter(|_| !skip).map(|w| (w, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), c.console, data.clone()));
-                if fail.is_some() || skip {
+                let fail = why.filter(|_| skip.is_none()).map(|w| (w, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), c.console, data.clone()));
+                if fail.is_some() || skip.is_some() {
                     cut.fetch_min(i, std::sync::atomic::Ordering::Relaxed);
                 }
                 return Some((i, r.gas, fail, skip));
@@ -738,7 +739,7 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
     let runs = outcomes.len() as u32;
     let gas_sum: u64 = outcomes.iter().map(|o| o.1).sum();
     // the first run that failed or skipped decides, as in forge, which stops there: a skip skips the whole test
-    let first = outcomes.into_iter().filter(|o| o.2.is_some() || o.3).min_by_key(|o| o.0);
+    let first = outcomes.into_iter().filter(|o| o.2.is_some() || o.3.is_some()).min_by_key(|o| o.0);
     if let Some((_, _, Some((why, args, logs, data)), _)) = first {
         res.status = Status::Fail(why);
         res.args = Some(args).filter(|a| !a.is_empty());
@@ -752,8 +753,8 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 }
             }
         }
-    } else if first.is_some() {
-        res.status = Status::Skip("skipped".into());
+    } else if let Some((_, _, _, Some(skip))) = first {
+        res.status = Status::Skip(skip);
     }
     res.runs = Some(runs);
     res.gas = gas_sum / runs.max(1) as u64;
@@ -975,9 +976,16 @@ fn view(addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, sig: &str, ty: 
 /// reports it as a broken invariant (`FOUNDRY::SKIP`), and so does plain.
 #[allow(clippy::too_many_arguments)]
 fn run_invariants(invs: &[&Function], key: (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
-    let (skipped, live): (Vec<&Function>, Vec<&Function>) = invs.iter().copied().partition(|f| exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats).0.output.as_ref() == SKIP_MAGIC);
+    let mut skipped = vec![];
+    let mut live = vec![];
+    for f in invs {
+        match evm::skipped(&exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats).0.output) {
+            Some(why) => skipped.push(TestResult { name: sig(f), status: Status::Skip(why), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }),
+            None => live.push(*f),
+        }
+    }
     let mut out = if live.is_empty() { vec![] } else { fuzz_invariants(&live, key, addr, db, env, cheats, opts, abi, dict) };
-    out.extend(skipped.iter().map(|f| TestResult { name: sig(f), status: Status::Skip("skipped".into()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }));
+    out.extend(skipped);
     out.sort_by_key(|r| invs.iter().position(|f| sig(f) == r.name));
     out
 }
