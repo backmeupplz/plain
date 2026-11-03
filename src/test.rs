@@ -129,6 +129,9 @@ pub struct Opts {
     pub isolate: bool,
     /// gas for each test (and the block), forge's gas_limit / --gas-limit
     pub gas_limit: u64,
+    /// the command a failing fuzz or invariant test's seed is shown with, to run it again (`plain test`, with
+    /// FOUNDRY_PROFILE and --fuzz-runs as given)
+    pub replay: String,
 }
 
 /// `/// forge-config:` settings above a test function.
@@ -157,6 +160,9 @@ struct TestResult {
     logs: Vec<String>,
     args: Option<String>,
     trace: Vec<String>,
+    /// the fuzz seed a fuzz or invariant test ran with (None: the test doesn't depend on it)
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 struct Suite {
@@ -176,6 +182,7 @@ struct Entry {
 
 /// Results are deterministic given the test contract's bytecode, the settings, this binary and what the
 /// suite read (artifacts it deployed, files, env vars): the key covers the first three, `Entry::deps` the rest.
+/// Fuzz and invariant results also depend on the seed, which each of them records.
 fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, Inline>) -> String {
     use sha2::Digest;
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -185,7 +192,9 @@ fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, Inline>) -> S
     });
     let mut inline: Vec<_> = inline.iter().collect();
     inline.sort();
-    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{}|{inline:?}|{:?}|{:?}|{}|{}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.seed, opts.allow_internal_revert, opts.access, opts.spec, opts.isolate, opts.gas_limit);
+    // not the seed: fuzz and invariant results carry the seed they ran with (TestResult::seed), so a new seed reruns
+    // only them
+    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{inline:?}|{:?}|{:?}|{}|{}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.allow_internal_revert, opts.access, opts.spec, opts.isolate, opts.gas_limit);
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
@@ -303,6 +312,25 @@ pub fn matches(a: &Artifact, filter: &Filter) -> bool {
     a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["name"].as_str().is_some_and(|n| crate::rewrite::is_test_name(n) && filter.wants(&id, Some(n)))))
 }
 
+/// A `--seed` (or `PLAIN_SEED`, `fuzz.seed`) value: decimal or 0x hex, up to 256 bits as forge takes it (folded into
+/// the 64 bits plain's fuzzer draws from), or `random` for a new one. The seed, and whether it was drawn.
+pub fn seed(s: &str) -> Option<(u64, bool)> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("random") {
+        let mut b = [0u8; 8];
+        getrandom::fill(&mut b).unwrap_or_else(|e| crate::die(&format!("no randomness from the OS: {e}")));
+        return Some((u64::from_le_bytes(b), true));
+    }
+    // ruint reads "", a bare prefix ("0x") and `_` separators alone as 0: an unset `--seed "$GITHUB_RUN_NUMBER"` is an
+    // error, not seed 0
+    let digits = ["0x", "0o", "0b"].iter().find_map(|p| s.get(..2).filter(|h| h.eq_ignore_ascii_case(p)).map(|_| &s[2..])).unwrap_or(s);
+    if digits.bytes().all(|b| b == b'_') {
+        return None;
+    }
+    let v: U256 = s.parse().ok()?;
+    Some((v.as_limbs().iter().fold(0, |a, l| a ^ l), false))
+}
+
 pub fn is_test_contract(a: &Artifact) -> bool {
     !a.bytecode.is_empty() && a.abi.as_array().is_some_and(|f| f.iter().any(|x| x["type"] == "function" && x["name"].as_str().is_some_and(crate::rewrite::is_test_name)))
 }
@@ -394,6 +422,10 @@ pub fn run(arts: Vec<Artifact>, root: &std::path::Path, opts: &Opts) -> bool {
                     if let Some(a) = &r.args {
                         println!("       args: {a}");
                     }
+                    if let Some(seed) = r.seed {
+                        let name = r.name.split('(').next().unwrap_or(&r.name);
+                        println!("       seed: {seed:#x} ({} --seed {seed:#x} --mt {name} replays it)", opts.replay);
+                    }
                     for l in &r.logs {
                         println!("       log: {l}");
                     }
@@ -448,7 +480,7 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
         .filter(|e| e.deps.iter().all(|(k, v)| evm::read_now(k, arts, root).as_ref() == Some(v)));
     let mut cached = vec![];
     if let Some(e) = &old {
-        tests.retain(|f| match e.results.iter().find(|r| r.name == sig(f)) {
+        tests.retain(|f| match e.results.iter().find(|r| r.name == sig(f) && r.seed.is_none_or(|s| s == opts.seed)) {
             Some(r) => {
                 cached.push(r.clone());
                 false
@@ -462,6 +494,9 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     }
     let reads = key.as_ref().map(|_| Arc::new(std::sync::Mutex::new(evm::Reads::default())));
     let mut results = execute(art, arts, root, opts, remote, env, &id, &abi, tests, &inline, reads.clone());
+    for r in results.iter_mut().filter(|r| r.runs.is_some()) {
+        r.seed = Some(opts.seed);
+    }
     if let (Some(k), Some(r)) = (key, reads) {
         let r = r.lock().unwrap();
         if !r.impure {
@@ -501,7 +536,7 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
     env.block.gas_limit = opts.gas_limit;
     let (mut db, r) = setup(evm::base_db(remote.clone()), &mut env, &mut cheats, arts, art);
     let fail_all = |why: String, logs: Vec<String>| -> Vec<TestResult> {
-        tests.iter().map(|f| TestResult { name: sig(f), status: Status::Fail(why.clone()), gas: 0, runs: None, logs: logs.clone(), args: None, trace: vec![] }).collect()
+        tests.iter().map(|f| TestResult { name: sig(f), status: Status::Fail(why.clone()), gas: 0, runs: None, logs: logs.clone(), args: None, trace: vec![], seed: None }).collect()
     };
     let Some(addr) = r.address.filter(|_| r.ok) else {
         return fail_all(format!("constructor reverted: {}", decode::reason(&r.output)), cheats.console);
@@ -512,7 +547,7 @@ fn execute(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, op
         let pending = cheats.finish();
         if let Some(why) = evm::skipped(&r.output) {
             let why = if why == "skipped" { "skipped in setUp".into() } else { format!("skipped in setUp: {why}") };
-            return tests.iter().map(|f| TestResult { name: sig(f), status: Status::Skip(why.clone()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }).collect();
+            return tests.iter().map(|f| TestResult { name: sig(f), status: Status::Skip(why.clone()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![], seed: None }).collect();
         }
         if !r.ok || pending.is_some() {
             let why = if r.ok { pending.unwrap() } else { decode::reason(&r.output) };
@@ -671,7 +706,7 @@ fn exec_once(data: Bytes, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
 #[allow(clippy::too_many_arguments)]
 fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, fuzz_runs: u32, opts: &Opts, dict: &Dict) -> TestResult {
     let name = sig(f);
-    let mut res = TestResult { name, status: Status::Pass, gas: 0, runs: None, logs: vec![], args: None, trace: vec![] };
+    let mut res = TestResult { name, status: Status::Pass, gas: 0, runs: None, logs: vec![], args: None, trace: vec![], seed: None };
     let sel = f.selector();
     if f.inputs.is_empty() {
         let data = Bytes::copy_from_slice(sel.as_slice());
@@ -712,7 +747,7 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
             if i > cut.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
-            let mut rng = Rng((base_seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) | 1);
+            let mut rng = Rng::seeded(base_seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15));
             // runs seeded side by side start out correlated: a few steps in, they aren't
             (0..4).for_each(|_| _ = rng.next());
             loop {
@@ -774,6 +809,15 @@ fn legacy_fail(mut r: TestResult, f: &Function) -> TestResult {
 
 struct Rng(u64);
 impl Rng {
+    /// A generator for this seed: splitmix64's finalizer is a bijection, so distinct seeds (N and N+1 too) start distinct
+    /// streams. xorshift needs a non-zero state, and the one seed that mixes to 0 gets a fixed one instead.
+    fn seeded(seed: u64) -> Rng {
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        Rng(if z == 0 { 0x9E3779B97F4A7C15 } else { z })
+    }
     fn next(&mut self) -> u64 {
         // xorshift64*
         self.0 ^= self.0 >> 12;
@@ -980,7 +1024,7 @@ fn run_invariants(invs: &[&Function], key: (u32, u32, bool), addr: Address, db: 
     let mut live = vec![];
     for f in invs {
         match evm::skipped(&exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats).0.output) {
-            Some(why) => skipped.push(TestResult { name: sig(f), status: Status::Skip(why), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }),
+            Some(why) => skipped.push(TestResult { name: sig(f), status: Status::Skip(why), gas: 0, runs: None, logs: vec![], args: None, trace: vec![], seed: None }),
             None => live.push(*f),
         }
     }
@@ -996,7 +1040,7 @@ fn run_invariants(invs: &[&Function], key: (u32, u32, bool), addr: Address, db: 
 #[allow(clippy::too_many_arguments)]
 fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
     let result = |status: Status, trace: Vec<String>| -> Vec<TestResult> {
-        invs.iter().map(|f| TestResult { name: sig(f), status: status.clone(), gas: 0, runs: Some(runs), logs: vec![], args: None, trace: trace.clone() }).collect()
+        invs.iter().map(|f| TestResult { name: sig(f), status: status.clone(), gas: 0, runs: Some(runs), logs: vec![], args: None, trace: trace.clone(), seed: None }).collect()
     };
     let fail = |why: String| result(Status::Fail(why), vec![]);
     // the ABI of what's at an address: the artifact it was deployed from, never one that merely shares its name
@@ -1068,15 +1112,17 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
     }
     let after = has("afterInvariant");
     let types: Vec<Vec<DynSolType>> = calls.iter().map(|(_, f)| f.inputs.iter().filter_map(|p| p.resolve().ok()).collect()).collect();
-    let stop = std::sync::atomic::AtomicBool::new(false);
+    // the first run that broke an invariant: later runs are left out, earlier ones all run, so the failure reported
+    // for a seed doesn't depend on how the runs are scheduled
+    let cut = std::sync::atomic::AtomicU32::new(u32::MAX);
     // each run: Some((run, invariant index or MAX for all, reason, calls made, the last calls)) on failure
     let failures: Vec<(u32, usize, String, usize, Vec<String>)> = (0..runs)
         .into_par_iter()
         .filter_map(|run| {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if run > cut.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
-            let mut rng = Rng((opts.seed ^ (run as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)) | 1);
+            let mut rng = Rng::seeded(opts.seed ^ (run as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15));
             (0..4).for_each(|_| _ = rng.next());
             let mut c = cheats.clone();
             let mut vm = evm::Vm::new(evm::overlay(db), env, &mut c);
@@ -1113,12 +1159,12 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
                 seq.push((i, vals, sender, r.ok));
                 // a handler that calls fail() (the global failure flag) breaks the run as an assertion would
                 if vm.cheats().failed {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    cut.fetch_min(run, std::sync::atomic::Ordering::Relaxed);
                     let (n, lines) = tail(&seq, vm.cheats());
                     return Some((run, usize::MAX, "a call failed an assertion (fail())".into(), n, lines));
                 }
                 if fail_on_revert && !r.ok && r.output.as_ref() != ASSUME_MAGIC {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    cut.fetch_min(run, std::sync::atomic::Ordering::Relaxed);
                     let (n, lines) = tail(&seq, vm.cheats());
                     return Some((run, usize::MAX, format!("call reverted: {}", decode::reason(&r.output)), n, lines));
                 }
@@ -1126,7 +1172,7 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
                     vm.cheats().failed = false;
                     let r = vm.call(SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&inv.selector()[..]), U256::ZERO, false);
                     if !r.ok || vm.cheats().failed {
-                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        cut.fetch_min(run, std::sync::atomic::Ordering::Relaxed);
                         let why = if r.ok { "assertion failed".into() } else { decode::reason(&r.output) };
                         let (n, lines) = tail(&seq, vm.cheats());
                         return Some((run, k, why, n, lines));
@@ -1138,7 +1184,7 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
                 vm.cheats().failed = false;
                 let r = vm.call(SENDER, TxKind::Call(addr), Bytes::copy_from_slice(&alloy_primitives::keccak256("afterInvariant()")[..4]), U256::ZERO, false);
                 if !r.ok || vm.cheats().failed {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    cut.fetch_min(run, std::sync::atomic::Ordering::Relaxed);
                     let why = if r.ok { "assertion failed".into() } else { decode::reason(&r.output) };
                     let (n, lines) = tail(&seq, vm.cheats());
                     return Some((run, usize::MAX, format!("afterInvariant(): {why}"), n, lines));
@@ -1151,7 +1197,7 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
     invs.iter()
         .enumerate()
         .map(|(k, f)| {
-            let mut r = TestResult { name: sig(f), status: Status::Pass, gas: 0, runs: Some(runs), logs: vec![], args: None, trace: vec![] };
+            let mut r = TestResult { name: sig(f), status: Status::Pass, gas: 0, runs: Some(runs), logs: vec![], args: None, trace: vec![], seed: None };
             if let Some((_, fk, why, n, tail)) = &first {
                 if *fk == k || *fk == usize::MAX {
                     r.status = Status::Fail(format!("invariant broken: {why}"));
@@ -1167,6 +1213,46 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seeds() {
+        use super::seed;
+        assert_eq!(seed("42"), Some((42, false)));
+        assert_eq!(seed("0x5eed"), Some((0x5eed, false)));
+        assert_eq!(seed(" 0xFF "), Some((255, false)));
+        // forge takes 256-bit seeds: the 64 bits plain draws from are their limbs folded together
+        assert_eq!(seed("0x10000000000000001"), Some((0, false)));
+        assert_eq!(seed("nope"), None);
+        assert_eq!(seed("-1"), None);
+        // ruint parses these as 0
+        assert_eq!(seed(""), None);
+        assert_eq!(seed("  "), None);
+        assert_eq!(seed("0x"), None);
+        assert_eq!(seed("0X"), None);
+        assert_eq!(seed("0b"), None);
+        assert_eq!(seed("_"), None);
+        assert_eq!(seed("0x__"), None);
+        assert_eq!(seed("0x_ff"), Some((255, false)));
+        assert_eq!(seed("0"), Some((0, false)));
+        assert_eq!(seed("0x0"), Some((0, false)));
+        let (a, b) = (seed("random").unwrap(), seed("RANDOM").unwrap());
+        assert!(a.1 && b.1 && a.0 != b.0);
+    }
+
+    #[test]
+    fn adjacent_seeds_differ() {
+        // seeds one apart (--seed $GITHUB_RUN_NUMBER) start different streams, and 0 is a working seed
+        use super::Rng;
+        let first = |s: u64| {
+            let mut r = Rng::seeded(s);
+            [r.next(), r.next()]
+        };
+        for s in [0u64, 1, 2, 100, 0x5eec, u64::MAX - 1] {
+            assert_ne!(first(s), first(s + 1), "{s}");
+            assert_ne!(first(s), first(s ^ 1), "{s}");
+        }
+        assert_ne!(first(0), [0, 0]);
+    }
+
     #[test]
     fn match_path() {
         use super::path_matches as m;

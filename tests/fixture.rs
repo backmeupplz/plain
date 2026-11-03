@@ -340,3 +340,91 @@ fn node_like_anvil() {
         assert_eq!(got, want);
     }
 }
+
+#[test]
+fn fuzz_seeds() {
+    // a seed from foundry.toml, $PLAIN_SEED or --seed (in that order of precedence), or a random one per run
+    let dir = "tests/fixture/tmp/seeds";
+    std::fs::create_dir_all(format!("{dir}/test")).unwrap();
+    std::fs::write(format!("{dir}/foundry.toml"), "[profile.default]\n\n[fuzz]\nseed = \"0x1234\"\n").unwrap();
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    std::fs::write(format!("{dir}/test/Plain.t.sol"), format!("{head}contract PlainTest is Test {{\n    function test_sum() public pure {{\n        assertEq(uint256(2) + 2, 4);\n    }}\n}}\n")).unwrap();
+    std::fs::write(format!("{dir}/test/Fuzz.t.sol"), format!("{head}contract FuzzTest is Test {{\n    function testFuzz_xor(uint256 x) public pure {{\n        assertEq(x ^ x, 0);\n    }}\n}}\n")).unwrap();
+    // fails for about one input in seven, so which input fails first depends on the seed
+    std::fs::write(format!("{dir}/test/Bad.t.sol"), format!("{head}contract BadTest is Test {{\n    function testFuzz_bad(uint256 x) public pure {{\n        assertTrue(x % 7 != 3);\n    }}\n}}\n")).unwrap();
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_plain"));
+        c.arg("test").args(args).current_dir(dir).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+    let field = |text: &str, prefix: &str| text.lines().find_map(|l| l.trim().strip_prefix(prefix).map(|r| r.split_whitespace().next().unwrap().to_string()));
+    let suite = |text: &str, id: &str| text.lines().find(|l| l.starts_with(id)).unwrap_or_else(|| panic!("no {id}: {text}")).to_string();
+
+    // a new random seed each run reruns the fuzz suite, while the suite without fuzz tests stays cached
+    let mp = ["--mp", "test/{Plain,Fuzz}.t.sol"];
+    let (ok, text) = run(&mp, &[]);
+    assert!(ok && text.contains("2 passed, 0 failed") && !text.contains("fuzz seed"), "{text}");
+    let mut seeds = vec![];
+    for _ in 0..2 {
+        let (ok, text) = run(&[&mp[..], &["--seed", "random"]].concat(), &[]);
+        assert!(ok && text.contains("2 passed, 0 failed"), "{text}");
+        seeds.push(field(&text, "fuzz seed ").unwrap_or_else(|| panic!("no seed printed: {text}")));
+        assert!(suite(&text, "test/Plain.t.sol:PlainTest").ends_with("(cached)"), "{text}");
+        assert!(!suite(&text, "test/Fuzz.t.sol:FuzzTest").ends_with("(cached)"), "{text}");
+    }
+    assert_ne!(seeds[0], seeds[1]);
+    // the same seed again is a cache hit for the fuzz suite too
+    let (ok, text) = run(&[&mp[..], &["--seed", &seeds[1]]].concat(), &[]);
+    assert!(ok && suite(&text, "test/Fuzz.t.sol:FuzzTest").ends_with("(cached)"), "{text}");
+
+    // a failure prints its seed, and --seed with it replays the same failing input, however the runs are scheduled
+    let bad = ["--mc", "BadTest", "--rerun"];
+    let (ok, text) = run(&[&bad[..], &["--seed", "random"]].concat(), &[]);
+    assert!(!ok && text.contains("FAIL testFuzz_bad"), "{text}");
+    let (seed, args) = (field(&text, "seed: ").unwrap_or_else(|| panic!("{text}")), field(&text, "args: ").unwrap());
+    assert!(text.contains(&format!("plain test --seed {seed} --mt testFuzz_bad replays it")), "{text}");
+    for threads in ["1", "8"] {
+        let (ok, again) = run(&[&bad[..], &["--seed", &seed, "--threads", threads]].concat(), &[]);
+        assert!(!ok && field(&again, "args: ").as_ref() == Some(&args) && !again.contains("fuzz seed"), "{text}\n{again}");
+    }
+    // consecutive seeds (--seed $GITHUB_RUN_NUMBER) try different inputs: the first input a seed draws, as random bytes
+    // never come from the code's constants (two seeds may pick the same constant)
+    std::fs::write(format!("{dir}/test/Bytes.t.sol"), format!("{head}contract BytesTest is Test {{\n    function testFuzz_first(bytes memory b) public pure {{\n        assertEq(b.length, 1000);\n    }}\n}}\n")).unwrap();
+    let failing = |s: &str| field(&run(&["--mc", "BytesTest", "--rerun", "--seed", s], &[]).1, "args: ");
+    for s in [100u64, 102, 0x5eec] {
+        let (a, b) = (failing(&s.to_string()), failing(&(s + 1).to_string()));
+        assert!(a.is_some() && a != b, "{s}: {a:?} {b:?}");
+    }
+    // the replay command names what else decides the inputs
+    let (ok, text) = run(&[&bad[..], &["--seed", "0x9", "--fuzz-runs", "300"]].concat(), &[]);
+    assert!(!ok && text.contains("(plain test --fuzz-runs 300 --seed 0x9 --mt testFuzz_bad replays it)"), "{text}");
+    // and how it runs, as typed (--block-gas-limit is --gas-limit), and that command replays it
+    let (ok, text) = run(&[&bad[..], &["--isolate", "--seed", "0x9", "--block-gas-limit", "900000000"]].concat(), &[]);
+    assert!(!ok && text.contains("(plain test --isolate --gas-limit 900000000 --seed 0x9 --mt testFuzz_bad replays it)"), "{text}");
+    let (ok, again) = run(&["--rerun", "--isolate", "--gas-limit", "900000000", "--seed", "0x9", "--mt", "testFuzz_bad"], &[]);
+    assert!(!ok && field(&again, "args: ") == field(&text, "args: "), "{text}\n{again}");
+
+    // foundry.toml's fuzz.seed, $PLAIN_SEED over it, --seed over both
+    for (args, env, want) in [(&[][..], &[][..], "0x1234"), (&[][..], &[("PLAIN_SEED", "99")][..], "0x63"), (&["--seed", "0x5"][..], &[("PLAIN_SEED", "99")][..], "0x5")] {
+        let (ok, text) = run(&[&bad[..], args].concat(), env);
+        assert!(!ok && field(&text, "seed: ").as_deref() == Some(want), "{want}: {text}");
+    }
+    let (ok, text) = run(&["--seed", "nope"], &[]);
+    assert!(!ok && text.contains("--seed nope: the fuzz seed is"), "{text}");
+    // an empty --seed (`--seed "$GITHUB_RUN_NUMBER"` with the variable unset) or a bare 0x is an error, not seed 0
+    for s in ["", "0x"] {
+        let (ok, text) = run(&["--seed", s], &[]);
+        assert!(!ok && text.contains(&format!("--seed {s}: the fuzz seed is")), "{s:?}: {text}");
+    }
+    let (ok, text) = run(&[], &[("PLAIN_SEED", "0x")]);
+    assert!(!ok && text.contains("PLAIN_SEED=0x: the fuzz seed is"), "{text}");
+    let (ok, text) = run(&[], &[("PLAIN_SEED", "-1")]);
+    assert!(!ok && text.contains("PLAIN_SEED=-1: the fuzz seed is"), "{text}");
+    // an empty PLAIN_SEED is unset: foundry.toml's seed applies
+    let (ok, text) = run(&bad, &[("PLAIN_SEED", " ")]);
+    assert!(!ok && field(&text, "seed: ").as_deref() == Some("0x1234"), "{text}");
+}

@@ -90,6 +90,8 @@ plain also doesn't write gas snapshot files or run coverage, so check [what plai
 
 **Does it use my `foundry.toml`?** Yes: the solc version, optimizer, via-IR, remappings, fuzz and invariant settings and the rest of the [Foundry settings](/docs/#foundry-projects) it reads are used as they are.
 
+**Do fuzz tests get new inputs on every run?** Not by default: plain's fuzz seed is fixed, so a fuzz or invariant test that passed keeps its cached result until the code changes. Use `~/.plain/bin/plain test --seed random` in the workflow (or `--seed ${{ github.run_number }}`) to have every run try new inputs, as forge does when no seed is set. A random seed is printed when the run starts, and every fuzz or invariant failure prints the seed it ran with and the command that replays it locally (with `FOUNDRY_PROFILE`, `--fuzz-runs`, `--fork`, `--isolate` and `--gas-limit` when the run had them), while suites without fuzz or invariant tests still come from the cache.
+
 **Can I run both?** Yes. plain writes only to `.plain/` in the project, so forge's `out/` and `cache/` are untouched and a job can run `forge test` next to it while you compare.
 
 **Where is the formatter check?** `plain fmt --check` lists the files that aren't formatted and exits 1, which is a gate for CI. On v4-core it took 45 ms in my run (`forge fmt --check` took 50 ms) and listed 30 of 132 files as not formatted.

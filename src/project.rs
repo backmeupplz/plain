@@ -14,6 +14,8 @@ pub struct Project {
     pub bytecode_hash: Option<String>,
     pub cbor_metadata: Option<bool>,
     pub fuzz_runs: u32,
+    /// forge's `fuzz.seed`, as written (a number, or `random`)
+    pub fuzz_seed: Option<String>,
     pub allow_internal_revert: bool,
     pub invariant: (u32, u32, bool),
     pub networks: BTreeMap<String, String>,
@@ -251,6 +253,7 @@ impl Project {
             .and_then(|f| f.get("runs"))
             .and_then(|v| v.as_integer())
             .unwrap_or(256) as u32;
+        let fuzz_seed = cfg.get("fuzz").and_then(|f| f.get("seed")).map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
 
         let mut remappings = Vec::new();
         let mut add = |line: &str, base: &str| {
@@ -316,6 +319,7 @@ impl Project {
             bytecode_hash: s("bytecode_hash"),
             cbor_metadata: b("cbor_metadata"),
             fuzz_runs,
+            fuzz_seed,
             allow_internal_revert: b("allow_internal_expect_revert").unwrap_or(false),
             invariant: {
                 let i = |k: &str| cfg.get("invariant").and_then(|t| t.get(k));

@@ -139,6 +139,7 @@ plain test -v                  # list every test, with gas and fuzz runs (-vv, -
 plain test --mt test_Deposit   # forge's --match-test and --match-contract (--mc) work as filters
 plain test --fork base         # run against a fork of a live network, at its latest block
 plain test --fuzz-runs 1000 --seed 42
+plain test --seed random       # a new fuzz seed each run, printed so you can replay it
 plain test --rerun             # run every suite again, even unchanged ones
 plain test --force             # recompile everything, then run everything
 plain test --mp "test/fork/*.t.sol" --isolate --gas-limit 100000000000 --threads 1   # forge's options work too
@@ -147,6 +148,8 @@ plain test --mp "test/fork/*.t.sol" --isolate --gas-limit 100000000000 --threads
 `--watch` runs the tests, then watches `src/`, `test/`, `script/` and the config, and runs them again as soon as something changes. A compile error doesn't end it: fix the file and the next run starts on its own. Since unchanged suites reuse their results, a rerun after you edit one test usually takes about a second, even on big projects. It takes the other options too, so `plain test Vault --watch` keeps rerunning only the Vault tests.
 
 A filter matches suite paths like `test/Vault.t.sol:VaultTest` and test names, and only the test files it can match get compiled. A filter that matches nothing is an error rather than a pass, and so is an option plain doesn't know, since a mistyped flag would otherwise run fewer tests than you meant. The exit code is non-zero when anything fails, so plain works in CI and in scripts as it is (see [Run Solidity tests in CI in seconds](/docs/ci/)). `FOUNDRY_PROFILE=ci` picks `[profile.ci]` from `foundry.toml`, as with forge.
+
+Fuzz and invariant tests draw their inputs from a seed, which is fixed (`0x5eed`) unless you set one, so a fuzz test that passed keeps passing until the code it tests changes, and its result stays cached. `--seed N` sets it, and so do `PLAIN_SEED` and `fuzz.seed` in `foundry.toml` (`[fuzz]` or a profile's), with the flag winning over the variable and the variable over the config. Forge leaves the seed unset, so each of its runs is a new draw; to get the same in CI, run `plain test --seed random` (or set `PLAIN_SEED=random`), or pass a number that changes with every run, such as `--seed $GITHUB_RUN_NUMBER` on GitHub Actions. A random seed is printed when the run starts, and every fuzz or invariant failure prints the seed it ran with and the command that replays it, such as `plain test --seed 0x9f3c… --mt testFuzz_Withdraw`. A new seed reruns only the fuzz and invariant tests: suites without them keep their cached results, so rotating the seed costs only the time the fuzzing takes.
 
 Tests run under the EVM rules your code is compiled for. That's the `evm_version` you configure; without one, plain follows forge: osaka, compiled for the newest EVM your solc supports, so the bytecode is the same forge would build. Fuzz inputs come partly from a dictionary of the constants in the contracts under test, which finds the magic values that random numbers miss.
 

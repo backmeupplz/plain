@@ -71,7 +71,8 @@ usage:
              [--match-path glob] [--match-contract name] [--match-test name]
              [--isolate] [--gas-limit N] [--threads N]
                                              forge's: each call a test makes its own transaction, the gas a
-                                             test gets, how many run at once
+                                             test gets, how many run at once; --seed random (or
+                                             $PLAIN_SEED, foundry.toml fuzz.seed): a new fuzz seed each run
   plain deploy <Contract|script.s.sol> [args] [--network name|id|url] [--account name] [--broadcast]
              [--confirm] [--proxy] [--no-verify]
                                              simulate, then send with --broadcast (--confirm: ask first) and
@@ -230,9 +231,43 @@ fn main() {
             let verbose = switch(&mut args, &["-v", "-vv", "-vvv", "-vvvv", "-vvvvv", "--verbose"]);
             let force = switch(&mut args, &["--force"]);
             let rerun = switch(&mut args, &["--rerun"]);
-            let fork = flag(&mut args, "--fork").or_else(|| flag(&mut args, "--fork-url")).map(|f| rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url);
+            // the run options as typed, for the replay command (a --fork name, not its resolved URL with a key in it)
+            let mut typed = String::new();
+            let fork = flag(&mut args, "--fork").map(|f| ("--fork", f)).or_else(|| flag(&mut args, "--fork-url").map(|f| ("--fork-url", f))).map(|(n, f)| {
+                typed += &format!(" {n} {f}");
+                rpc::network(&p, &f).unwrap_or_else(|e| die(&e)).url
+            });
+            let isolate_flag = switch(&mut args, &["--isolate"]);
+            let isolate = isolate_flag || p.isolate;
+            if isolate_flag {
+                typed += " --isolate";
+            }
+            let gas_limit = flag(&mut args, "--gas-limit").or_else(|| flag(&mut args, "--block-gas-limit")).map(|v| {
+                typed += &format!(" --gas-limit {v}");
+                v.parse().unwrap_or_else(|_| die("--gas-limit N"))
+            });
+            let gas_limit = gas_limit.unwrap_or(p.gas_limit);
             let fuzz_runs = flag(&mut args, "--fuzz-runs").map(|v| v.parse().unwrap_or_else(|_| die("--fuzz-runs N"))).unwrap_or(p.fuzz_runs);
-            let seed = flag(&mut args, "--seed").or_else(|| flag(&mut args, "--fuzz-seed")).map(|v| v.parse().unwrap_or_else(|_| die("--seed N"))).unwrap_or(0x5eed);
+            // the fuzz seed: --seed, else $PLAIN_SEED, else foundry.toml's fuzz.seed; `random` draws a new one
+            let fuzz_runs_flag = fuzz_runs != p.fuzz_runs;
+            // an empty PLAIN_SEED or fuzz.seed counts as unset
+            let set = |s: &String| !s.trim().is_empty();
+            let source = flag(&mut args, "--seed")
+                .or_else(|| flag(&mut args, "--fuzz-seed"))
+                .map(|s| (format!("--seed {s}"), s))
+                .or_else(|| project::var("PLAIN_SEED").filter(set).map(|s| (format!("PLAIN_SEED={s}"), s)))
+                .or_else(|| p.fuzz_seed.clone().filter(set).map(|s| (format!("foundry.toml fuzz.seed = {s}"), s)));
+            let (seed, random) = match source {
+                Some((from, s)) => test::seed(&s).unwrap_or_else(|| die(&format!("{from}: the fuzz seed is a number (decimal or 0x hex) or random"))),
+                None => (0x5eed, false),
+            };
+            // how to run a failing fuzz test again: what else decides its inputs (the profile's runs and depth, --fuzz-runs)
+            // and how it runs (--fork, --isolate, --gas-limit)
+            let profile = project::var("FOUNDRY_PROFILE").filter(|n| !n.is_empty() && n != "default");
+            let replay = format!("{}plain test{typed}{}", profile.map(|n| format!("FOUNDRY_PROFILE={n} ")).unwrap_or_default(), if fuzz_runs_flag { format!(" --fuzz-runs {fuzz_runs}") } else { String::new() });
+            if random {
+                eprintln!("fuzz seed {seed:#x} (random; {replay} --seed {seed:#x} replays this run)");
+            }
             // forge's filters (--match-test and --match-contract are regexes there: names without special characters
             // match the same as substrings, which is what plain takes them as)
             let mut filter = test::Filter {
@@ -241,8 +276,6 @@ fn main() {
                 test: flag(&mut args, "--match-test").or_else(|| flag(&mut args, "--mt")),
                 any: None,
             };
-            let isolate = switch(&mut args, &["--isolate"]) || p.isolate;
-            let gas_limit = flag(&mut args, "--gas-limit").or_else(|| flag(&mut args, "--block-gas-limit")).map(|v| v.parse().unwrap_or_else(|_| die("--gas-limit N"))).unwrap_or(p.gas_limit);
             let threads = flag(&mut args, "--threads").or_else(|| flag(&mut args, "--jobs")).or_else(|| flag(&mut args, "-j")).map(|v| v.parse::<usize>().unwrap_or_else(|_| die("--threads N")));
             no_options(&args);
             if args.len() > 1 {
@@ -265,7 +298,7 @@ fn main() {
             }
             let mut ok = true;
             if has_sol || ts_files.is_empty() {
-                let opts = test::Opts { filter, verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none(), access: std::sync::Arc::new(p.access.clone()), spec: evm::spec(&out.evm), solc: out.solc.clone(), isolate, gas_limit };
+                let opts = test::Opts { filter, verbose, fuzz_runs, fork: fork.clone(), seed, allow_internal_revert: p.allow_internal_revert, invariant: p.invariant, quiet_if_empty: !ts_files.is_empty(), cache: !force && !rerun && fork.is_none(), access: std::sync::Arc::new(p.access.clone()), spec: evm::spec(&out.evm), solc: out.solc.clone(), isolate, gas_limit, replay };
                 // what forge's run would have compiled: src, the test files the filter matches and what they import
                 // (scripts only when imported), so the libraries it deploys are forge's, in forge's order
                 let arts: Vec<solc::Artifact> = out.artifacts.into_iter().filter(|a| out.built.contains(&a.file)).collect();
