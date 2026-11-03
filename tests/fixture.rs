@@ -97,6 +97,23 @@ fn forge_options() {
 }
 
 #[test]
+fn invariant_skips_like_forge() {
+    // forge's invariant skip check runs on the state setUp left: an invariant that vm.skip(true)s there is skipped
+    // (even with nothing to fuzz) and the others still fuzz; a skip first reached mid-campaign breaks the invariant
+    let dir = "tests/fixture/tmp/invariant-skip";
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::create_dir_all(format!("{dir}/test")).unwrap();
+    std::fs::write(format!("{dir}/foundry.toml"), "[profile.default]\n").unwrap();
+    std::fs::write(format!("{dir}/test/Skip.t.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\ncontract Bump {\n    uint256 public n;\n    function bump() external { n += 1; }\n}\ncontract SkipTest is Test {\n    Bump b;\n    function setUp() public { b = new Bump(); }\n    function invariant_a_skips() public { vm.skip(true); }\n    function invariant_b_holds() public view { assertLe(b.n(), 1000); }\n}\ncontract NothingToFuzzSkipTest is Test {\n    function invariant_skips() public { vm.skip(true); }\n}\ncontract MidCampaignSkipTest is Test {\n    Bump b;\n    function setUp() public { b = new Bump(); }\n    function invariant_skips_later() public { vm.skip(b.n() != 0); }\n}\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_plain")).args(["test", "-v"]).current_dir(dir).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success() && text.contains("1 passed, 1 failed, 2 skipped"), "{text}");
+    assert!(text.contains("skip invariant_a_skips(): skipped") && text.contains("skip invariant_skips(): skipped"), "{text}");
+    assert!(text.contains("pass invariant_b_holds()"), "{text}");
+    assert!(text.contains("FAIL invariant_skips_later(): invariant broken: FOUNDRY::SKIP"), "{text}");
+}
+
+#[test]
 fn build_outputs() {
     std::fs::create_dir_all("tests/fixture/tmp").unwrap();
     // forge's --sizes table and EIP-170 check, its artifact layout with storage layouts, and inspect

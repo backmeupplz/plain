@@ -970,11 +970,23 @@ fn view(addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, sig: &str, ty: 
     }
 }
 
+/// forge's skip check: each invariant is first called on the state setUp left, and one that `vm.skip(true)`s there
+/// is reported skipped while the others are fuzzed without it. A skip first reached mid-campaign is no skip: forge
+/// reports it as a broken invariant (`FOUNDRY::SKIP`), and so does plain.
+#[allow(clippy::too_many_arguments)]
+fn run_invariants(invs: &[&Function], key: (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
+    let (skipped, live): (Vec<&Function>, Vec<&Function>) = invs.iter().copied().partition(|f| exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats).0.output.as_ref() == SKIP_MAGIC);
+    let mut out = if live.is_empty() { vec![] } else { fuzz_invariants(&live, key, addr, db, env, cheats, opts, abi, dict) };
+    out.extend(skipped.iter().map(|f| TestResult { name: sig(f), status: Status::Skip("skipped".into()), gas: 0, runs: None, logs: vec![], args: None, trace: vec![] }));
+    out.sort_by_key(|r| invs.iter().position(|f| sig(f) == r.name));
+    out
+}
+
 /// forge-style invariant testing: random call sequences against targets, invariants checked before the first call
 /// and after every call. What plain can't target as forge would (artifact- or interface-based targeting, targets
 /// without a compiled ABI) fails the invariant rather than silently fuzzing less.
 #[allow(clippy::too_many_arguments)]
-fn run_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
+fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32, bool), addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheats, opts: &Opts, abi: &JsonAbi, dict: &Dict) -> Vec<TestResult> {
     let result = |status: Status, trace: Vec<String>| -> Vec<TestResult> {
         invs.iter().map(|f| TestResult { name: sig(f), status: status.clone(), gas: 0, runs: Some(runs), logs: vec![], args: None, trace: trace.clone() }).collect()
     };
@@ -1036,8 +1048,8 @@ fn run_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32, 
     }
     // the state setUp left has to satisfy the invariants too
     for f in invs {
-        let (r, c, why) = exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats);
-        if let Some(why) = why.filter(|_| r.output.as_ref() != SKIP_MAGIC) {
+        let (_, c, why) = exec_once(Bytes::copy_from_slice(&f.selector()[..]), addr, db, env, cheats);
+        if let Some(why) = why {
             let mut out = fail(String::new());
             for (res, g) in out.iter_mut().zip(invs) {
                 res.status = if g.name == f.name { Status::Fail(format!("invariant broken before any call: {why}")) } else { Status::Skip("not checked (another invariant broke)".into()) };
