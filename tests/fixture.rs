@@ -73,7 +73,7 @@ fn fixture() {
         let should_fail = line.contains("testBad") || line.contains("testFail") || line.contains("invariantBad");
         assert_eq!(failed, should_fail, "{line}\n{text}");
     }
-    assert!(text.contains("27 passed, 10 failed"), "{text}");
+    assert!(text.contains("28 passed, 10 failed, 1 skipped"), "{text}");
     assert!(text.contains("Breakable.poke(7)"), "{text}");
     assert!(text.contains("panic: arithmetic underflow"), "{text}");
     assert!(text.contains("log: value is 99"), "{text}");
@@ -88,6 +88,10 @@ fn forge_options() {
     assert!(!ok && text.contains("0 passed, 1 failed") && text.contains("warm and dirty"), "{text}");
     let (ok, text) = plain(&["test", "--match-path", "Forge.t.sol", "--match-test", "isolated", "--rerun"]);
     assert!(ok && text.contains("1 passed, 0 failed"), "{text}");
+    // vm.skip(true) on some fuzz inputs skips the test (it used to fail with the skip marker as its reason)
+    let (ok, text) = plain(&["test", "--match-path", "Forge.t.sol", "--match-test", "testFuzz_skip", "-v", "--rerun"]);
+    assert!(ok && text.contains("1 passed, 0 failed, 1 skipped") && text.contains("skip testFuzz_skipsSomeInputs(uint256): skipped"), "{text}");
+    assert!(text.contains("pass testFuzz_skipFalseRuns(uint256)") && !text.contains("FOUNDRY::"), "{text}");
     let (ok, text) = plain(&["test", "--match-test", "nothing_by_this_name"]);
     assert!(!ok && text.contains("no test matches"), "{text}");
 }

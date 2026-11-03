@@ -33,6 +33,17 @@ contract ForgeTest is Test {
         assertEq(address(this).balance, type(uint96).max);
     }
 
+    // vm.skip(true) on some of the inputs skips the whole fuzz test, as in forge
+    function testFuzz_skipsSomeInputs(uint256 x) public {
+        vm.skip(x % 2 == 0);
+        assertEq(x % 2, 1);
+    }
+
+    function testFuzz_skipFalseRuns(uint256 x) public {
+        vm.skip(false);
+        assertEq(x - x, 0);
+    }
+
     /// forge-config: default.isolate = true
     function test_isolatedCallsAreTransactions() public {
         Probe p = new Probe();

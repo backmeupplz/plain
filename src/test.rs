@@ -700,13 +700,15 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
         return res;
     };
     let base_seed = opts.seed ^ u64::from_be_bytes(alloy_primitives::keccak256(res.name.as_bytes())[..8].try_into().unwrap());
-    let stop = std::sync::atomic::AtomicBool::new(false);
+    // the first run that failed or skipped: runs after it are left out, runs before it all run, so which run fails
+    // first (and its inputs) is the same for a seed however the runs are scheduled
+    let cut = std::sync::atomic::AtomicU32::new(u32::MAX);
     let rejects = std::sync::atomic::AtomicU32::new(0);
     // each run gets its own deterministic stream; runs execute in parallel
     let outcomes: Vec<(u32, u64, Option<(String, String, Vec<String>, Vec<u8>)>, bool)> = (0..fuzz_runs)
         .into_par_iter()
         .filter_map(|i| {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if i > cut.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             let mut rng = Rng((base_seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) | 1);
@@ -718,15 +720,16 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 let (r, c, why) = exec_once(data.clone().into(), addr, db, env, cheats);
                 if r.output.as_ref() == ASSUME_MAGIC {
                     if rejects.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 65536 {
-                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        cut.store(0, std::sync::atomic::Ordering::Relaxed);
                         return Some((i, 0, Some(("too many vm.assume rejections".into(), String::new(), vec![], vec![])), false));
                     }
                     continue;
                 }
                 let skip = r.output.as_ref() == SKIP_MAGIC;
-                let fail = why.map(|w| (w, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), c.console, data.clone()));
+                // vm.skip(true) reverts with the skip marker: that's a skip, not a failure
+                let fail = why.filter(|_| !skip).map(|w| (w, vals.iter().map(decode::display).collect::<Vec<_>>().join(", "), c.console, data.clone()));
                 if fail.is_some() || skip {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    cut.fetch_min(i, std::sync::atomic::Ordering::Relaxed);
                 }
                 return Some((i, r.gas, fail, skip));
             }
@@ -734,9 +737,9 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
         .collect();
     let runs = outcomes.len() as u32;
     let gas_sum: u64 = outcomes.iter().map(|o| o.1).sum();
-    let skipped = outcomes.iter().any(|o| o.3);
-    // a run that failed fails the test, whatever other runs did
-    if let Some((_, _, Some((why, args, logs, data)), _)) = outcomes.into_iter().filter(|o| o.2.is_some()).min_by_key(|o| o.0) {
+    // the first run that failed or skipped decides, as in forge, which stops there: a skip skips the whole test
+    let first = outcomes.into_iter().filter(|o| o.2.is_some() || o.3).min_by_key(|o| o.0);
+    if let Some((_, _, Some((why, args, logs, data)), _)) = first {
         res.status = Status::Fail(why);
         res.args = Some(args).filter(|a| !a.is_empty());
         res.logs = logs;
@@ -749,7 +752,7 @@ fn run_test(f: &Function, addr: Address, db: &Arc<Db>, env: &Env, cheats: &Cheat
                 }
             }
         }
-    } else if skipped {
+    } else if first.is_some() {
         res.status = Status::Skip("skipped".into());
     }
     res.runs = Some(runs);
