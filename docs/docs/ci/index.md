@@ -5,7 +5,7 @@ og_image_alt: "Run Solidity tests in CI in seconds: Uniswap v4-core on 2 CPUs, 1
 title: "Run Solidity tests in CI in seconds with plain"
 description: "Run a Foundry project's tests in GitHub Actions with plain: a workflow, what to cache, and measured times on Uniswap v4-core (1m43s cold against 8m57s for forge, 4 s with a restored cache)."
 jsonld: |
-  {"@context":"https://schema.org","@type":"TechArticle","headline":"Run Solidity tests in CI in seconds with plain","description":"Run a Foundry project's tests in GitHub Actions with plain: a workflow, what to cache, and measured times on Uniswap v4-core.","datePublished":"2026-10-29","dateModified":"2026-10-29","author":{"@type":"Person","name":"Nikita Kolmogorov","url":"https://borodutch.com"},"publisher":{"@type":"Organization","name":"plain","url":"https://getplain.org"},"mainEntityOfPage":"https://getplain.org/docs/ci/","image":"https://getplain.org/og-ci.png"}
+  {"@context":"https://schema.org","@type":"TechArticle","headline":"Run Solidity tests in CI in seconds with plain","description":"Run a Foundry project's tests in GitHub Actions with plain: a workflow, what to cache, and measured times on Uniswap v4-core.","datePublished":"2026-10-29","dateModified":"2026-11-04","author":{"@type":"Person","name":"Nikita Kolmogorov","url":"https://borodutch.com"},"publisher":{"@type":"Organization","name":"plain","url":"https://getplain.org"},"mainEntityOfPage":"https://getplain.org/docs/ci/","image":"https://getplain.org/og-ci.png"}
 ---
 
 # Run Solidity tests in CI in seconds
@@ -72,11 +72,13 @@ Each command was run once on the same machine, pinned to 2 CPUs, with `plain` an
 - **Add one test** appended a one-line test to `test/types/Slot0.t.sol`; both times are for running that suite (`--mc TestSlot0`). Running all 39 suites after the same edit took plain 3.8 s.
 - **Fresh clone** is a new `git clone --recurse-submodules` in a new directory with `~/.plain/cache`, `solc` and `salt` copied from the earlier run into a new home directory. I did not time forge on this step.
 
-## One test plain failed that forge passed
+## One v4-core test fails under both tools
 
-plain's run ended with `597 passed, 1 failed`, and forge's with `598 tests passed`. The failing test is `test_fuzz_getTickAtSqrtPrice_getSqrtPriceAtTick_relation`, and plain fails it every time, with the input `-887273`. That input bounds to tick 887271, whose next tick's price is exactly `MAX_SQRT_PRICE`, and `TickMath.getTickAtSqrtPrice` reverts with `InvalidSqrtPrice` on that value.
+Both tools end with the same single failure on this checkout. plain's run ended with `597 passed, 1 failed`, and forge 1.8.6's with `597 tests passed, 1 failed, 0 skipped (598 total tests)`. The failing test is `test_fuzz_getTickAtSqrtPrice_getSqrtPriceAtTick_relation`, and both fail it with the input `-887273`. That input bounds to tick 887271, whose next tick's price is exactly `MAX_SQRT_PRICE`, and `TickMath.getTickAtSqrtPrice` reverts with `InvalidSqrtPrice` on that value.
 
-I wrote a three-line test that calls it with that tick, and forge fails it the same way. So the project's fuzz test has an edge case that forge's fuzzer, with the project's seed of `0x4444` and 1,000 runs, didn't reach and plain's did. The times above are for a suite that goes red in CI under plain, because forge would fail that input too.
+I rechecked this on 4 November 2026 with forge 1.8.6, forge 1.5.1 and plain 0.5.0 on the same commit. forge 1.8.6 found the input on the second fuzz run of that test with the project's seed `0x4444`. forge 1.5.1 found it with that seed too (after 977 runs), and with 30 different seeds at 1,000 runs, 30 at 10,000 runs and 10 at 100,000 runs, so it was never missed. Bound as it is, this fuzz test fails in CI under either tool. Both tools run the same `TickMath` code, so the times above are for a suite that goes red with forge as well.
+
+An earlier version of this section said forge's run passed all 598 tests. That was a misreading of its summary line, where 598 is the total, and I corrected it on 4 November 2026.
 
 ## What plain doesn't run
 
