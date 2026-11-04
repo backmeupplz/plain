@@ -518,6 +518,8 @@ RPC URLs from providers like Alchemy or Infura contain your API key, so keep the
 
 Run plain in the project root as it is. It reads `foundry.toml`'s `[profile.default]` (or `FOUNDRY_PROFILE`'s: solc version, optimizer, via-IR, EVM version, remappings, fuzz and invariant settings, `ffi`, `fs_permissions`, `rpc_endpoints` and `[etherscan]` keys), `remappings.txt`, `lib/` and `.env`, so nothing needs to change. Add `.plain/` to your `.gitignore`.
 
+The [Foundry projects page](/docs/foundry-projects/) has what ran and what didn't on OpenZeppelin Contracts and solmate, with the fix for each failure.
+
 plain and forge can share a project. plain writes only to `.plain/`, plus `deployments/` when you deploy and `verify/` when you export, and forge keeps using `out/` and `cache/`, so you can keep both and switch whenever you like. Keystores from `cast wallet import` work with `--account`, and forge scripts deploy with `plain deploy` unchanged.
 
 ### With or without Foundry installed

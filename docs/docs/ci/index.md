@@ -82,7 +82,7 @@ An earlier version of this section said forge's run passed all 598 tests. That w
 
 ## What plain doesn't run
 
-plain follows forge 1.x, so tests named `testFail…` are rejected with a message that says to use `vm.expectRevert`. On [solmate](https://github.com/transmissions11/solmate) (commit `89365b8`) 278 of 568 tests failed for this reason in my run, and nothing else failed. A project that still uses `testFail` has to rename those tests before plain can run them.
+plain follows forge 1.x, so tests named `testFail…` are rejected with a message that says to use `vm.expectRevert`. On [solmate](https://github.com/transmissions11/solmate) (commit `89365b8`) 278 of 568 tests failed for this reason in my run, and nothing else failed; forge 1.8.6 fails the same 278 (see [Use plain in an existing Foundry project](/docs/foundry-projects/)). A project that still uses `testFail` has to rename those tests before either tool can run them.
 
 plain also doesn't write gas snapshot files or run coverage, so check [what plain doesn't do yet](/docs/#what-plain-doesnt-do-yet) before replacing a CI step that depends on either.
 
