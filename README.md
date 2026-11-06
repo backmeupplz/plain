@@ -1,6 +1,6 @@
 # plain
 
-Compile, test, deploy, verify and upgrade EVM smart contracts with one ~9 MB binary. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
+plain is a faster alternative to Foundry and Hardhat for Solidity development: one ~9 MB binary that compiles, tests, deploys, verifies and upgrades EVM smart contracts. There's no config, no `npm install` and no `forge install`, your Foundry project works as it is, and the loop you run all day takes seconds instead of minutes.
 
 ```sh
 curl -fsSL https://getplain.org/install | sh   # macOS and Linux
@@ -29,6 +29,13 @@ plain is also on Homebrew (`brew install backmeupplz/tap/plain`), npm, mise, apt
 - **Networks:** any chain on [chainlist.org](https://chainlist.org), by name or chain id (`base`, `base-sepolia`, `linea`, `8453`, ...), or a URL.
 - **Zero setup:** `forge-std` is built into the binary, so `import {Test} from "forge-std/Test.sol";` works without installing anything. `lib/` dependencies, `remappings.txt` and `node_modules` (`@openzeppelin/...`) resolve automatically.
 - **Foundry projects work as they are:** `foundry.toml` `[profile.default]` is read, including solc version, optimizer, via_ir, remappings, compiler profiles and restrictions, fuzz/invariant runs, isolate, gas_limit, libraries and rpc_endpoints.
+
+## How it compares
+
+plain does the same jobs as Foundry and Hardhat, and it is built to make the edit-and-test loop and CI fast. It runs Foundry projects as they are, with forge-std tests, cheatcodes, `foundry.toml`, `lib/` and remappings, so trying it doesn't mean migrating. solc is the same, and what `plain deploy` sends is byte for byte what solc produces; the time saved comes from compiling less and not rerunning what hasn't changed (see [where the speed comes from](#benchmarks)).
+
+- **Foundry:** on veydrift's suite of about 300 via-IR tests, editing a test and rerunning the suite took 0.99 s with plain against 56 s with forge 1.7.1, and a cold build took 15 s against 116 s. Foundry is still the better pick if you need coverage, gas snapshot files, Windows, `cast` or `chisel`, or a cheatcode plain doesn't have yet (they fail with `unsupported cheatcode`), and it has a far larger community and a longer track record. The two can share a project: plain writes only to `.plain/`, so `forge` keeps working next to it.
+- **Hardhat:** in the same benchmarks Hardhat 3.20.0 took 61 s for that test edit and 115 s for the cold build. plain compiles Hardhat-style projects (`contracts/`, imports from `node_modules`) and runs Solidity tests and `test/**/*.test.ts` files against its own chain, but tests written for Hardhat's own runner and its plugins stay with Hardhat. If your project leans on Hardhat's plugins or its own test runner, Hardhat is the better fit.
 
 ## Commands
 
@@ -245,3 +252,14 @@ Where the speed comes from (solc itself is unchanged: what gets deployed is byte
 Gas snapshot files, coverage, verifying contracts plain didn't deploy, the `vm.deployCode` cheatcode (use `vm.getCode` + `create`), `targetArtifacts`/`targetInterfaces` (invariants using them fail rather than pass), OpenZeppelin 4 transparent proxies, and beacon proxies. Library linking only works for libraries under `src/`/`test/`/`script/`.
 
 Because tests deploy contracts from artifacts (see Benchmarks), the gas a test reports for a `new X(...)` is a little higher than under forge, and the test contract's own bytecode differs (more so for tests you just edited, which compile without the optimizer until the file is re-split). Everything else is exactly solc's output: what `plain deploy` sends, and the artifacts in `.plain/out` (test and script contracts aren't written there).
+
+## FAQ
+
+**What's a faster alternative to Foundry or Hardhat for Solidity development?**
+plain. It reads your Foundry project as it is, and in [Benchmarks](#benchmarks) editing a test and rerunning veydrift's suite took 0.99 s against 56 s with forge and 61 s with Hardhat. Install it with `curl -fsSL https://getplain.org/install | sh` and run `plain test` in the project root. The [Foundry projects page](https://getplain.org/docs/foundry-projects/) shows what passed and what didn't on OpenZeppelin Contracts and solmate.
+
+**How do I speed up Foundry tests in CI?**
+Run `plain test` in place of `forge test` and cache `~/.plain/cache`, `~/.plain/solc` and `~/.plain/salt` between runs. On Uniswap v4-core, on a machine pinned to 2 CPUs, a cold run took 1m43s with plain against 8m57s with forge 1.8.6, and a fresh clone with the restored cache took 4.9 seconds. [Run Solidity tests in CI](https://getplain.org/docs/ci/) has the GitHub Actions workflow and the measurements, including that these were single runs on one machine rather than on a hosted runner.
+
+**Do I have to stop using Foundry?**
+No. plain doesn't need Foundry installed, but it reuses Foundry's solc downloads and keystores when they are there, and `forge` keeps its own `out/` and `cache/`, so you can run both on the same project and compare.
