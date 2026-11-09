@@ -20,6 +20,7 @@ Tested on 29 October 2026 with plain 0.5.0 and forge 1.8.6 on Linux x86_64, on [
 
 ## The workflow
 
+{% raw %}
 ```yaml
 name: tests
 on: [push, pull_request]
@@ -41,6 +42,7 @@ jobs:
       - run: curl -fsSL https://getplain.org/install | sh
       - run: ~/.plain/bin/plain test
 ```
+{% endraw %}
 
 The checkout needs `submodules: recursive` because plain, like forge, reads `lib/` as it is; only forge-std is built in. The installer takes about 3 seconds: it downloads the release for your platform, checks it against the release's `SHA256SUMS` and unpacks one 11 MB binary into `~/.plain/bin`. `plain test` exits with a non-zero code when any test fails, so the job fails as it would with forge. A `[profile.ci]` in `foundry.toml` is picked up with `FOUNDRY_PROFILE=ci`.
 
@@ -92,7 +94,7 @@ plain also doesn't write gas snapshot files or run coverage, so check [what plai
 
 **Does it use my `foundry.toml`?** Yes: the solc version, optimizer, via-IR, remappings, fuzz and invariant settings and the rest of the [Foundry settings](/docs/#foundry-projects) it reads are used as they are.
 
-**Do fuzz tests get new inputs on every run?** Not by default: plain's fuzz seed is fixed, so a fuzz or invariant test that passed keeps its cached result until the code changes. Use `~/.plain/bin/plain test --seed random` in the workflow (or `--seed ${{ github.run_number }}`) to have every run try new inputs, as forge does when no seed is set. A random seed is printed when the run starts, and every fuzz or invariant failure prints the seed it ran with and the command that replays it locally (with `FOUNDRY_PROFILE`, `--fuzz-runs`, `--fork`, `--isolate` and `--gas-limit` when the run had them), while suites without fuzz or invariant tests still come from the cache.
+**Do fuzz tests get new inputs on every run?** Not by default: plain's fuzz seed is fixed, so a fuzz or invariant test that passed keeps its cached result until the code changes. Use `~/.plain/bin/plain test --seed random` in the workflow (or `--seed {% raw %}${{ github.run_number }}{% endraw %}`) to have every run try new inputs, as forge does when no seed is set. A random seed is printed when the run starts, and every fuzz or invariant failure prints the seed it ran with and the command that replays it locally (with `FOUNDRY_PROFILE`, `--fuzz-runs`, `--fork`, `--isolate` and `--gas-limit` when the run had them), while suites without fuzz or invariant tests still come from the cache.
 
 **Can I run both?** Yes. plain writes only to `.plain/` in the project, so forge's `out/` and `cache/` are untouched and a job can run `forge test` next to it while you compare.
 
