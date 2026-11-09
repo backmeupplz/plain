@@ -585,6 +585,77 @@ fn cache_across_paths_relative() {
 }
 
 #[test]
+fn cache_symlink_retarget() {
+    // at the same path, a symlink on a file cheatcode's way that moves (or appears where nothing was) changes whether
+    // the path is open, though the bytes it reaches stay the same: the suites that went through it run again
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/symlink-retarget");
+    std::fs::remove_dir_all(&base).ok();
+    let a = base.join("repo");
+    for d in ["test", "open", "closed"] {
+        std::fs::create_dir_all(a.join(d)).unwrap();
+    }
+    std::fs::create_dir_all(base.join("outside")).unwrap();
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\nfs_permissions = [{ access = \"read\", path = \"./open\" }]\n").unwrap();
+    for f in [a.join("open/x.txt"), a.join("closed/x.txt"), base.join("outside/x.txt")] {
+        std::fs::write(f, "hi").unwrap();
+    }
+    let link = |at: &str, to: &std::path::Path| {
+        std::fs::remove_file(a.join(at)).ok();
+        std::os::unix::fs::symlink(to, a.join(at)).unwrap();
+    };
+    link("in", &a.join("open"));
+    link("out", &a.join("closed"));
+    // `..` goes up by name, as in Cheats::fs: open/x.txt, not closed/../x.txt
+    link("open/up", &a.join("closed"));
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    let suites = [
+        ("Read", "function test_read() public view { assertEq(vm.readFile(\"open/x.txt\"), \"hi\"); }"),
+        // open now; the link moves to identical bytes that aren't open
+        ("In", "function test_in() public view { assertEq(vm.readFile(\"in/x.txt\"), \"hi\"); }"),
+        // not open now; the link moves to the open copy
+        ("Out", "function test_out() public view { assertEq(vm.readFile(\"out/x.txt\"), \"hi\"); }"),
+        // nothing there now; a link to a directory outside the project appears
+        ("Later", "function test_later() public view { assertFalse(vm.exists(\"open/later/y.txt\")); }"),
+        ("Dots", "function test_dots() public view { assertEq(vm.readFile(\"open/up/../x.txt\"), \"hi\"); }"),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(real.join("solc"), home.join("solc")).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(&a).env("PLAIN_HOME", &home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let text = run();
+    assert!(text.contains("4 passed, 1 failed"), "{text}");
+    let text = run();
+    assert!(suites.iter().all(|(n, _)| cached(&text, n)), "{text}");
+
+    link("in", &a.join("closed"));
+    link("out", &a.join("open"));
+    link("open/later", &base.join("outside"));
+    let text = run();
+    assert!(text.contains("3 passed, 2 failed"), "{text}");
+    assert!(cached(&text, "Read") && cached(&text, "Dots"), "{text}");
+    assert!(["In", "Out", "Later"].iter().all(|n| !cached(&text, n)), "{text}");
+    assert!(["test_in(): \"in/x.txt\"", "test_later(): \"open/later/y.txt\""].iter().all(|t| text.contains(&format!("FAIL {t} isn't open for reading"))), "{text}");
+
+    // the file both read changes
+    std::fs::write(a.join("open/x.txt"), "ho").unwrap();
+    let text = run();
+    assert!(!cached(&text, "Read") && !cached(&text, "Dots"), "{text}");
+    assert!(text.contains("FAIL test_dots()"), "{text}");
+}
+
+#[test]
 fn fuzz_seeds() {
     // a seed from foundry.toml, $PLAIN_SEED or --seed (in that order of precedence), or a random one per run
     let dir = "tests/fixture/tmp/seeds";

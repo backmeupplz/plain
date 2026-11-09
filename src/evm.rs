@@ -569,10 +569,18 @@ pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path, access: &c
     let (kind, name) = key.split_once(':')?;
     Some(match kind {
         "art" => arts.iter().find(|a| a.shard == 0 && format!("{}:{}", a.file, a.name) == name).map_or("missing".into(), art_hash),
-        "file" => match root.join(name) {
+        // what the cheatcode reads: `..` goes up by name before a symlink is followed (Cheats::fs), unlike the OS
+        "file" => match crate::project::resolve(&root.join(name)) {
             p if p.is_dir() => "dir".into(),
             p => std::fs::read(p).map_or("missing".into(), |b| keccak256(b).to_string()),
         },
+        // where a file cheatcode's path leads, symlinks and `..` resolved (Cheats::fs): relative to the root when inside
+        // the project, so a copy at another path records the same, else absolute (and then the suite reads root: and
+        // access: as well)
+        "path" => {
+            let (p, r) = (crate::project::resolve(&root.join(name)), crate::project::resolve(root));
+            p.strip_prefix(&r).map_or_else(|_| p.display().to_string(), |x| format!("./{}", x.display()))
+        }
         "env" => lookup(name).unwrap_or_else(|| "\0unset".into()),
         "root" => root.to_string_lossy().into(),
         // every path tests may reach, absolute: the cache key has only the part inside the project
@@ -828,6 +836,9 @@ impl Cheats {
     /// symlinks resolved. Nothing is open unless configured, like forge.
     fn fs(&self, path: &str, write: bool) -> Result<std::path::PathBuf, String> {
         let p = crate::project::resolve(&self.root.join(path));
+        // whether the path is open depends on where it leads, which a symlink on the way (one that's there now or one
+        // that appears later) changes without changing the bytes, so the suite records it even when this call fails
+        self.read(format!("path:{path}"));
         // whether a path is open and what it holds depend on where the project is (the test cache key has
         // fs_permissions relative to the root) unless it goes down from the root by name alone: an absolute path, a
         // `..` (`../repo/x` climbs out and back in only from a checkout named repo) or a symlink on the way (its
