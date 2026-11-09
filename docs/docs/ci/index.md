@@ -3,7 +3,7 @@ layout: docs
 og_image: /og-ci.png
 og_image_alt: "Run Solidity tests in CI in seconds: Uniswap v4-core on 2 CPUs, 1m43s cold with plain, 8m57s with forge."
 title: "Run Solidity tests in CI in seconds with plain"
-description: "Run a Foundry project's tests in GitHub Actions with plain: a workflow, what to cache, and measured times on Uniswap v4-core (1m43s cold against 8m57s for forge, 4 s with a restored cache)."
+description: "Run a Foundry project's tests in GitHub Actions with plain: a workflow, what to cache, and measured times on Uniswap v4-core (1m43s cold against 8m57s for forge, 4.9 s with a restored cache)."
 jsonld: |
   {"@context":"https://schema.org","@type":"TechArticle","headline":"Run Solidity tests in CI in seconds with plain","description":"Run a Foundry project's tests in GitHub Actions with plain: a workflow, what to cache, and measured times on Uniswap v4-core.","datePublished":"2026-10-29","dateModified":"2026-11-04","author":{"@type":"Person","name":"Nikita Kolmogorov","url":"https://borodutch.com"},"publisher":{"@type":"Organization","name":"plain","url":"https://getplain.org"},"mainEntityOfPage":"https://getplain.org/docs/ci/","image":"https://getplain.org/og-ci.png"}
 ---
