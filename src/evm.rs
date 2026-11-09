@@ -576,10 +576,11 @@ pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path, access: &c
         },
         // where a file cheatcode's path leads, symlinks and `..` resolved (Cheats::fs): relative to the root when inside
         // the project, so a copy at another path records the same, else absolute (and then the suite reads root: and
-        // access: as well)
+        // access: as well); a loop of symlinks, which Cheats::fs refuses, records the same path, so it's marked
         "path" => {
             let (p, r) = (crate::project::resolve(&root.join(name)), crate::project::resolve(root));
-            p.strip_prefix(&r).map_or_else(|_| p.display().to_string(), |x| format!("./{}", x.display()))
+            let at = p.strip_prefix(&r).map_or_else(|_| p.display().to_string(), |x| format!("./{}", x.display()));
+            if crate::project::through_dangling_link(&p) { format!("{at}\0loop") } else { at }
         }
         "env" => lookup(name).unwrap_or_else(|| "\0unset".into()),
         "root" => root.to_string_lossy().into(),
@@ -855,6 +856,9 @@ impl Cheats {
         if lexical.as_ref() != Some(&p) {
             self.read("root:".into());
             self.read("access:".into());
+        }
+        if crate::project::through_dangling_link(&p) {
+            return Err(format!("{path:?} goes through a loop of symlinks"));
         }
         let open = self.access.fs.iter().any(|(dir, r, w)| (if write { *w } else { *r }) && p.starts_with(dir));
         if write && self.access.protected.iter().any(|x| p.starts_with(x)) {

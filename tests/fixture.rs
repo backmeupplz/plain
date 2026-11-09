@@ -656,6 +656,88 @@ fn cache_symlink_retarget() {
 }
 
 #[test]
+fn dangling_symlinks() {
+    // a symlink to nothing yet leads where writing through it would create the file: outside the open paths it's
+    // refused and nothing appears there; inside them it works; a loop of them can't be opened at all
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/dangling-symlinks");
+    std::fs::remove_dir_all(&base).ok();
+    let (a, outside) = (base.join("repo"), base.join("outside"));
+    for d in [a.join("test"), a.join("data"), a.join("rel"), outside.join("sub")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\nfs_permissions = [{ access = \"read-write\", path = \"./\" }]\n").unwrap();
+    let link = |at: &str, to: &std::path::Path| std::os::unix::fs::symlink(to, a.join(at)).unwrap();
+    link("out", &outside.join("f.txt"));
+    link("outdir", &outside.join("missing"));
+    link("chain", &a.join("out"));
+    // relative to the link's folder, which is a link itself: rel -> ../outside/sub, so ../g.txt is outside/g.txt
+    std::fs::remove_dir(a.join("rel")).unwrap();
+    link("rel", std::path::Path::new("../outside/sub"));
+    link("rel/up", std::path::Path::new("../g.txt"));
+    // `..` after a link goes up from its target, as the OS does: outside/dots, not this same link again by name
+    link("dots", std::path::Path::new("rel/../dots"));
+    link("in", std::path::Path::new("data/new.txt"));
+    link("loop", &a.join("loop2"));
+    link("loop2", &a.join("loop"));
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    let suites = [
+        ("Out", "function test_out() public { vm.writeFile(\"out\", \"x\"); }"),
+        ("OutDir", "function test_outdir() public { vm.writeFile(\"outdir/f.txt\", \"x\"); }"),
+        ("Chain", "function test_chain() public { vm.writeFile(\"chain\", \"x\"); }"),
+        ("Rel", "function test_rel() public { vm.writeFile(\"rel/up\", \"x\"); }"),
+        ("Dots", "function test_dots() public { vm.writeFile(\"dots\", \"x\"); }"),
+        ("Json", "function test_json() public { vm.writeJson(\"{}\", \"out\"); }"),
+        ("Exists", "function test_exists() public view { vm.exists(\"out\"); }"),
+        ("In", "function test_in() public { vm.writeFile(\"in\", \"hi\"); assertEq(vm.readFile(\"data/new.txt\"), \"hi\"); }"),
+        ("Loop", "function test_loop() public { vm.writeFile(\"loop\", \"x\"); }"),
+        // nothing there now; a loop appears
+        ("Gone", "function test_gone() public view { assertFalse(vm.exists(\"gone\")); }"),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(real.join("solc"), home.join("solc")).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(&a).env("PLAIN_HOME", &home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let text = run();
+    assert!(text.contains("2 passed, 8 failed"), "{text}");
+    for (t, p) in [("test_out()", "out"), ("test_outdir()", "outdir/f.txt"), ("test_chain()", "chain"), ("test_rel()", "rel/up"), ("test_dots()", "dots"), ("test_json()", "out")] {
+        assert!(text.contains(&format!("FAIL {t}: {p:?} isn't open for writing")), "{t}: {text}");
+    }
+    assert!(text.contains("FAIL test_exists(): \"out\" isn't open for reading"), "{text}");
+    assert!(text.contains("FAIL test_loop(): \"loop\" goes through a loop of symlinks"), "{text}");
+    assert_eq!(std::fs::read_to_string(a.join("data/new.txt")).unwrap(), "hi");
+    let mut made: Vec<_> = std::fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name()).collect();
+    made.sort();
+    assert_eq!(made, ["sub"], "{text}");
+    // only the rel/up link itself
+    let sub: Vec<_> = std::fs::read_dir(outside.join("sub")).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(sub, ["up"], "{text}");
+
+    // the cache sees a loop go and one come, though the path they record is the same
+    let text = run();
+    assert!(cached(&text, "Loop") && cached(&text, "Gone"), "{text}");
+    std::fs::remove_file(a.join("loop")).unwrap();
+    std::fs::remove_file(a.join("loop2")).unwrap();
+    link("gone", &a.join("gone2"));
+    link("gone2", &a.join("gone"));
+    let text = run();
+    assert!(!cached(&text, "Loop") && !cached(&text, "Gone"), "{text}");
+    assert!(text.contains("FAIL test_gone(): \"gone\" goes through a loop of symlinks"), "{text}");
+    assert!(!text.contains("FAIL test_loop()"), "{text}");
+}
+
+#[test]
 fn fuzz_seeds() {
     // a seed from foundry.toml, $PLAIN_SEED or --seed (in that order of precedence), or a random one per run
     let dir = "tests/fixture/tmp/seeds";

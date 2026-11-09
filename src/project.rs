@@ -81,29 +81,67 @@ pub struct Access {
     pub protected: Vec<PathBuf>,
 }
 
-/// `p` with `.`, `..` and symlinks resolved; for a path that doesn't exist yet, its nearest existing ancestor's.
+/// `p` with `.`, `..` and symlinks resolved; for a path that doesn't exist yet, its nearest existing ancestor's. A
+/// dangling symlink on the way is followed as well: writing through it creates its target, so that's where it leads.
+/// Past more links than any OS follows in one path (Linux 40, macOS 32), the path as given, which still goes through
+/// one: see `through_dangling_link`.
 pub fn resolve(p: &Path) -> PathBuf {
-    let mut norm = PathBuf::new();
-    for c in p.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                norm.pop();
+    let normalize = |p: &Path| {
+        let mut norm = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    norm.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => norm.push(c),
             }
-            std::path::Component::CurDir => {}
-            c => norm.push(c),
+        }
+        norm
+    };
+    let mut next = normalize(p);
+    for _ in 0..64 {
+        let (mut base, mut rest) = (normalize(&next), vec![]);
+        while !base.exists() {
+            // a link to nothing (yet): go on from its target, relative to the link's folder with its links resolved,
+            // and a `..` in it goes up from where the OS would be, past the links before it (`d/../x` with d -> /a/b is
+            // /a/x), not by name
+            if let Ok(to) = std::fs::read_link(&base) {
+                next = base.parent().map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())).unwrap_or_default();
+                for c in to.components() {
+                    match c {
+                        std::path::Component::ParentDir => {
+                            if let Ok(d) = std::fs::canonicalize(&next) {
+                                next = d;
+                            }
+                            next.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        c => next.push(c),
+                    }
+                }
+                next.extend(rest.iter().rev());
+                break;
+            }
+            match base.file_name() {
+                Some(n) => rest.push(n.to_owned()),
+                None => break,
+            }
+            base.pop();
+        }
+        if base.exists() || base.file_name().is_none() {
+            let mut out = std::fs::canonicalize(&base).unwrap_or(base);
+            out.extend(rest.iter().rev());
+            return out;
         }
     }
-    let (mut base, mut rest) = (norm, vec![]);
-    while !base.exists() {
-        match base.file_name() {
-            Some(n) => rest.push(n.to_owned()),
-            None => break,
-        }
-        base.pop();
-    }
-    let mut out = std::fs::canonicalize(&base).unwrap_or(base);
-    out.extend(rest.iter().rev());
-    out
+    normalize(p)
+}
+
+/// Whether `p` (from `resolve`) still goes through a symlink to nothing: only past the links `resolve` follows, a loop,
+/// where opening it would follow links `resolve` didn't, so it can't be checked.
+pub fn through_dangling_link(p: &Path) -> bool {
+    p.ancestors().any(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.is_symlink()) && !a.exists())
 }
 
 type Table = toml::Table;
