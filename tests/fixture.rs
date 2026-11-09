@@ -447,6 +447,144 @@ fn node_like_anvil() {
 }
 
 #[test]
+fn cache_across_paths() {
+    // CI restores ~/.plain into a new home and may check out to another path each run (GitLab, per-job work dirs, git
+    // worktrees): a suite's results don't depend on where the project is, unless it reads the path
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/paths");
+    std::fs::remove_dir_all(&base).ok();
+    let (a, b) = (base.join("a/project"), base.join("b/elsewhere/project"));
+    std::fs::create_dir_all(a.join("test")).unwrap();
+    std::fs::create_dir_all(a.join("data")).unwrap();
+    // a path beside the project (at another depth from a and b) opens nothing in it, so it doesn't change the key
+    let toml = format!("[profile.default]\nfs_permissions = [{{ access = \"read\", path = \"./data\" }}, {{ access = \"read\", path = \"{}\" }}]\n", base.join("shared").display());
+    std::fs::write(a.join("foundry.toml"), toml).unwrap();
+    std::fs::write(a.join("data/x.txt"), "hi").unwrap();
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    std::fs::create_dir_all(base.join("shared")).unwrap();
+    std::fs::write(base.join("shared/y.txt"), "yo").unwrap();
+    let shared = format!("function test_shared() public view {{ assertEq(vm.readFile(\"{}/shared/y.txt\"), \"yo\"); }}", base.display());
+    let abs = format!("function test_abs() public view {{ assertEq(vm.readFile(\"{}/data/x.txt\"), \"hi\"); }}", a.display());
+    let suites = [
+        ("Plain", "function test_sum() public pure { assertEq(uint256(2) + 2, 4); }"),
+        ("Read", "function test_read() public view { assertEq(vm.readFile(\"data/x.txt\"), \"hi\"); }"),
+        ("Root", "function test_root() public view { assertGt(bytes(vm.projectRoot()).length, 0); }"),
+        // the error names the absolute path, so this failure depends on the path too
+        ("Missing", "function testBad_missing() public view { vm.readFile(\"data/none.txt\"); }"),
+        // an absolute path is open in a only: it fails at b
+        ("Abs", abs.as_str()),
+        // open wherever the project is, but only while the config opens it
+        ("Shared", shared.as_str()),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    // new homes, sharing this machine's solc downloads
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = |h: &str| {
+        let h = base.join(h);
+        std::fs::create_dir_all(&h).unwrap();
+        std::os::unix::fs::symlink(real.join("solc"), h.join("solc")).unwrap();
+        h
+    };
+    let (ha, hb) = (home("home-a"), home("home-b"));
+    let run = |dir: &std::path::Path, home: &std::path::Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(dir).env("PLAIN_HOME", home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let text = run(&a, &ha);
+    assert!(text.contains("5 passed, 1 failed"), "{text}");
+    assert!(suites.iter().all(|(n, _)| !cached(&text, n)), "{text}");
+    let text = run(&a, &ha);
+    assert!(suites.iter().all(|(n, _)| cached(&text, n)), "{text}");
+
+    // a fresh copy at another path, with the cache and salt restored into another new home
+    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+    let cp = |from: &std::path::Path, to: &std::path::Path| assert!(Command::new("cp").arg("-R").arg(from).arg(to).status().unwrap().success());
+    cp(&a, &b);
+    for d in [".plain", "out", "cache"] {
+        std::fs::remove_dir_all(b.join(d)).ok();
+    }
+    cp(&ha.join("cache"), &hb.join("cache"));
+    std::fs::copy(ha.join("salt"), hb.join("salt")).unwrap();
+    let text = run(&b, &hb);
+    assert!(text.contains("4 passed, 2 failed"), "{text}");
+    assert!(cached(&text, "Plain") && cached(&text, "Read"), "{text}");
+    assert!(["Root", "Missing", "Abs", "Shared"].iter().all(|n| !cached(&text, n)), "{text}");
+    assert!(text.contains("elsewhere/project/data/none.txt"), "{text}");
+    let text = run(&b, &hb);
+    assert!(suites.iter().all(|(n, _)| cached(&text, n)), "{text}");
+
+    // closing the path beside the project leaves the key alone, but a suite that reached it runs again
+    std::fs::write(b.join("foundry.toml"), "[profile.default]\nfs_permissions = [{ access = \"read\", path = \"./data\" }]\n").unwrap();
+    let text = run(&b, &hb);
+    assert!(text.contains("3 passed, 3 failed"), "{text}");
+    assert!(cached(&text, "Plain") && cached(&text, "Read") && !cached(&text, "Shared"), "{text}");
+}
+
+#[test]
+fn cache_across_paths_relative() {
+    // a relative path that climbs out and back in through the checkout's own name, or goes through a symlink to an
+    // absolute target, resolves inside the project only at the path that filled the cache: at a sibling copy it reruns
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/paths-relative");
+    std::fs::remove_dir_all(&base).ok();
+    let (a, b) = (base.join("repo"), base.join("repo2"));
+    std::fs::create_dir_all(a.join("test")).unwrap();
+    std::fs::create_dir_all(a.join("data")).unwrap();
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\nfs_permissions = [{ access = \"read\", path = \"./\" }]\n").unwrap();
+    std::fs::write(a.join("data/x.txt"), "hi").unwrap();
+    std::os::unix::fs::symlink(a.join("data"), a.join("link")).unwrap();
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    let suites = [
+        ("Read", "function test_read() public view { assertEq(vm.readFile(\"data/x.txt\"), \"hi\"); }"),
+        ("Up", "function test_up() public view { assertEq(vm.readFile(\"../repo/data/x.txt\"), \"hi\"); }"),
+        ("Link", "function test_link() public view { assertEq(vm.readFile(\"link/x.txt\"), \"hi\"); }"),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = |h: &str| {
+        let h = base.join(h);
+        std::fs::create_dir_all(&h).unwrap();
+        std::os::unix::fs::symlink(real.join("solc"), h.join("solc")).unwrap();
+        h
+    };
+    let (ha, hb) = (home("home-a"), home("home-b"));
+    let run = |dir: &std::path::Path, home: &std::path::Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(dir).env("PLAIN_HOME", home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let text = run(&a, &ha);
+    assert!(text.contains("3 passed"), "{text}");
+    let text = run(&a, &ha);
+    assert!(suites.iter().all(|(n, _)| cached(&text, n)), "{text}");
+
+    // cp -R keeps the symlink, which still points into repo; neither repo/data is open from repo2
+    let cp = |from: &std::path::Path, to: &std::path::Path| assert!(Command::new("cp").arg("-R").arg(from).arg(to).status().unwrap().success());
+    cp(&a, &b);
+    for d in [".plain", "out", "cache"] {
+        std::fs::remove_dir_all(b.join(d)).ok();
+    }
+    cp(&ha.join("cache"), &hb.join("cache"));
+    std::fs::copy(ha.join("salt"), hb.join("salt")).unwrap();
+    let text = run(&b, &hb);
+    assert!(text.contains("1 passed, 2 failed"), "{text}");
+    assert!(cached(&text, "Read"), "{text}");
+    assert!(!cached(&text, "Up") && !cached(&text, "Link"), "{text}");
+    assert!(text.contains("isn't open for reading"), "{text}");
+}
+
+#[test]
 fn fuzz_seeds() {
     // a seed from foundry.toml, $PLAIN_SEED or --seed (in that order of precedence), or a random one per run
     let dir = "tests/fixture/tmp/seeds";

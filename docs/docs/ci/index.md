@@ -56,6 +56,8 @@ plain keeps three things outside the project that are worth restoring between ru
 
 I checked the salt the hard way. Copying `cache` and `solc` into a new home directory and running a fresh clone still took 1m42s, because the cache didn't match. Adding `salt` brought the same run down to 4.9 seconds. So the three entries go together, and the workflow above caches all of them.
 
+The checkout doesn't have to be at the same path as the run that filled the cache. Test results are keyed on paths relative to the project root, so a clone in another directory, as GitLab's `builds/<runner>/<concurrency id>/…` paths, per-job work directories on self-hosted runners and git worktrees give you, reuses them too. Only a suite that depends on the path runs again there: one that calls `vm.projectRoot()`, gives a file cheatcode an absolute path, a path with `..` in it, a path through a symlink or one outside the project, or gets a file read error, which names the absolute path. This needs a plain release after 0.5.0: 0.5.0 put the absolute path in every test result's key, so on 9 November 2026 the same fresh clone took 2.5 s at the original path and 10.2 s in another directory, where the compiled contracts still came from the cache but every test ran again. GitHub Actions checks out to the same path on every run, so the workflow above wasn't affected.
+
 Because a restored cache is trusted as if you had built it, restore it only in workflows you control.
 
 ## Measured times
@@ -72,7 +74,7 @@ Each command was run once on the same machine, pinned to 2 CPUs, with `plain` an
 - **Cold** includes downloading solc and compiling everything. plain's compile alone, forced with `plain build --force`, took 79.9 s, and its tests ran in 19.4 s. forge's tests ran in 30.0 s, so almost all of its 8m57s was compiling the project with via-IR.
 - **Rerun** is where plain reuses test results: 565 of the results came from its cache and the rest ran again. forge ran every test again.
 - **Add one test** appended a one-line test to `test/types/Slot0.t.sol`; both times are for running that suite (`--mc TestSlot0`). Running all 39 suites after the same edit took plain 3.8 s.
-- **Fresh clone** is a new `git clone --recurse-submodules` in a new directory with `~/.plain/cache`, `solc` and `salt` copied from the earlier run into a new home directory. I did not time forge on this step.
+- **Fresh clone** is a new `git clone --recurse-submodules` with `~/.plain/cache`, `solc` and `salt` copied from the earlier run into a new home directory. With plain 0.5.0 this time holds only for a clone at the same path as the earlier run (see [What the cache holds](#what-the-cache-holds)); later releases leave the path out of the key, though I haven't timed v4-core at another path with them. I did not time forge on this step.
 
 ## One v4-core test fails under both tools
 

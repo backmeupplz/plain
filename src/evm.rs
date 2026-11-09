@@ -565,7 +565,7 @@ pub struct Reads {
 }
 
 /// What `Reads` records for an input, as of now (None: the kind is unknown).
-pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path) -> Option<String> {
+pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path, access: &crate::project::Access) -> Option<String> {
     let (kind, name) = key.split_once(':')?;
     Some(match kind {
         "art" => arts.iter().find(|a| a.shard == 0 && format!("{}:{}", a.file, a.name) == name).map_or("missing".into(), art_hash),
@@ -575,6 +575,8 @@ pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path) -> Option<
         },
         "env" => lookup(name).unwrap_or_else(|| "\0unset".into()),
         "root" => root.to_string_lossy().into(),
+        // every path tests may reach, absolute: the cache key has only the part inside the project
+        "access" => format!("{:?} {:?}", access.fs, access.protected),
         _ => return None,
     })
 }
@@ -826,6 +828,23 @@ impl Cheats {
     /// symlinks resolved. Nothing is open unless configured, like forge.
     fn fs(&self, path: &str, write: bool) -> Result<std::path::PathBuf, String> {
         let p = crate::project::resolve(&self.root.join(path));
+        // whether a path is open and what it holds depend on where the project is (the test cache key has
+        // fs_permissions relative to the root) unless it goes down from the root by name alone: an absolute path, a
+        // `..` (`../repo/x` climbs out and back in only from a checkout named repo) or a symlink on the way (its
+        // target may be absolute) all make the result path-dependent
+        let lexical = std::path::Path::new(path).components().try_fold(crate::project::resolve(&self.root), |mut l, c| {
+            match c {
+                std::path::Component::Normal(n) => l.push(n),
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+            Some(l)
+        });
+        // and so does whether a path beside the project is open, which the key leaves out (test::access_key)
+        if lexical.as_ref() != Some(&p) {
+            self.read("root:".into());
+            self.read("access:".into());
+        }
         let open = self.access.fs.iter().any(|(dir, r, w)| (if write { *w } else { *r }) && p.starts_with(dir));
         if write && self.access.protected.iter().any(|x| p.starts_with(x)) {
             return Err(format!("{path:?} can't be written from a test or script (plain's state, git's or the config)"));
@@ -840,11 +859,17 @@ impl Cheats {
         }
     }
 
+    /// A file cheatcode's error, which names the absolute path: the result now depends on where the project is.
+    fn fs_error(&self, p: &std::path::Path, e: std::io::Error) -> String {
+        self.read("root:".into());
+        format!("{}: {e}", p.display())
+    }
+
     pub fn read(&self, key: String) {
         if let Some(r) = &self.reads {
             let mut r = r.lock().unwrap();
             if !r.deps.contains_key(&key) {
-                let v = read_now(&key, &self.artifacts, &self.root).unwrap_or_default();
+                let v = read_now(&key, &self.artifacts, &self.root, &self.access).unwrap_or_default();
                 r.deps.insert(key, v);
             }
         }
@@ -1378,7 +1403,7 @@ impl Cheats {
             "readFile(string)" => {
                 let p = self.fs(&st(&args[0]), false)?;
                 self.read(format!("file:{}", st(&args[0])));
-                Ok(enc(DynSolValue::String(std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)))
+                Ok(enc(DynSolValue::String(std::fs::read_to_string(&p).map_err(|e| self.fs_error(&p, e))?)))
             }
             "writeFile(string,string)" => {
                 let p = self.fs(&st(&args[0]), true)?;
@@ -1460,7 +1485,7 @@ impl Cheats {
             "readFileBinary(string)" => {
                 let p = self.fs(&st(&args[0]), false)?;
                 self.read(format!("file:{}", st(&args[0])));
-                Ok(enc(DynSolValue::Bytes(std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?)))
+                Ok(enc(DynSolValue::Bytes(std::fs::read(&p).map_err(|e| self.fs_error(&p, e))?)))
             }
             other => Err(format!("plain: unsupported cheatcode vm.{other}")),
         }

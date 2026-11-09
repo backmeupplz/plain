@@ -182,8 +182,10 @@ struct Entry {
 
 /// Results are deterministic given the test contract's bytecode, the settings, this binary and what the
 /// suite read (artifacts it deployed, files, env vars): the key covers the first three, `Entry::deps` the rest.
-/// Fuzz and invariant results also depend on the seed, which each of them records.
-fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, Inline>) -> String {
+/// Fuzz and invariant results also depend on the seed, which each of them records. Nothing in the key names where the
+/// project is (`access_key`), so a clone at another path reuses the results; suites that read the path
+/// (vm.projectRoot) depend on it through `Entry::deps`.
+fn cache_key(art: &Artifact, root: &std::path::Path, opts: &Opts, inline: &HashMap<String, Inline>) -> String {
     use sha2::Digest;
     static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let exe = EXE.get_or_init(|| {
@@ -194,8 +196,24 @@ fn cache_key(art: &Artifact, opts: &Opts, inline: &HashMap<String, Inline>) -> S
     inline.sort();
     // not the seed: fuzz and invariant results carry the seed they ran with (TestResult::seed), so a new seed reruns
     // only them
-    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{inline:?}|{:?}|{:?}|{}|{}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.allow_internal_revert, opts.access, opts.spec, opts.isolate, opts.gas_limit);
+    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{inline:?}|{:?}|{:?}|{}|{}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.allow_internal_revert, access_key(&opts.access, root), opts.spec, opts.isolate, opts.gas_limit);
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
+}
+
+/// What tests may reach inside the project, for the cache key: each path (absolute, resolved) as the part of the
+/// resolved root it opens, relative to the root, so the same project at another path has the same key. A path that
+/// contains the root opens all of it (`.`); one beside the root opens none of it and is left out: a test reaches it
+/// only through an absolute path, `..` or a symlink, which records the root and the whole access list as
+/// dependencies (Cheats::fs), so a suite that doesn't is unaffected by it wherever the project is.
+fn access_key(a: &crate::project::Access, root: &std::path::Path) -> String {
+    let root = crate::project::resolve(root);
+    let rel = |p: &std::path::PathBuf| match p.strip_prefix(&root) {
+        Ok(r) => Some(format!("./{}", r.display())),
+        Err(_) => root.starts_with(p).then(|| "./".to_string()),
+    };
+    let fs: Vec<_> = a.fs.iter().filter_map(|(p, r, w)| Some((rel(p)?, r, w))).collect();
+    let protected: Vec<_> = a.protected.iter().filter_map(rel).collect();
+    format!("ffi={} fs={fs:?} protected={protected:?}", a.ffi)
 }
 
 fn entry_path(key: &str) -> std::path::PathBuf {
@@ -473,11 +491,11 @@ fn run_suite(art: &Artifact, arts: &Arc<Vec<Artifact>>, root: &std::path::Path, 
     let t0 = Instant::now();
     let inline = inline_config(&root.join(&art.file));
     // results of an unchanged suite come from its last run
-    let key = opts.cache.then(|| cache_key(art, opts, &inline));
+    let key = opts.cache.then(|| cache_key(art, root, opts, &inline));
     let old: Option<Entry> = key
         .as_ref()
         .and_then(|k| serde_json::from_slice::<Entry>(&std::fs::read(entry_path(k)).ok()?).ok())
-        .filter(|e| e.deps.iter().all(|(k, v)| evm::read_now(k, arts, root).as_ref() == Some(v)));
+        .filter(|e| e.deps.iter().all(|(k, v)| evm::read_now(k, arts, root, &opts.access).as_ref() == Some(v)));
     let mut cached = vec![];
     if let Some(e) = &old {
         tests.retain(|f| match e.results.iter().find(|r| r.name == sig(f) && r.seed.is_none_or(|s| s == opts.seed)) {
@@ -1222,6 +1240,25 @@ fn fuzz_invariants(invs: &[&Function], (runs, depth, fail_on_revert): (u32, u32,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn access_keys() {
+        // only what each path opens inside the project counts, wherever the project is
+        use crate::project::Access;
+        use std::path::PathBuf;
+        let key = |root: &str, paths: &[&str]| {
+            let fs = paths.iter().map(|p| (PathBuf::from(p), true, false)).collect();
+            super::access_key(&Access { ffi: false, fs, protected: vec![PathBuf::from(root).join(".git")] }, &PathBuf::from(root))
+        };
+        let (a, b) = ("/nonexistent/a/repo", "/nonexistent/b/deeper/repo");
+        let paths = |root: &str| [format!("{root}/data"), root.to_string(), "/nonexistent".into(), "/usr/share".into(), "/nonexistent/a/other".into()];
+        let (pa, pb) = (paths(a), paths(b));
+        let (ka, kb) = (key(a, &pa.iter().map(|s| s.as_str()).collect::<Vec<_>>()), key(b, &pb.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+        assert_eq!(ka, kb);
+        assert_eq!(ka, r#"ffi=false fs=[("./data", true, false), ("./", true, false), ("./", true, false)] protected=["./.git"]"#);
+        // a path into the first checkout opens nothing of the second
+        assert_ne!(key(a, &["/nonexistent/a/repo/data"]), key(b, &["/nonexistent/a/repo/data"]));
+    }
+
     #[test]
     fn seeds() {
         use super::seed;
