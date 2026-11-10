@@ -527,6 +527,68 @@ fn cache_across_paths() {
 }
 
 #[test]
+fn cache_salt() {
+    // the salt is in every cache key: test results restored into a home with another salt never pass for a run made
+    // there, while the same salt reuses them
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/salt");
+    std::fs::remove_dir_all(&base).ok();
+    let a = base.join("project");
+    std::fs::create_dir_all(a.join("test")).unwrap();
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\n").unwrap();
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    for name in ["One", "Two"] {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    function test_sum() public pure {{ assertEq(uint256(2) + 2, 4); }}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = |h: &str| {
+        let h = base.join(h);
+        std::fs::create_dir_all(&h).unwrap();
+        std::os::unix::fs::symlink(real.join("solc"), h.join("solc")).unwrap();
+        h
+    };
+    let run = |home: &std::path::Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(&a).env("PLAIN_HOME", home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str| {
+        ["One", "Two"].map(|n| {
+            let id = format!("test/{n}.t.sol:{n}Test");
+            text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+        })
+    };
+    let ha = home("home-a");
+    let text = run(&ha);
+    assert!(text.contains("2 passed"), "{text}");
+    assert_eq!(cached(&text), [false, false], "{text}");
+    assert_eq!(cached(&run(&ha)), [true, true]);
+
+    let restore = |h: &std::path::Path, salt: Option<&str>| {
+        assert!(Command::new("cp").arg("-R").arg(ha.join("cache")).arg(h.join("cache")).status().unwrap().success());
+        match salt {
+            Some(s) => std::fs::write(h.join("salt"), s).unwrap(),
+            None => drop(std::fs::copy(ha.join("salt"), h.join("salt")).unwrap()),
+        }
+    };
+    // the cache restored with its salt: results are reused
+    let hb = home("home-b");
+    restore(&hb, None);
+    let text = run(&hb);
+    assert_eq!(cached(&text), [true, true], "{text}");
+
+    // the same cache under another salt: every suite runs again, and then its new results are reused
+    let hc = home("home-c");
+    let other = "ab".repeat(32);
+    assert_ne!(std::fs::read_to_string(ha.join("salt")).unwrap(), other);
+    restore(&hc, Some(&other));
+    let text = run(&hc);
+    assert!(text.contains("2 passed"), "{text}");
+    assert_eq!(cached(&text), [false, false], "{text}");
+    assert_eq!(cached(&run(&hc)), [true, true]);
+    assert_eq!(std::fs::read_to_string(hc.join("salt")).unwrap(), other, "plain kept the restored salt");
+}
+
+#[test]
 fn cache_across_paths_relative() {
     // a relative path that climbs out and back in through the checkout's own name, or goes through a symlink to an
     // absolute target, resolves inside the project only at the path that filled the cache: at a sibling copy it reruns

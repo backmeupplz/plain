@@ -182,6 +182,7 @@ struct Entry {
 
 /// Results are deterministic given the test contract's bytecode, the settings, this binary and what the
 /// suite read (artifacts it deployed, files, env vars): the key covers the first three, `Entry::deps` the rest.
+/// The machine's salt is in the key too, so a result copied in from another machine never passes for a run made here.
 /// Fuzz and invariant results also depend on the seed, which each of them records. Nothing in the key names where the
 /// project is (`access_key`), so a clone at another path reuses the results; suites that read the path
 /// (vm.projectRoot) depend on it through `Entry::deps`.
@@ -196,7 +197,7 @@ fn cache_key(art: &Artifact, root: &std::path::Path, opts: &Opts, inline: &HashM
     inline.sort();
     // not the seed: fuzz and invariant results carry the seed they ran with (TestResult::seed), so a new seed reruns
     // only them
-    let s = format!("{exe}|{}|{}|{}|{}|{}|{:?}|{}|{inline:?}|{:?}|{:?}|{}|{}", art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.allow_internal_revert, access_key(&opts.access, root), opts.spec, opts.isolate, opts.gas_limit);
+    let s = format!("{}|{exe}|{}|{}|{}|{}|{}|{:?}|{}|{inline:?}|{:?}|{:?}|{}|{}", crate::solc::salt(), art.file, art.name, art.bytecode, art.abi, opts.fuzz_runs, opts.invariant, opts.allow_internal_revert, access_key(&opts.access, root), opts.spec, opts.isolate, opts.gas_limit);
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 

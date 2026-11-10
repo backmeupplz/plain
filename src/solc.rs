@@ -169,9 +169,15 @@ pub enum Scope {
     Files(Vec<String>, Vec<String>, bool),
 }
 
-/// A random value of this machine's own in the build cache's key, so that a `.plain/cache.json` committed to a repo
-/// (or copied from anywhere else) can never pass for this machine's compile of the sources it describes.
-fn salt() -> String {
+/// A random value of this machine's own in every cache key (the build cache's, test results', canonical compiles'), so
+/// that a `.plain/cache.json` committed to a repo or a `~/.plain/cache` file copied from anywhere else can never pass
+/// for this machine's compile of the sources it describes, or for a test run it made.
+pub fn salt() -> String {
+    static SALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SALT.get_or_init(read_salt).clone()
+}
+
+fn read_salt() -> String {
     let path = home().join("salt");
     let read = || std::fs::read_to_string(&path).ok().filter(|s| s.len() == 64);
     if let Some(s) = read() {
@@ -1469,7 +1475,7 @@ pub fn canonical(p: &Project, version: &str, file: &str) -> Result<HashMap<Strin
     // remembered by what was compiled (sources, settings, compiler), so a deploy pays for this once per change
     let key = {
         use sha2::Digest;
-        hex::encode(sha2::Sha256::digest(format!("{version}{input}").as_bytes()))
+        hex::encode(sha2::Sha256::digest(format!("{}{version}{input}", salt()).as_bytes()))
     };
     let path = home().join("cache/canonical").join(format!("{key}.json"));
     if let Some(hit) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {

@@ -52,7 +52,7 @@ plain keeps three things outside the project that are worth restoring between ru
 
 - `~/.plain/solc` has the compilers it downloaded (29 MB here, for solc 0.8.26).
 - `~/.plain/cache` has compiled contracts and test results by content hash (7.9 MB here), shared by every checkout of every project.
-- `~/.plain/salt` is a random value of the machine that goes into every cache key. It exists so that a cache file copied from somewhere else can never pass for a compile you made, and it means the cache is ignored on a machine with a different salt.
+- `~/.plain/salt` is a random value of the machine that goes into every cache key: compiled contracts and test results alike. It exists so that a cache file copied from somewhere else can never pass for a compile or a test run you made, and it means the cache is ignored on a machine with a different salt. plain 0.5.0 left it out of the test results' key, so there a new salt compiled everything again but still reused the test results whenever the bytecode came out the same; later releases run every suite again.
 
 I checked the salt the hard way. Copying `cache` and `solc` into a new home directory and running a fresh clone still took 1m42s, because the cache didn't match. Adding `salt` brought the same run down to 4.9 seconds. So the three entries go together, and the workflow above caches all of them.
 
