@@ -27,6 +27,9 @@ contract Token {
 // forge 1.x behavior that plain matches
 contract ForgeTest is Test {
     struct Pair { uint256 z; string a; }
+    // forge leaves mapping and function members out when it orders an object by a struct's members
+    struct WithMapping { uint256 mz; mapping(uint256 => uint256) mm; uint256 my; }
+    struct WithFunction { uint256 fz; function() external fe; uint256 fy; }
 
     function test_setUpLikeForge() public view {
         assertEq(address(this), 0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496, "SENDER's nonce 1");
@@ -124,6 +127,20 @@ contract ForgeTest is Test {
         assertEq(pairs[0].a, "s");
         vm.serializeUint("o", "n", 5);
         assertEq(vm.serializeAddress("o", "who", address(0xaa)), '{"n":5,"who":"0x00000000000000000000000000000000000000AA"}');
+    }
+
+    function test_jsonSkipsMappingAndFunctionMembers() public pure {
+        // (mz, my) and (fz, fy), not by key
+        (uint256 a, uint256 b) = abi.decode(vm.parseJson('{"my": 1, "mz": 2}'), (uint256, uint256));
+        assertEq(a, 2);
+        assertEq(b, 1);
+        (a, b) = abi.decode(vm.parseJson('{"fy": 1, "fz": 2}'), (uint256, uint256));
+        assertEq(a, 2);
+        assertEq(b, 1);
+        // with the skipped member's key too, no struct has the members: by key (mm, my, mz)
+        (uint256 c, , uint256 d) = abi.decode(vm.parseJson('{"mz": 1, "my": 2, "mm": 3}'), (uint256, uint256, uint256));
+        assertEq(c, 3);
+        assertEq(d, 1);
     }
 
     function test_recordAndStdStorageDeal() public {

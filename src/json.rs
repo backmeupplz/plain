@@ -115,7 +115,8 @@ impl Step {
 }
 
 /// The fields of every struct in `sources` ("Contract.Struct" or "Struct" -> member names, in order): forge orders an
-/// object's values by the struct with the same member names when decoding it untyped.
+/// object's values by the struct with the same member names when decoding it untyped. Like forge, members of mapping or
+/// function type (arrays of them too) aren't counted; a member whose struct type holds a mapping is.
 pub fn struct_defs<'a>(sources: impl Iterator<Item = &'a str>) -> BTreeMap<String, Vec<String>> {
     use crate::rewrite::{K, lex};
     let mut out = BTreeMap::new();
@@ -130,12 +131,21 @@ pub fn struct_defs<'a>(sources: impl Iterator<Item = &'a str>) -> BTreeMap<Strin
                 "contract" | "library" | "interface" if toks.get(i + 1).is_some_and(|x| x.k == K::Ident) => owner.push((t(i + 1).to_string(), depth + 1)),
                 "struct" if toks.get(i + 1).is_some_and(|x| x.k == K::Ident) && t(i + 2) == "{" => {
                     let name = t(i + 1).to_string();
-                    let (mut fields, mut j, mut nest, mut last) = (vec![], i + 3, 0, "");
+                    // `head`: the member's first token, where its type starts
+                    let (mut fields, mut j, mut nest, mut last, mut head) = (vec![], i + 3, 0, "", "");
                     while j < toks.len() && !(nest == 0 && t(j) == "}") {
+                        if head.is_empty() {
+                            head = t(j);
+                        }
                         match t(j) {
                             "(" | "[" | "{" => nest += 1,
                             ")" | "]" | "}" => nest -= 1,
-                            ";" if nest == 0 => fields.push(last.to_string()),
+                            ";" if nest == 0 => {
+                                if !matches!(head, "mapping" | "function") {
+                                    fields.push(last.to_string());
+                                }
+                                head = "";
+                            }
                             _ if toks[j].k == K::Ident => last = t(j),
                             _ => {}
                         }
@@ -329,6 +339,11 @@ mod tests {
     fn decoding() {
         let defs = struct_defs(["contract T { struct Rule { uint256 value; uint256 attacker; } }"].into_iter());
         assert_eq!(defs["T.Rule"], ["value", "attacker"]);
+        // like forge: mapping and function members (arrays of them too) don't count; a struct member holding one does
+        let src = "struct In { mapping(uint256 => uint256) m; uint256 v; }\nstruct S { uint256 z; mapping(uint256 => mapping(address => bool)) m; function(uint256) internal pure returns (uint256) f; /* c */ function() external[] fs; mapping(uint256 => uint256)[2] ms; In i; uint256 y; }";
+        let skip = struct_defs([src].into_iter());
+        assert_eq!(skip["In"], ["v"]);
+        assert_eq!(skip["S"], ["z", "i", "y"]);
         // object values in the order of the struct with the same members, else by key
         let t = |v: Value| token(&v, &defs).unwrap();
         assert_eq!(t(json!({"attacker": 1, "value": 2})), DynSolValue::Tuple(vec![DynSolValue::Uint(U256::from(2), 256), DynSolValue::Uint(U256::from(1), 256)]));
