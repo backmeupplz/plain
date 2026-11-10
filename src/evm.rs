@@ -816,6 +816,14 @@ fn by(v: &DynSolValue) -> Vec<u8> {
         v => v.as_bytes().unwrap_or_default().to_vec(),
     }
 }
+/// Whether two paths name the same entry, links not followed.
+fn same_entry(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
 fn st(v: &DynSolValue) -> String {
     v.as_str().unwrap_or_default().to_string()
 }
@@ -844,10 +852,36 @@ impl Cheats {
     /// Where a file cheatcode may go: inside a path fs_permissions opens for reading (or writing), with `..` and
     /// symlinks resolved. Nothing is open unless configured, like forge.
     fn fs(&self, path: &str, write: bool) -> Result<std::path::PathBuf, String> {
-        let p = crate::project::resolve(&self.root.join(path));
-        // whether the path is open depends on where it leads, which a symlink on the way (one that's there now or one
-        // that appears later) changes without changing the bytes, so the suite records it even when this call fails
-        self.read(format!("path:{path}"));
+        self.fs_at(path, write, false)
+    }
+
+    /// Where removeFile may go: the entry itself, a symlink rather than where it leads (unlink takes away the link),
+    /// so its folder with `..` and symlinks resolved, plus its name. A path ending in `/`, `.` or `..` names a folder,
+    /// which unlink refuses (`link/` too, even when the link leads to a file), and so does this.
+    fn fs_entry(&self, path: &str) -> Result<std::path::PathBuf, String> {
+        if ["", ".", ".."].contains(&path.rsplit('/').next().unwrap_or_default()) {
+            return Err(format!("{path:?} names a folder, not a file"));
+        }
+        self.fs_at(path, true, true)
+    }
+
+    fn fs_at(&self, path: &str, write: bool, entry: bool) -> Result<std::path::PathBuf, String> {
+        let name = path.rsplit('/').next().filter(|_| entry);
+        let (p, at, via) = match name {
+            Some(n) => {
+                let dir = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                let d = crate::project::resolve(&self.root.join(dir));
+                (d.join(n), dir.to_string_lossy().into_owned(), d)
+            }
+            None => {
+                let p = crate::project::resolve(&self.root.join(path));
+                (p.clone(), path.to_string(), p)
+            }
+        };
+        // whether the path is open depends on where it leads (for an entry, where its folder does), which a symlink on
+        // the way (one that's there now or one that appears later) changes without changing the bytes, so the suite
+        // records it even when this call fails
+        self.read(format!("path:{at}"));
         // whether a path is open and what it holds depend on where the project is (the test cache key has
         // fs_permissions relative to the root) unless it goes down from the root by name alone: an absolute path, a
         // `..` (`../repo/x` climbs out and back in only from a checkout named repo) or a symlink on the way (its
@@ -865,11 +899,17 @@ impl Cheats {
             self.read("root:".into());
             self.read("access:".into());
         }
-        if crate::project::through_dangling_link(&p) {
+        if crate::project::through_dangling_link(&via) {
             return Err(format!("{path:?} goes through a loop of symlinks"));
         }
         let open = self.access.fs.iter().any(|(dir, r, w)| (if write { *w } else { *r }) && p.starts_with(dir));
-        if write && self.access.protected.iter().any(|x| p.starts_with(x)) {
+        // an entry's name isn't resolved, so on a case-insensitive disk `.ENV` spells `.env`: the same name in another
+        // case in the same folder is the same entry when the disk says so (and that, unlike a hard link elsewhere,
+        // the recorded folder and the name decide)
+        let respelt = |x: &std::path::Path| {
+            entry && p.parent() == x.parent() && p.file_name().zip(x.file_name()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)) && same_entry(&p, x)
+        };
+        if write && self.access.protected.iter().any(|x| p.starts_with(x) || respelt(x)) {
             return Err(format!("{path:?} can't be written from a test or script (plain's state, git's or the config)"));
         }
         match open {
@@ -1277,7 +1317,7 @@ impl Cheats {
                 ok
             }
             "removeFile(string)" => {
-                let p = self.fs(&st(&args[0]), true)?;
+                let p = self.fs_entry(&st(&args[0]))?;
                 self.impure();
                 std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
                 ok

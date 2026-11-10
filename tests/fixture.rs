@@ -866,6 +866,90 @@ fn dangling_symlinks() {
 }
 
 #[test]
+fn remove_symlinks() {
+    // removeFile takes away the link itself, like forge and unlink: a live one's target stays, a dangling one goes
+    // too. Whether it may is up to where the link is (its folder, links resolved), not where it leads
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/remove-symlinks");
+    std::fs::remove_dir_all(&base).ok();
+    let (a, outside) = (base.join("repo"), base.join("outside"));
+    for d in [a.join("test"), a.join("data"), outside.join("sub")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\nfs_permissions = [{ access = \"read-write\", path = \"./\" }]\n").unwrap();
+    for f in [a.join("data/target.txt"), a.join("data/env.txt"), a.join("data/t2.txt"), outside.join("f.txt")] {
+        std::fs::write(f, "t").unwrap();
+    }
+    let link = |at: &std::path::Path, to: &std::path::Path| std::os::unix::fs::symlink(to, at).unwrap();
+    link(&a.join("data/live"), std::path::Path::new("target.txt"));
+    link(&a.join("data/dead"), &outside.join("missing.txt"));
+    link(&a.join("data/far"), &outside.join("f.txt"));
+    // `link/` names a folder: unlink refuses it, rather than taking away where the link leads
+    link(&a.join("data/slash"), std::path::Path::new("t2.txt"));
+    // a hard link to a protected file is another entry, which unlinking leaves the file alone
+    std::fs::hard_link(a.join("foundry.toml"), a.join("data/hard")).unwrap();
+    // a link in a folder reached through a link: removed where it is
+    link(&a.join("dlink"), &a.join("data"));
+    // its folder is outside the open paths, though its target is inside them
+    link(&outside.join("sub/l"), &a.join("data/target.txt"));
+    link(&a.join("out"), &outside.join("sub"));
+    // a protected name stays, link or not
+    link(&a.join(".env"), std::path::Path::new("data/env.txt"));
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    let suites = [
+        ("Live", "function test_live() public { vm.removeFile(\"data/live\"); assertTrue(vm.exists(\"data/target.txt\")); }"),
+        ("Dead", "function test_dead() public { vm.removeFile(\"data/dead\"); }"),
+        ("Far", "function test_far() public { vm.removeFile(\"dlink/far\"); }"),
+        ("Out", "function test_out() public { vm.removeFile(\"out/l\"); }"),
+        ("Env", "function test_env() public { vm.removeFile(\".env\"); }"),
+        ("Hard", "function test_hard() public { vm.removeFile(\"data/hard\"); }"),
+        ("Slash", "function test_slash() public { vm.removeFile(\"data/slash/\"); }"),
+        // on a case-insensitive disk (macOS's) this is foundry.toml, still protected; elsewhere there's no such file
+        ("Case", "function test_case() public { vm.removeFile(\"FOUNDRY.TOML\"); }"),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(real.join("solc"), home.join("solc")).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(&a).env("PLAIN_HOME", &home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let is_link = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_symlink());
+    let text = run();
+    assert!(text.contains("4 passed, 4 failed"), "{text}");
+    assert!(text.contains("FAIL test_slash(): \"data/slash/\" names a folder"), "{text}");
+    let insensitive = a.join("FOUNDRY.TOML").exists();
+    assert!(text.contains(if insensitive { "FAIL test_case(): \"FOUNDRY.TOML\" can't be written" } else { "FAIL test_case()" }), "{text}");
+    assert!(a.join("foundry.toml").is_file() && is_link(&a.join("data/slash")), "{text}");
+    assert!(text.contains("FAIL test_out(): \"out/l\" isn't open for writing"), "{text}");
+    assert!(text.contains("FAIL test_env(): \".env\" can't be written"), "{text}");
+    for gone in ["data/live", "data/dead", "data/far", "data/hard"] {
+        assert!(std::fs::symlink_metadata(a.join(gone)).is_err(), "{gone}: {text}");
+    }
+    for kept in [a.join("data/target.txt"), a.join("data/env.txt"), a.join("data/t2.txt"), outside.join("f.txt")] {
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "t", "{}: {text}", kept.display());
+    }
+    assert!(is_link(&outside.join("sub/l")) && is_link(&a.join(".env")) && is_link(&a.join("dlink")), "{text}");
+
+    // the refusal depends on where the folder leads: moving it inside reruns the suite, which then removes the link
+    assert!(cached(&run(), "Out"));
+    std::fs::remove_file(a.join("out")).unwrap();
+    link(&a.join("out"), &a.join("data"));
+    link(&a.join("data/l"), std::path::Path::new("target.txt"));
+    let text = run();
+    assert!(!cached(&text, "Out") && !text.contains("FAIL test_out()"), "{text}");
+    assert!(!is_link(&a.join("data/l")) && a.join("data/target.txt").exists() && is_link(&outside.join("sub/l")), "{text}");
+}
+
+#[test]
 fn fuzz_seeds() {
     // a seed from foundry.toml, $PLAIN_SEED or --seed (in that order of precedence), or a random one per run
     let dir = "tests/fixture/tmp/seeds";

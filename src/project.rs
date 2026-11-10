@@ -391,7 +391,15 @@ impl Project {
                         Some((path, read, write))
                     })
                     .collect(),
-                protected: [".git", ".plain", "foundry.toml", "plain.toml", ".env"].iter().map(|f| resolve(&root.join(f))).collect(),
+                // where each leads and, when it's a symlink, the link itself, which removeFile would take away
+                protected: [".git", ".plain", "foundry.toml", "plain.toml", ".env"].iter().fold(vec![], |mut v, f| {
+                    for p in [resolve(&root.join(f)), resolve(&root).join(f)] {
+                        if !v.contains(&p) {
+                            v.push(p);
+                        }
+                    }
+                    v
+                }),
             },
             typescript: b("typescript").unwrap_or(false),
             profiles: cfg.get("additional_compiler_profiles").and_then(|v| v.as_array()).into_iter().flatten().map(|t| {
