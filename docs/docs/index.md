@@ -210,7 +210,7 @@ Invariant tests (`invariant*`, `statefulFuzz*`) check the state setUp leaves bef
 
 ### Results are reused
 
-A suite runs again only when its compiled code, the test settings, the plain binary, or something it read changed. That last part covers contracts it deployed through `getCode`, files and environment variables. Suites whose results were reused print `(cached)`. Suites that call `ffi`, `writeFile`, `unixTime` or `setEnv` always run, and so does every `--fork` run.
+A suite runs again only when its compiled code, the test settings, the plain binary, or something it read changed. That last part covers contracts it deployed through `getCode`, files, environment variables, and the struct definitions that `vm.parseJson` orders an object's values by, in any of the project's own source files that define a contract. Suites whose results were reused print `(cached)`. Suites that call `ffi`, `writeFile`, `unixTime` or `setEnv` always run, and so does every `--fork` run.
 
 ### TypeScript tests
 

@@ -718,6 +718,72 @@ fn cache_symlink_retarget() {
 }
 
 #[test]
+fn cache_json_struct_defs() {
+    // vm.parseJson orders an object's values like the project's struct with the same member names, wherever it's
+    // defined: a suite that decoded {x, y} reruns when that struct changes in a file it never deploys, while one that
+    // decoded other keys stays cached
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/json-struct-defs");
+    std::fs::remove_dir_all(&base).ok();
+    let a = base.join("repo");
+    for d in ["src", "test"] {
+        std::fs::create_dir_all(a.join(d)).unwrap();
+    }
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\n").unwrap();
+    let shapes = |members: &str| std::fs::write(a.join("src/Shapes.sol"), format!("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract Shapes {{\n    struct Point {{ {members} }}\n}}\n")).unwrap();
+    shapes("uint256 y; uint256 x;");
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    let suites = [
+        // Point is (y, x): the object's y comes first
+        ("Point", "function test_point() public pure { (uint256 first, uint256 second) = abi.decode(vm.parseJson('{\"x\": 1, \"y\": 2}'), (uint256, uint256)); assertEq(first, 2); assertEq(second, 1); }"),
+        // no struct has these members: by key
+        ("Other", "function test_other() public pure { (uint256 first, uint256 second) = abi.decode(vm.parseJson('{\"b\": 1, \"a\": 2}'), (uint256, uint256)); assertEq(first, 2); assertEq(second, 1); }"),
+        // no struct has three members: by key, which the suite records as just the count
+        ("Wide", "function test_wide() public pure { (uint256 first, , uint256 third) = abi.decode(vm.parseJson('{\"c\": 1, \"b\": 2, \"a\": 3}'), (uint256, uint256, uint256)); assertEq(first, 3); assertEq(third, 1); }"),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(real.join("solc"), home.join("solc")).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(&a).env("PLAIN_HOME", &home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let text = run();
+    assert!(text.contains("3 passed, 0 failed"), "{text}");
+    let text = run();
+    assert!(suites.iter().all(|(n, _)| cached(&text, n)), "{text}");
+
+    // Point becomes (x, y): only Shapes.sol and its artifact change, neither of which the suites read
+    shapes("uint256 x; uint256 y;");
+    let text = run();
+    assert!(text.contains("2 passed, 1 failed"), "{text}");
+    assert!(!cached(&text, "Point") && cached(&text, "Other") && cached(&text, "Wide"), "{text}");
+    assert!(text.contains("FAIL test_point()"), "{text}");
+    let text = run();
+    assert!(suites.iter().all(|(n, _)| cached(&text, n)), "{text}");
+
+    // a struct with the other suite's members appears
+    std::fs::write(a.join("src/Pair.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\nstruct Pair { uint256 b; uint256 a; }\n\ncontract Pairs {}\n").unwrap();
+    let text = run();
+    assert!(!cached(&text, "Other") && cached(&text, "Point") && cached(&text, "Wide"), "{text}");
+    assert!(text.contains("FAIL test_other()"), "{text}");
+
+    // and one with three members, which the third suite's object now decodes like
+    std::fs::write(a.join("src/Triple.sol"), "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract Triples {\n    struct Triple { uint256 c; uint256 b; uint256 a; }\n}\n").unwrap();
+    let text = run();
+    assert!(!cached(&text, "Wide") && cached(&text, "Point") && cached(&text, "Other"), "{text}");
+    assert!(text.contains("FAIL test_wide()"), "{text}");
+}
+
+#[test]
 fn dangling_symlinks() {
     // a symlink to nothing yet leads where writing through it would create the file: outside the open paths it's
     // refused and nothing appears there; inside them it works; a loop of them can't be opened at all

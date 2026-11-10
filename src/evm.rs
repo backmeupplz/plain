@@ -584,6 +584,14 @@ pub fn read_now(key: &str, arts: &[Artifact], root: &std::path::Path, access: &c
         }
         "env" => lookup(name).unwrap_or_else(|| "\0unset".into()),
         "root" => root.to_string_lossy().into(),
+        // the members, in order, of the struct an object with these keys (a JSON array) decodes like (vm.parseJson)
+        "json" => {
+            let keys: Vec<String> = serde_json::from_str(name).ok()?;
+            let order = crate::json::order(&keys.iter().map(String::as_str).collect(), json_defs(arts, root));
+            order.map_or("by key".into(), |f| serde_json::to_string(f).unwrap())
+        }
+        // how many structs have this many members (vm.parseJson, for objects none matched by count)
+        "json-size" => json_defs(arts, root).values().filter(|f| f.len().to_string() == name).count().to_string(),
         // every path tests may reach, absolute: the cache key has only the part inside the project
         "access" => format!("{:?} {:?}", access.fs, access.protected),
         _ => return None,
@@ -1196,6 +1204,18 @@ impl Cheats {
                     }
                     "parseJson" => {
                         let defs = json_defs(&self.artifacts, &self.root);
+                        // the order of an object's values comes from the project's struct definitions, which can change
+                        // in a file whose artifacts the suite never reads: it depends on the struct each key set matches
+                        let mut sets = std::collections::BTreeSet::new();
+                        found.iter().for_each(|v| crate::json::key_sets(v, &mut sets));
+                        for keys in sets {
+                            // no struct with as many members: by key whatever the keys, so only the count is recorded
+                            // (a big object, such as a map of addresses, would otherwise make a dependency of every key)
+                            match defs.values().any(|f| f.len() == keys.len()) {
+                                true => self.read(format!("json:{}", serde_json::to_string(&keys).unwrap())),
+                                false => self.read(format!("json-size:{}", keys.len())),
+                            }
+                        }
                         let values = found.iter().map(|v| crate::json::token(v, defs)).collect::<Result<Vec<_>, _>>()?;
                         return Ok(enc(DynSolValue::Bytes(crate::json::encode(values))));
                     }

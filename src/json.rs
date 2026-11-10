@@ -4,7 +4,7 @@
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address, B256, I256, U256};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The values a JSONPath selects: `$` (or `.`) the root, `.key` / `['key']` children, `[n]` (negative from the end),
 /// `[a,b]`, `[start:end]`, `*` and `..key` (any depth). A path not starting with `$` starts at the root.
@@ -163,6 +163,23 @@ pub fn struct_defs<'a>(sources: impl Iterator<Item = &'a str>) -> BTreeMap<Strin
     out
 }
 
+/// The members, in order, of the struct an object with exactly `keys` decodes like (None: by key).
+pub fn order<'a>(keys: &BTreeSet<&str>, defs: &'a BTreeMap<String, Vec<String>>) -> Option<&'a Vec<String>> {
+    defs.values().find(|f| f.len() == keys.len() && f.iter().map(String::as_str).collect::<BTreeSet<_>>() == *keys)
+}
+
+/// The key sets of the objects in `v`, nested ones too: what `token` looks up in the struct definitions.
+pub fn key_sets(v: &Value, out: &mut BTreeSet<Vec<String>>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| key_sets(x, out)),
+        Value::Object(o) => {
+            out.insert(o.keys().cloned().collect::<BTreeSet<_>>().into_iter().collect());
+            o.values().for_each(|x| key_sets(x, out));
+        }
+        _ => {}
+    }
+}
+
 /// forge's untyped decoding (`vm.parseJson`): null is bytes32(0), numbers are uint256 (int256 if negative), "0x"
 /// strings are an address (20 bytes), a bytes32 (32) or bytes, numeric strings past 64 bits are numbers, objects are
 /// tuples ordered like the struct with the same member names (else by key).
@@ -172,8 +189,8 @@ pub fn token(v: &Value, defs: &BTreeMap<String, Vec<String>>) -> Result<DynSolVa
         Value::Bool(b) => DynSolValue::Bool(*b),
         Value::Array(a) => DynSolValue::Array(a.iter().map(|x| token(x, defs)).collect::<Result<_, _>>()?),
         Value::Object(o) => {
-            let keys: std::collections::BTreeSet<&str> = o.keys().map(String::as_str).collect();
-            let order: Vec<&str> = match defs.values().find(|f| f.len() == keys.len() && f.iter().map(String::as_str).collect::<std::collections::BTreeSet<_>>() == keys) {
+            let keys: BTreeSet<&str> = o.keys().map(String::as_str).collect();
+            let order: Vec<&str> = match order(&keys, defs) {
                 Some(f) => f.iter().map(String::as_str).collect(),
                 None => keys.into_iter().collect(),
             };
