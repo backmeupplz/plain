@@ -114,6 +114,25 @@ impl Step {
     }
 }
 
+/// Whether `src` defines a contract, library or interface (a file solc makes an artifact of).
+pub fn defines_contract(src: &str) -> bool {
+    use crate::rewrite::{K, lex};
+    let toks = lex(src);
+    let mut depth = 0;
+    toks.iter().enumerate().any(|(i, x)| match &src[x.s..x.e] {
+        "{" => {
+            depth += 1;
+            false
+        }
+        "}" => {
+            depth -= 1;
+            false
+        }
+        "contract" | "library" | "interface" => depth == 0 && toks.get(i + 1).is_some_and(|n| n.k == K::Ident),
+        _ => false,
+    })
+}
+
 /// The fields of every struct in `sources` ("Contract.Struct" or "Struct" -> member names, in order): forge orders an
 /// object's values by the struct with the same member names when decoding it untyped. Like forge, members of mapping or
 /// function type (arrays of them too) aren't counted; a member whose struct type holds a mapping is.

@@ -421,6 +421,7 @@ fn build_in(p: &Project, force: bool, scope: Scope, forced: Option<usize>) -> (O
         }
     };
     let g = Graph::build(p, &files);
+    crate::evm::note_sources(&g);
     let version = pick_version(p, &g);
     let evm = EVM.get_or_init(|| target_evm(p, &version)).clone();
     let settings: Vec<Value> = (0..=p.profiles.len()).map(|i| settings(p, i)).collect();

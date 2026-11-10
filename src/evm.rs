@@ -779,13 +779,64 @@ fn storage_of(db: &Db, a: Address) -> HashMap<U256, U256> {
     out
 }
 
-/// The structs of the sources the artifacts come from, which order the members of objects vm.parseJson decodes.
+/// The project's sources as the build read them: unit -> (text, the units it imports). json_defs follows the imports
+/// with them, and reads the embedded forge-std, which isn't on disk.
+static SOURCES: OnceLock<HashMap<String, (String, Vec<String>)>> = OnceLock::new();
+
+/// Keeps the build's source graph for json_defs (the first build's: every build reads the same project files).
+pub fn note_sources(g: &crate::project::Graph) {
+    SOURCES.get_or_init(|| g.files.iter().map(|(u, n)| (u.clone(), (n.content.clone(), n.imports.clone()))).collect());
+}
+
+/// The structs vm.parseJson orders the members of objects by: like forge's, those of the sources the artifacts come from
+/// and of every file they import, struct-only files too (a file with no contract that nothing imports isn't read).
+/// Like forge, every file that defines a contract (lib/ ones too, which a test build makes no artifacts of) is a start,
+/// in path order, files are read depth first in import order from there, a file's imports before the file itself, and
+/// of two structs with the same name the first read wins.
 fn json_defs(arts: &[Artifact], root: &std::path::Path) -> &'static std::collections::BTreeMap<String, Vec<String>> {
     static DEFS: OnceLock<std::collections::BTreeMap<String, Vec<String>>> = OnceLock::new();
     DEFS.get_or_init(|| {
-        let files: std::collections::BTreeSet<&str> = arts.iter().map(|a| a.file.as_str()).collect();
-        let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(root.join(f)).ok()).collect();
-        crate::json::struct_defs(texts.iter().map(String::as_str))
+        // without a build (no graph), only the artifacts' own files, from disk
+        let graph = SOURCES.get();
+        let read = |f: &str| match graph.and_then(|s| s.get(f)) {
+            Some((text, imports)) => Some((std::borrow::Cow::Borrowed(text.as_str()), imports.as_slice())),
+            None => std::fs::read_to_string(root.join(f)).ok().map(|t| (std::borrow::Cow::Owned(t), &[][..])),
+        };
+        let mut reached = std::collections::BTreeSet::new();
+        let mut stack: Vec<&str> = arts.iter().map(|a| a.file.as_str()).collect();
+        while let Some(f) = stack.pop() {
+            if reached.insert(f) {
+                stack.extend(graph.and_then(|s| s.get(f)).into_iter().flat_map(|(_, imports)| imports.iter().map(String::as_str)));
+            }
+        }
+        let mut starts: Vec<&str> = reached.into_iter().filter(|f| read(f).is_some_and(|(t, _)| crate::json::defines_contract(&t))).collect();
+        // path order compares component by component, not as strings: `src/pa/X.sol` before `src/pa-b/Y.sol`
+        starts.sort_by_key(|f| std::path::Path::new(*f));
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = std::collections::BTreeMap::new();
+        for start in starts {
+            if !seen.insert(start) {
+                continue;
+            }
+            // a file's imports, depth first in order, are read before the file itself, like forge
+            let mut stack = vec![(read(start), 0)];
+            while let Some((file, i)) = stack.last_mut() {
+                let next = file.as_ref().map(|(_, imports)| *imports).and_then(|imports| imports.get(*i));
+                if let Some(next) = next {
+                    *i += 1;
+                    if seen.insert(next.as_str()) {
+                        stack.push((read(next), 0));
+                    }
+                    continue;
+                }
+                if let Some((text, _)) = stack.pop().and_then(|(file, _)| file) {
+                    for (k, v) in crate::json::struct_defs(std::iter::once(&*text)) {
+                        out.entry(k).or_insert(v);
+                    }
+                }
+            }
+        }
+        out
     })
 }
 

@@ -866,6 +866,112 @@ fn dangling_symlinks() {
 }
 
 #[test]
+fn json_struct_only_files() {
+    // like forge (1.7.1, a full compile), vm.parseJson orders an object by the structs of the files that define a
+    // contract and of every file they import: a file holding only structs counts once something imports it, even
+    // through another struct-only file, and not while nothing does. Changing one reruns the suites it ordered.
+    let base = std::env::current_dir().unwrap().join("tests/fixture/tmp/json-struct-only");
+    std::fs::remove_dir_all(&base).ok();
+    let a = base.join("repo");
+    for d in ["src", "test", "lib/ext"] {
+        std::fs::create_dir_all(a.join(d)).unwrap();
+    }
+    std::fs::write(a.join("foundry.toml"), "[profile.default]\n").unwrap();
+    let sol = |path: &str, body: &str| std::fs::write(a.join(path), format!("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n{body}\n")).unwrap();
+    // Pair has no contract in its file, but Uses imports it; Lone is imported by nothing
+    sol("src/Pair.sol", "struct Pair { uint256 b; uint256 a; }");
+    sol("src/Lone.sol", "struct Lone { uint256 d; uint256 c; }");
+    sol("src/Uses.sol", "import {Pair} from \"./Pair.sol\";\n\ncontract Uses {}");
+    // two structs with the same members: forge takes the one whose name sorts first (Aa). Two named Col: forge takes
+    // the first it reads, depth first in import order (ColZ's, through Via, before ColA's)
+    sol("src/Zz.sol", "struct Zz { uint256 u; uint256 t; }");
+    sol("src/Aa.sol", "struct Aa { uint256 t; uint256 u; }");
+    sol("src/ColZ.sol", "struct Col { uint256 w; uint256 v; }");
+    sol("src/ColA.sol", "struct Col { uint256 v; uint256 w; }");
+    sol("src/Via.sol", "import * as Z from \"./ColZ.sol\";");
+    // a Dup in src/ and one in a lib/ file with a contract: forge starts from every file with a contract, in path
+    // order, so LibC's comes first even though C imports DupA's before it
+    sol("src/DupA.sol", "struct Dup { uint256 r; uint256 s; }");
+    sol("lib/ext/LibC.sol", "struct Dup { uint256 s; uint256 r; }\n\ncontract LibC {}");
+    sol("src/C.sol", "import {Dup} from \"./DupA.sol\";\nimport {LibC} from \"../lib/ext/LibC.sol\";\n\ncontract C {}");
+    sol("src/Ties.sol", "import {Zz} from \"./Zz.sol\";\nimport {Aa} from \"./Aa.sol\";\nimport \"./Via.sol\";\nimport * as A from \"./ColA.sol\";\n\ncontract Ties {}");
+    // a file's own Hg and an imported one: forge reads a file's imports before the file, so HgZ's comes first
+    sol("src/HgZ.sol", "struct Hg { uint256 h; uint256 g; }");
+    sol("src/Pre.sol", "import * as Z from \"./HgZ.sol\";\n\nstruct Hg { uint256 g; uint256 h; }\n\ncontract Pre {}");
+    // two Po in files with a contract: forge orders its starts by path, component by component, so `pa/X.sol` comes
+    // before `pa-b/Y.sol` (as strings, `-` sorts before `/`)
+    std::fs::create_dir_all(a.join("src/pa")).unwrap();
+    std::fs::create_dir_all(a.join("src/pa-b")).unwrap();
+    sol("src/pa/X.sol", "struct Po { uint256 pq; uint256 pp; }\n\ncontract PaX {}");
+    sol("src/pa-b/Y.sol", "struct Po { uint256 pp; uint256 pq; }\n\ncontract PaY {}");
+    let head = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\n";
+    let suites = [
+        // Pair is (b, a): the object's b comes first
+        ("Pair", "function test_pair() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"a\": 1, \"b\": 2}'), (uint256, uint256)); assertEq(first, 2); }"),
+        // Lone isn't read: by key
+        ("Lone", "function test_lone() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"c\": 1, \"d\": 2}'), (uint256, uint256)); assertEq(first, 1); }"),
+        // no struct has these members yet: by key
+        ("Other", "function test_other() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"e\": 1, \"f\": 2}'), (uint256, uint256)); assertEq(first, 1); }"),
+        // like Aa (t, u), not Zz
+        ("Name", "function test_name() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"t\": 1, \"u\": 2}'), (uint256, uint256)); assertEq(first, 1); }"),
+        // like LibC's Dup (s, r)
+        ("Lib", "function test_lib() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"r\": 1, \"s\": 2}'), (uint256, uint256)); assertEq(first, 2); }"),
+        // like ColZ's Col (w, v)
+        ("Order", "function test_order() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"v\": 1, \"w\": 2}'), (uint256, uint256)); assertEq(first, 2); }"),
+        // like HgZ's Hg (h, g), not Pre's own
+        ("Post", "function test_post() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"g\": 1, \"h\": 2}'), (uint256, uint256)); assertEq(first, 2); }"),
+        // like pa/X.sol's Po (pq, pp)
+        ("Path", "function test_path() public pure { (uint256 first, ) = abi.decode(vm.parseJson('{\"pp\": 1, \"pq\": 2}'), (uint256, uint256)); assertEq(first, 2); }"),
+    ];
+    for (name, body) in &suites {
+        std::fs::write(a.join(format!("test/{name}.t.sol")), format!("{head}contract {name}Test is Test {{\n    {body}\n}}\n")).unwrap();
+    }
+    let real = std::env::var("PLAIN_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".plain"));
+    std::fs::create_dir_all(real.join("solc")).unwrap();
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(real.join("solc"), home.join("solc")).unwrap();
+    let run = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_plain")).arg("test").current_dir(&a).env("PLAIN_HOME", &home).env_remove("PLAIN_SEED").env_remove("FOUNDRY_PROFILE").output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let cached = |text: &str, name: &str| {
+        let id = format!("test/{name}.t.sol:{name}Test");
+        text.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("no {id}: {text}")).ends_with("(cached)")
+    };
+    let all_cached = |text: &str| suites.iter().all(|(n, _)| cached(text, n));
+    let text = run();
+    assert!(text.contains("8 passed, 0 failed"), "{text}");
+    assert!(all_cached(&run()));
+
+    // Pair becomes (a, b) and back: only the struct-only file changes
+    sol("src/Pair.sol", "struct Pair { uint256 a; uint256 b; }");
+    let text = run();
+    assert!(!cached(&text, "Pair") && ["Lone", "Other", "Name", "Order", "Lib", "Post", "Path"].iter().all(|n| cached(&text, n)), "{text}");
+    assert!(text.contains("FAIL test_pair()"), "{text}");
+    sol("src/Pair.sol", "struct Pair { uint256 b; uint256 a; }");
+    let text = run();
+    assert!(!cached(&text, "Pair") && text.contains("8 passed, 0 failed"), "{text}");
+
+    // a new struct-only file nothing imports changes nothing
+    sol("src/Ef.sol", "struct Ef { uint256 f; uint256 e; }");
+    let text = run();
+    assert!(all_cached(&text) && text.contains("8 passed, 0 failed"), "{text}");
+
+    // once Uses imports Lone, the object with Lone's members decodes like it
+    sol("src/Uses.sol", "import {Pair} from \"./Pair.sol\";\nimport {Lone} from \"./Lone.sol\";\n\ncontract Uses {}");
+    let text = run();
+    assert!(!cached(&text, "Lone") && ["Pair", "Other", "Name", "Order", "Lib", "Post", "Path"].iter().all(|n| cached(&text, n)), "{text}");
+    assert!(text.contains("FAIL test_lone()"), "{text}");
+
+    // and Ef counts once a struct-only file Uses imports imports it
+    sol("src/Pair.sol", "import {Ef} from \"./Ef.sol\";\n\nstruct Pair { uint256 b; uint256 a; }");
+    let text = run();
+    assert!(!cached(&text, "Other") && ["Pair", "Lone", "Name", "Order", "Lib", "Post", "Path"].iter().all(|n| cached(&text, n)), "{text}");
+    assert!(text.contains("FAIL test_other()"), "{text}");
+}
+
+#[test]
 fn remove_symlinks() {
     // removeFile takes away the link itself, like forge and unlink: a live one's target stays, a dangling one goes
     // too. Whether it may is up to where the link is (its folder, links resolved), not where it leads
