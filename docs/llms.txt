@@ -9,6 +9,7 @@ Editing a test and rerunning the suite takes about 1 second where Foundry takes 
 - [Documentation](https://getplain.org/docs/): installing, the edit-and-test loop, compiling, testing, deploying, verifying and upgrading contracts, networks, existing Foundry projects, dependencies, configuration, security and plugins.
 - [Run Solidity tests in CI](https://getplain.org/docs/ci/): a GitHub Actions workflow for plain, what to cache, and measured times on Uniswap v4-core (1m43s cold against 8m57s for forge 1.8.6, 4.9 s with a restored cache), tested 2026-10-29.
 - [Use plain in an existing Foundry project](https://getplain.org/docs/foundry-projects/): what ran and what didn't on OpenZeppelin Contracts (340 of 383 tests pass as the repository comes, 367 after two lines in foundry.toml, and 16 need cheatcodes plain 0.5.0 lacks) and solmate (the 278 `testFail` tests fail under forge 1.8.6 too), tested 2026-11-04.
+- [ABI and calldata decoder and encoder](https://getplain.org/tools/abi/): a free tool that runs in the browser. Paste calldata and an ABI or a function signature to read the arguments, or encode arguments into calldata; tuples, arrays, bytes and strings, nothing leaves the page.
 - [README](https://raw.githubusercontent.com/backmeupplz/plain/main/README.md): the project overview in Markdown.
 
 ## Install

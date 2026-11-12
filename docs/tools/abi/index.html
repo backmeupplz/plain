@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABI and calldata decoder and encoder online | plain</title>
+<meta name="description" content="Paste calldata and an ABI or a function signature to see the decoded arguments, or encode arguments into calldata. It runs in your browser, handles tuples, arrays, bytes and strings, and nothing you paste leaves the page.">
+<link rel="canonical" href="https://getplain.org/tools/abi/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fbfbf8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111110" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="plain">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://getplain.org/tools/abi/">
+<meta property="og:title" content="ABI and calldata decoder and encoder online">
+<meta property="og:description" content="Decode Ethereum calldata with an ABI or a signature, or encode arguments into calldata. Runs in your browser; nothing you paste is sent anywhere.">
+<meta property="og:image" content="https://getplain.org/og-abi.png">
+<meta property="og:image:secure_url" content="https://getplain.org/og-abi.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="ABI and calldata decoder and encoder: paste calldata and a function signature, get the decoded arguments.">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@backmeupplz">
+<meta name="twitter:creator" content="@backmeupplz">
+<meta name="twitter:title" content="ABI and calldata decoder and encoder online">
+<meta name="twitter:description" content="Decode Ethereum calldata with an ABI or a signature, or encode arguments into calldata. Runs in your browser; nothing you paste is sent anywhere.">
+<meta name="twitter:image" content="https://getplain.org/og-abi.png">
+<meta name="twitter:image:alt" content="ABI and calldata decoder and encoder: paste calldata and a function signature, get the decoded arguments.">
+
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "WebApplication", "name": "ABI and calldata decoder and encoder",
+ "url": "https://getplain.org/tools/abi/", "applicationCategory": "DeveloperApplication", "operatingSystem": "Any (runs in the browser)",
+ "description": "Decodes Ethereum calldata with an ABI or a function signature and encodes arguments into calldata, in the browser.",
+ "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}, "isAccessibleForFree": true,
+ "isPartOf": {"@type": "WebSite", "name": "plain", "url": "https://getplain.org/"},
+ "author": {"@type": "Person", "name": "Nikita Kolmogorov", "url": "https://borodutch.com"}}
+</script>
+<style>
+:root {
+  --bg: #fbfbf8; --fg: #1b1b19; --muted: #66665f; --line: #e4e3dc; --card: #f3f2ec;
+  --code: #efeee7; --accent: #1f7a4d; --accent-fg: #ffffff; --err: #b42318;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111110; --fg: #ecebe5; --muted: #9a9991; --line: #282825; --card: #191917;
+    --code: #1d1d1b; --accent: #4cc38a; --accent-fg: #0d1f16; --err: #ff8a80; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 var(--sans); }
+a { color: inherit; text-decoration-color: var(--muted); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+code, pre { font-family: var(--mono); }
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+.mark { font: 700 22px var(--mono); letter-spacing: -0.5px; text-decoration: none; }
+.mark span { color: var(--accent); }
+nav a { margin-left: 22px; font-size: 15px; color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--fg); }
+h1 { font-size: clamp(32px, 6vw, 46px); line-height: 1.1; letter-spacing: -1.3px; margin: 36px 0 18px; font-weight: 750; }
+.lead { font-size: 19px; color: var(--muted); max-width: 720px; margin: 0 0 28px; }
+h2 { font-size: clamp(24px, 4vw, 30px); line-height: 1.2; letter-spacing: -0.6px; margin: 0 0 14px; }
+h3 { font-size: 18px; margin: 22px 0 6px; }
+section { padding: 40px 0; border-top: 1px solid var(--line); }
+.tool { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+.modes { display: flex; gap: 8px; margin: 0 0 16px; }
+.modes button, button.copy, .ex button { font: 600 15px var(--sans); border-radius: 8px; padding: 10px 16px; min-height: 44px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+.modes button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+label { display: block; font-weight: 600; font-size: 15px; margin: 14px 0 6px; }
+textarea, select { width: 100%; font: 14.5px/1.5 var(--mono); background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 12px; }
+textarea { min-height: 92px; resize: vertical; }
+textarea:focus-visible, select:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.check { display: flex; align-items: center; gap: 10px; font-weight: 400; margin-top: 12px; }
+.check input { width: 22px; height: 22px; accent-color: var(--accent); }
+.ex { margin: 16px 0 0; font-size: 15px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ex button { font-weight: 500; padding: 6px 12px; min-height: 36px; font-size: 14px; }
+#result { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }
+.rhead { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.rhead h2 { font-size: 18px; margin: 0; letter-spacing: 0; }
+button.copy { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.item { margin: 10px 0; }
+.k { font-weight: 650; font-size: 15px; }
+.k span { font: 400 13px var(--mono); color: var(--muted); margin-left: 6px; }
+.v { font: 14.5px/1.5 var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.kids { margin-left: 12px; padding-left: 12px; border-left: 2px solid var(--line); }
+.fn { margin: 0 0 6px; overflow-wrap: anywhere; }
+.fn code { font-size: 14px; color: var(--muted); }
+.err { color: var(--err); margin: 0; font-weight: 600; }
+.muted { color: var(--muted); margin: 0; }
+#sels { list-style: none; padding: 0; margin: 0; font-size: 14px; }
+#sels li { overflow-wrap: anywhere; margin: 2px 0; }
+#sels code { color: var(--accent); }
+details { margin: 14px 0 0; }
+summary { cursor: pointer; font-weight: 600; font-size: 15px; padding: 8px 0; }
+.cta { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; }
+.cta p { margin: 0 0 12px; }
+.cta a.btn { display: inline-block; background: var(--accent); color: var(--accent-fg); font-weight: 650; padding: 10px 18px; border-radius: 8px; text-decoration: none; }
+.cta a.btn:hover { color: var(--accent-fg); opacity: .9; }
+.types { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; padding: 0; list-style: none; }
+.types li { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; font-size: 15.5px; }
+.types code { font-size: 14px; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; font-size: 14px; overflow-x: auto; }
+main p, main li { max-width: 720px; }
+footer { border-top: 1px solid var(--line); padding: 34px 0 52px; color: var(--muted); font-size: 15px; }
+@media (max-width: 640px) {
+  body { font-size: 16px; }
+  .types { grid-template-columns: 1fr; }
+  nav a { margin-left: 14px; }
+  .tool { padding: 14px; }
+}
+</style>
+<script defer src="https://lumen.borodutch.com/l.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="mark" href="/">plain<span>.</span></a>
+    <nav><a href="/docs/">Docs</a><a href="https://github.com/backmeupplz/plain">GitHub</a></nav>
+  </header>
+
+  <main>
+  <h1>ABI and calldata decoder and encoder</h1>
+  <p class="lead">Paste calldata and the function&#8217;s ABI or signature to read the arguments, or give the arguments and get the calldata. It works in your browser, so what you paste never leaves this page.</p>
+
+  <div class="tool">
+    <div class="modes" role="group" aria-label="Direction">
+      <button type="button" data-mode="decode" aria-pressed="true">Decode calldata</button>
+      <button type="button" data-mode="encode" aria-pressed="false">Encode arguments</button>
+    </div>
+
+    <label for="abi">ABI or function signature</label>
+    <textarea id="abi" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="function transfer(address to, uint256 amount)"></textarea>
+
+    <div id="decode-box">
+      <label for="data">Calldata</label>
+      <textarea id="data" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="0xa9059cbb000000000000000000000000&#8230;"></textarea>
+      <label class="check" for="nosel"><input type="checkbox" id="nosel"> The data has no 4-byte selector (arguments only)</label>
+    </div>
+
+    <div id="encode-box" hidden>
+      <div id="fn-wrap" hidden>
+        <label for="fn">Function</label>
+        <select id="fn"></select>
+      </div>
+      <label for="args">Arguments as a JSON list</label>
+      <textarea id="args" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder='["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "1000000000000000000"]'></textarea>
+    </div>
+
+    <p class="ex">Examples: <button type="button" data-example="transfer">ERC-20 transfer</button><button type="button" data-example="dynamic">Arrays and bytes</button><button type="button" data-example="tuple">Tuples</button></p>
+
+    <div id="result" aria-live="polite">
+      <div class="rhead"><h2>Result</h2><button type="button" class="copy" id="copy" hidden>Copy</button></div>
+      <div id="out"></div>
+      <details><summary>Selectors in this ABI</summary><ul id="sels"></ul></details>
+    </div>
+  </div>
+
+  <section>
+    <h2>What goes in the ABI box</h2>
+    <p>Any of these works, and you can mix several functions in one box:</p>
+    <ul>
+      <li>A JSON ABI as <code>solc</code>, Foundry or plain writes it: a whole array, or a single function object, with nested <code>components</code> for tuples.</li>
+      <li>Human-readable lines such as <code>function transfer(address to, uint256 amount) returns (bool)</code>, one per line. The <code>function</code> keyword, names and <code>returns</code> are optional, so a bare <code>transfer(address,uint256)</code> is enough.</li>
+      <li>Tuples written inline, as in <code>swap((address token, uint256 amount)[] legs, string memo)</code>.</li>
+    </ul>
+    <p>When you decode, the first four bytes of the calldata choose the function, and the tool says so if none of the functions you pasted has that selector. The selector is the first four bytes of the Keccak-256 hash of the canonical signature, such as <code>transfer(address,uint256)</code>. A signature written with <code>uint</code> instead of <code>uint256</code>, or with a wrong type, hashes to a different selector, which is the usual reason a decode fails.</p>
+  </section>
+
+  <section>
+    <h2>Types it understands</h2>
+    <ul class="types">
+      <li><code>uint8</code> to <code>uint256</code>, <code>int8</code> to <code>int256</code>, <code>uint</code>, <code>int</code></li>
+      <li><code>address</code>, shown with its EIP-55 checksum</li>
+      <li><code>bool</code></li>
+      <li><code>bytes1</code> to <code>bytes32</code>, <code>bytes</code>, <code>string</code></li>
+      <li>Arrays: <code>T[]</code> and <code>T[3]</code>, nested as deep as you like</li>
+      <li>Tuples and arrays of tuples</li>
+    </ul>
+    <p>Integers are read and written as exact big integers, so a <code>uint256</code> near 2<sup>256</sup> comes out digit for digit. When you encode, give integers as strings or JSON numbers (decimal or <code>0x</code> hex), bytes as hex, and tuples as lists in the order of their fields.</p>
+  </section>
+
+  <section>
+    <h2>How the encoding works</h2>
+    <p>The tool follows the <a href="https://docs.soliditylang.org/en/latest/abi-spec.html">Solidity contract ABI specification</a>. Every argument gets a 32-byte slot in a head. A static value, such as a number, an address or a <code>bytes32</code>, sits in its slot. A dynamic value, such as a <code>string</code>, <code>bytes</code> or <code>uint256[]</code>, puts an offset in its slot, and the value itself, with its length in front, goes in the tail after the head. Tuples and fixed-size arrays are inline when everything inside them is static, and dynamic otherwise.</p>
+    <p>As a check, the <code>f(uint256,uint32[],bytes10,bytes)</code> example from the specification, with <code>291</code>, <code>[1110, 1929]</code>, <code>"1234567890"</code> and <code>"Hello, world!"</code>, gives the selector <code>0x8be65246</code> followed by nine 32-byte words, with the offsets <code>0x80</code> and <code>0xe0</code> in the head, and the and the &#8220;Example&#8221; button above loads it#8220;Arrays and bytesand the &#8220;Example&#8221; button above loads it#8221; button above loads it. The Keccak-256 here is the original Keccak that Ethereum uses (padding byte <code>0x01</code>), not NIST&#8217;s SHA3-256, and it returns <code>c5d24601&#8230;a470</code> for empty input and <code>0xa9059cbb</code> as the selector of <code>transfer(address,uint256)</code>.</p>
+  </section>
+
+  <section>
+    <h2>Where it stops</h2>
+    <ul>
+      <li>It decodes and encodes the arguments of one function call. It doesn&#8217;t decode event logs, return data from a call it can&#8217;t see, or a transaction&#8217;s outer envelope.</li>
+      <li>It doesn&#8217;t look selectors up in a signature database. If you only have calldata, the first four bytes tell you what to search for, and you then paste the signature you find.</li>
+      <li>Packed encoding (<code>abi.encodePacked</code>), fixed-point types and function-pointer types aren&#8217;t supported.</li>
+      <li>Strict decoding: values that don&#8217;t fit their type (a <code>uint8</code> slot holding 300, an address with non-zero high bytes) and offsets that point past the data are reported as errors instead of being guessed at.</li>
+    </ul>
+    <p>It handles everything in your browser. The tool makes no network request with what you paste, and nothing is stored.</p>
+  </section>
+
+  <section>
+    <div class="cta">
+      <h2>Working on Solidity?</h2>
+      <p><a href="/">plain</a> is one small, MIT-licensed binary that compiles, tests, deploys, verifies and upgrades Solidity contracts, and runs Foundry projects as they are. Its builds write each contract&#8217;s <code>abi</code> and <code>methodIdentifiers</code>, and a failing test prints the decoded revert reason, custom errors included.</p>
+      <p><a class="btn" href="/?utm_source=tool&amp;utm_campaign=abi">See what plain does</a></p>
+    </div>
+  </section>
+  </main>
+
+  <footer>Free and open source. Made by <a href="https://borodutch.com">Nikita Kolmogorov</a>. Browse the <a href="/docs/">plain docs</a> or the <a href="https://github.com/backmeupplz/plain">source on GitHub</a>.</footer>
+</div>
+<script>
+var abi=(function(){"use strict";
+/* Keccak-256 (the original Keccak padding, 0x01, which Ethereum uses; not NIST SHA3-256's 0x06). */
+var RC = [], RHO = [1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44],
+    PI = [10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1];
+(function () {
+  var r = 1n;
+  for (var i = 0; i < 24; i++) {
+    var c = 0n;
+    for (var j = 0; j < 7; j++) {
+      if (r & 1n) c |= 1n << BigInt((1 << j) - 1);
+      r = (r << 1n) ^ ((r & 0x80n) ? 0x171n : 0n);
+    }
+    RC.push(c);
+  }
+})();
+var M64 = (1n << 64n) - 1n;
+function rotl(x, n) { n = BigInt(n); return ((x << n) | (x >> (64n - n))) & M64; }
+function keccakF(s) {
+  for (var round = 0; round < 24; round++) {
+    var c = [], d = [], x, y;
+    for (x = 0; x < 5; x++) c[x] = s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20];
+    for (x = 0; x < 5; x++) d[x] = c[(x + 4) % 5] ^ rotl(c[(x + 1) % 5], 1);
+    for (x = 0; x < 25; x++) s[x] ^= d[x % 5];
+    var t = s[1];
+    for (x = 0; x < 24; x++) { var j = PI[x], tmp = s[j]; s[j] = rotl(t, RHO[x]); t = tmp; }
+    for (y = 0; y < 25; y += 5) {
+      var row = s.slice(y, y + 5);
+      for (x = 0; x < 5; x++) s[y + x] = row[x] ^ (~row[(x + 1) % 5] & M64 & row[(x + 2) % 5]);
+    }
+    s[0] ^= RC[round];
+  }
+}
+function keccak256(bytes) {
+  var rate = 136, s = [], i;
+  for (i = 0; i < 25; i++) s.push(0n);
+  var n = bytes.length, padded = new Uint8Array(Math.floor(n / rate) * rate + rate);
+  padded.set(bytes); padded[n] ^= 0x01; padded[padded.length - 1] ^= 0x80;
+  for (var off = 0; off < padded.length; off += rate) {
+    for (i = 0; i < rate / 8; i++) {
+      var w = 0n;
+      for (var k = 7; k >= 0; k--) w = (w << 8n) | BigInt(padded[off + i * 8 + k]);
+      s[i] ^= w;
+    }
+    keccakF(s);
+  }
+  var out = new Uint8Array(32);
+  for (i = 0; i < 32; i++) out[i] = Number((s[i >> 3] >> BigInt(8 * (i & 7))) & 0xffn);
+  return out;
+}
+
+function toHex(b) { var h = "0x"; for (var i = 0; i < b.length; i++) h += (b[i] < 16 ? "0" : "") + b[i].toString(16); return h; }
+function fromHex(h) {
+  h = String(h).trim().replace(/^0x/i, "").replace(/\s+/g, "");
+  if (h.length % 2 || /[^0-9a-f]/i.test(h)) throw new Error("not valid hex (an even number of 0-9 and a-f characters)");
+  var b = new Uint8Array(h.length / 2);
+  for (var i = 0; i < b.length; i++) b[i] = parseInt(h.substr(i * 2, 2), 16);
+  return b;
+}
+function utf8(s) { return new TextEncoder().encode(s); }
+function selectorOf(sig) { return toHex(keccak256(utf8(sig)).slice(0, 4)); }
+
+/* ---------- types ---------- */
+/* A type is {t: "uint"|"int"|"address"|"bool"|"bytesN"|"bytes"|"string"|"array"|"tuple", ...}. */
+function splitTop(s) {
+  var out = [], depth = 0, cur = "";
+  for (var i = 0; i < s.length; i++) {
+    var ch = s[i];
+    if (ch === "(" || ch === "[") depth++;
+    if (ch === ")" || ch === "]") depth--;
+    if (ch === "," && depth === 0) { out.push(cur); cur = ""; } else cur += ch;
+  }
+  if (cur.trim() !== "" || out.length) out.push(cur);
+  return out.map(function (x) { return x.trim(); });
+}
+function parseType(str, comps) {
+  str = str.trim();
+  var m = /^(.*)\[(\d*)\]$/.exec(str);
+  if (m) return { t: "array", of: parseType(m[1], comps), len: m[2] === "" ? null : parseInt(m[2], 10) };
+  if (str === "tuple" || str[0] === "(") {
+    var items;
+    if (str === "tuple") items = comps || [];
+    else {
+      if (str[str.length - 1] !== ")") throw new Error("unbalanced parentheses in type " + str);
+      items = splitTop(str.slice(1, -1)).map(function (p) { return parseParam(p); });
+    }
+    return { t: "tuple", items: items };
+  }
+  if (str === "address" || str === "bool" || str === "string" || str === "bytes") return { t: str };
+  if (str === "uint" || str === "int") return { t: str, bits: 256 };
+  m = /^(u?int)(\d+)$/.exec(str);
+  if (m) {
+    var b = parseInt(m[2], 10);
+    if (b < 8 || b > 256 || b % 8) throw new Error("bad integer size in " + str);
+    return { t: m[1], bits: b };
+  }
+  m = /^bytes(\d+)$/.exec(str);
+  if (m) {
+    var n = parseInt(m[1], 10);
+    if (n < 1 || n > 32) throw new Error("bad bytes size in " + str);
+    return { t: "bytesN", n: n };
+  }
+  throw new Error("unknown type " + JSON.stringify(str));
+}
+/* "uint256 amount", "address indexed from", "(uint256,address) pair" */
+function parseParam(p) {
+  p = p.trim();
+  var type, rest;
+  if (p[0] === "(") {
+    var depth = 0, i = 0;
+    for (; i < p.length; i++) { if (p[i] === "(") depth++; if (p[i] === ")" && --depth === 0) break; }
+    i++;
+    while (p[i] === "[") i = p.indexOf("]", i) + 1;
+    type = p.slice(0, i); rest = p.slice(i);
+  } else {
+    var mm = /^(\S+)([\s\S]*)$/.exec(p);
+    type = mm[1]; rest = mm[2];
+  }
+  var words = rest.trim().split(/\s+/).filter(function (w) { return w && w !== "indexed" && w !== "memory" && w !== "calldata" && w !== "storage"; });
+  var t = parseType(type);
+  t.name = words[0] || "";
+  return t;
+}
+function fromJsonParam(p) {
+  var t = parseType(p.type, (p.components || []).map(fromJsonParam));
+  t.name = p.name || "";
+  return t;
+}
+function canon(t) {
+  switch (t.t) {
+    case "uint": case "int": return t.t + t.bits;
+    case "bytesN": return "bytes" + t.n;
+    case "array": return canon(t.of) + "[" + (t.len === null ? "" : t.len) + "]";
+    case "tuple": return "(" + t.items.map(canon).join(",") + ")";
+    default: return t.t;
+  }
+}
+function isDynamic(t) {
+  if (t.t === "bytes" || t.t === "string") return true;
+  if (t.t === "array") return t.len === null || isDynamic(t.of);
+  if (t.t === "tuple") return t.items.some(isDynamic);
+  return false;
+}
+function headSize(t) {
+  if (isDynamic(t)) return 32;
+  if (t.t === "array") return t.len * headSize(t.of);
+  if (t.t === "tuple") return t.items.reduce(function (a, x) { return a + headSize(x); }, 0);
+  return 32;
+}
+
+/* ---------- ABI input: a JSON ABI, one JSON item, or human-readable signatures ---------- */
+function parseAbi(text) {
+  text = text.trim();
+  if (!text) throw new Error("paste an ABI or a function signature");
+  var items = [];
+  if (text[0] === "[" || text[0] === "{") {
+    var j = JSON.parse(text);
+    if (!Array.isArray(j)) j = [j];
+    j.forEach(function (it) {
+      if (typeof it === "string") items.push(fromHuman(it));
+      else if (it.type === "function" || (!it.type && it.name)) items.push({ kind: "function", name: it.name, inputs: (it.inputs || []).map(fromJsonParam), outputs: (it.outputs || []).map(fromJsonParam) });
+      else if (it.type === "constructor") items.push({ kind: "constructor", name: "constructor", inputs: (it.inputs || []).map(fromJsonParam), outputs: [] });
+      else if (it.type === "error") items.push({ kind: "error", name: it.name, inputs: (it.inputs || []).map(fromJsonParam), outputs: [] });
+    });
+  } else {
+    text.split(/\n|;/).forEach(function (line) {
+      line = line.replace(/\/\/.*$/, "").trim();
+      if (line) items.push(fromHuman(line));
+    });
+  }
+  items.forEach(function (it) { it.sig = it.name + "(" + it.inputs.map(canon).join(",") + ")"; it.selector = selectorOf(it.sig); });
+  return items;
+}
+function fromHuman(line) {
+  var s = line.trim().replace(/^(function|error)\s+/, function (m) { return ""; });
+  var kind = /^error\b/.test(line.trim()) ? "error" : "function";
+  var open = s.indexOf("(");
+  if (open < 1 && !/^\(/.test(s)) throw new Error("expected something like transfer(address,uint256), got " + JSON.stringify(line));
+  var name = s.slice(0, open).trim(), depth = 0, i = open;
+  for (; i < s.length; i++) { if (s[i] === "(") depth++; if (s[i] === ")" && --depth === 0) break; }
+  if (i >= s.length) throw new Error("unbalanced parentheses in " + JSON.stringify(line));
+  var inputs = splitTop(s.slice(open + 1, i)).map(parseParam);
+  var outputs = [], tail = s.slice(i + 1), rm = /returns\s*\(/.exec(tail);
+  if (rm) {
+    var st = rm.index + rm[0].length - 1, d2 = 0, k = st;
+    for (; k < tail.length; k++) { if (tail[k] === "(") d2++; if (tail[k] === ")" && --d2 === 0) break; }
+    outputs = splitTop(tail.slice(st + 1, k)).map(parseParam);
+  }
+  return { kind: kind, name: name, inputs: inputs, outputs: outputs };
+}
+
+/* ---------- decode ---------- */
+var MAXUINT = (1n << 256n) - 1n;
+function readWord(b, off) {
+  if (off < 0 || off + 32 > b.length) throw new Error("the data ends before byte " + (off + 32) + " (it has " + b.length + ")");
+  var v = 0n;
+  for (var i = 0; i < 32; i++) v = (v << 8n) | BigInt(b[off + i]);
+  return v;
+}
+function checksum(addr) {
+  var a = addr.toLowerCase().replace(/^0x/, ""), h = toHex(keccak256(utf8(a))).slice(2), o = "0x";
+  for (var i = 0; i < 40; i++) o += parseInt(h[i], 16) >= 8 ? a[i].toUpperCase() : a[i];
+  return o;
+}
+function decodeValue(t, b, base, off) {
+  /* base: start of the enclosing head/tail area; off: where this value's head sits */
+  var v, i;
+  if (isDynamic(t)) {
+    var ptr = readWord(b, off);
+    if (ptr > BigInt(b.length)) throw new Error("an offset points past the end of the data (" + ptr + ")");
+    return decodeAt(t, b, base + Number(ptr));
+  }
+  return decodeAt(t, b, off);
+}
+function decodeAt(t, b, pos) {
+  var v, i, n;
+  switch (t.t) {
+    case "uint": v = readWord(b, pos); if (t.bits < 256 && v >> BigInt(t.bits)) throw new Error("a value does not fit in " + canon(t)); return v.toString();
+    case "int":
+      v = readWord(b, pos);
+      var signBit = 1n << BigInt(t.bits - 1);
+      if (t.bits < 256) {
+        var hi = v >> BigInt(t.bits - 1);
+        if (hi !== 0n && hi !== (MAXUINT >> BigInt(t.bits - 1))) throw new Error("a value does not fit in " + canon(t));
+      }
+      return (v >= (1n << 255n) ? v - (1n << 256n) : v).toString();
+    case "address":
+      v = readWord(b, pos);
+      if (v >> 160n) throw new Error("an address has non-zero bytes above its 20 bytes");
+      return checksum("0x" + v.toString(16).padStart(40, "0"));
+    case "bool":
+      v = readWord(b, pos);
+      if (v > 1n) throw new Error("a bool is neither 0 nor 1");
+      return v === 1n;
+    case "bytesN":
+      readWord(b, pos);
+      return toHex(b.slice(pos, pos + t.n));
+    case "bytes": case "string":
+      n = Number(readWord(b, pos));
+      if (pos + 32 + n > b.length) throw new Error("a " + t.t + " is longer than the data");
+      var raw = b.slice(pos + 32, pos + 32 + n);
+      if (t.t === "bytes") return toHex(raw);
+      try { return new TextDecoder("utf-8", { fatal: true }).decode(raw); } catch (e) { return "(invalid UTF-8) " + toHex(raw); }
+    case "array":
+      var len, start;
+      if (t.len === null) { len = Number(readWord(b, pos)); start = pos + 32; if (len > b.length) throw new Error("an array claims " + len + " elements, more than the data can hold"); }
+      else { len = t.len; start = pos; }
+      return decodeList(new Array(len).fill(t.of), b, start);
+    case "tuple": return decodeList(t.items, b, pos);
+  }
+}
+function decodeList(types, b, start) {
+  var out = [], off = start;
+  types.forEach(function (t) { out.push(decodeValue(t, b, start, off)); off += headSize(t); });
+  return out;
+}
+function decodeArgs(inputs, data) {
+  return decodeList(inputs, data, 0);
+}
+
+/* ---------- encode ---------- */
+function word(v) { var b = new Uint8Array(32); for (var i = 31; i >= 0; i--) { b[i] = Number(v & 0xffn); v >>= 8n; } return b; }
+function concat(list) {
+  var n = 0; list.forEach(function (x) { n += x.length; });
+  var o = new Uint8Array(n), p = 0; list.forEach(function (x) { o.set(x, p); p += x.length; });
+  return o;
+}
+function toBig(x, t) {
+  var v;
+  if (typeof x === "bigint") v = x;
+  else if (typeof x === "number") { if (!Number.isInteger(x)) throw new Error("not an integer: " + x); v = BigInt(x); }
+  else if (typeof x === "string" && /^-?(0x[0-9a-f]+|\d+)$/i.test(x.trim())) {
+    var s = x.trim(), neg = s[0] === "-"; if (neg) s = s.slice(1);
+    v = BigInt(s); if (neg) v = -v;
+  } else throw new Error("expected a whole number for " + canon(t) + ", got " + JSON.stringify(x));
+  var bits = BigInt(t.bits);
+  if (t.t === "uint") { if (v < 0n || v >= (1n << bits)) throw new Error(v + " does not fit in " + canon(t)); return v; }
+  if (v < -(1n << (bits - 1n)) || v >= (1n << (bits - 1n))) throw new Error(v + " does not fit in " + canon(t));
+  return v < 0n ? v + (1n << 256n) : v;
+}
+function encodeValue(t, x) {
+  var i;
+  switch (t.t) {
+    case "uint": case "int": return word(toBig(x, t));
+    case "bool":
+      if (x === true || x === "true" || x === 1) return word(1n);
+      if (x === false || x === "false" || x === 0) return word(0n);
+      throw new Error("expected true or false, got " + JSON.stringify(x));
+    case "address":
+      if (typeof x !== "string" || !/^0x[0-9a-f]{40}$/i.test(x.trim())) throw new Error("expected a 0x address of 40 hex digits, got " + JSON.stringify(x));
+      return concat([new Uint8Array(12), fromHex(x)]);
+    case "bytesN":
+      var bn = fromHex(x);
+      if (bn.length !== t.n) throw new Error("expected " + t.n + " bytes for " + canon(t) + ", got " + bn.length);
+      return concat([bn, new Uint8Array(32 - t.n)]);
+    case "bytes": case "string":
+      var raw = t.t === "string" ? utf8(String(x)) : fromHex(x), pad = (32 - raw.length % 32) % 32;
+      return concat([word(BigInt(raw.length)), raw, new Uint8Array(pad)]);
+    case "array":
+      if (!Array.isArray(x)) throw new Error("expected a list for " + canon(t));
+      if (t.len !== null && x.length !== t.len) throw new Error(canon(t) + " needs " + t.len + " items, got " + x.length);
+      var parts = encodeList(x.map(function () { return t.of; }), x);
+      return t.len === null ? concat([word(BigInt(x.length)), parts]) : parts;
+    case "tuple":
+      if (!Array.isArray(x)) throw new Error("expected a list for " + canon(t));
+      if (x.length !== t.items.length) throw new Error(canon(t) + " needs " + t.items.length + " items, got " + x.length);
+      return encodeList(t.items, x);
+  }
+}
+function encodeList(types, values) {
+  var heads = [], tails = [], size = types.reduce(function (a, t) { return a + headSize(t); }, 0), tailLen = 0;
+  types.forEach(function (t, i) {
+    var enc = encodeValue(t, values[i]);
+    if (isDynamic(t)) { heads.push(word(BigInt(size + tailLen))); tails.push(enc); tailLen += enc.length; }
+    else heads.push(enc);
+  });
+  return concat(heads.concat(tails));
+}
+function encodeCall(fn, values) {
+  if (values.length !== fn.inputs.length) throw new Error(fn.sig + " takes " + fn.inputs.length + " argument" + (fn.inputs.length === 1 ? "" : "s") + ", got " + values.length);
+  return concat([fromHex(fn.selector), encodeList(fn.inputs, values)]);
+}
+
+
+return {keccak256:keccak256,toHex:toHex,fromHex:fromHex,utf8:utf8,selectorOf:selectorOf,parseAbi:parseAbi,decodeArgs:decodeArgs,encodeCall:encodeCall,canon:canon};})();
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var used = false;
+  function track() { if (!used) { used = true; if (window.lumen) window.lumen("tool-use"); } }
+  var mode = "decode";
+  function setMode(m) {
+    mode = m;
+    $("decode-box").hidden = m !== "decode";
+    $("encode-box").hidden = m !== "encode";
+    document.querySelectorAll("[data-mode]").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.mode === m)); });
+    run();
+  }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function fmt(t, v) {
+    if (t.t === "array") return v.map(function (x) { return fmt(t.of, x); });
+    if (t.t === "tuple") return v.map(function (x, i) { return fmt(t.items[i], x); });
+    return v;
+  }
+  function render(t, v, label) {
+    if (t.t === "array" || t.t === "tuple") {
+      var kids = v.map(function (x, i) {
+        var ct = t.t === "array" ? t.of : t.items[i];
+        return render(ct, x, t.t === "array" ? "[" + i + "]" : (ct.name || String(i)));
+      }).join("");
+      return '<div class="item"><div class="k">' + esc(label) + ' <span>' + esc(abi.canon(t)) + '</span></div><div class="kids">' + (kids || '<div class="v">(empty)</div>') + "</div></div>";
+    }
+    return '<div class="item"><div class="k">' + esc(label) + ' <span>' + esc(abi.canon(t)) + '</span></div><div class="v">' + esc(String(v)) + "</div></div>";
+  }
+  function jsonOf(v) { return JSON.stringify(v, null, 2); }
+  function show(html, plain) {
+    $("out").innerHTML = html;
+    $("copy").hidden = !plain;
+    $("copy").dataset.copy = plain || "";
+  }
+  function fail(msg) { show('<p class="err" role="alert">' + esc(msg) + "</p>", ""); }
+  function pick(items, sel) {
+    var fns = items.filter(function (i) { return i.kind !== "constructor"; });
+    var s = $("fn");
+    var cur = s.value;
+    s.innerHTML = fns.map(function (f, i) { return '<option value="' + i + '">' + esc(f.sig) + "</option>"; }).join("");
+    if (cur && s.querySelector('option[value="' + cur + '"]')) s.value = cur;
+    $("fn-wrap").hidden = fns.length < 2 || mode !== "encode";
+    return fns;
+  }
+  function run() {
+    var items, fns;
+    try { items = abi.parseAbi($("abi").value); } catch (e) { return fail("ABI: " + e.message); }
+    fns = pick(items);
+    if (!fns.length) return fail("No function found in that ABI.");
+    var list = fns.map(function (f) { return '<li><code>' + esc(f.selector) + "</code> " + esc(f.sig) + "</li>"; }).join("");
+    $("sels").innerHTML = list;
+    try {
+      if (mode === "decode") {
+        var raw = $("data").value.trim();
+        if (!raw) return show('<p class="muted">Paste calldata to decode it.</p>', "");
+        var bytes = abi.fromHex(raw), fn, args;
+        if ($("nosel").checked) {
+          fn = fns[0];
+          if (fns.length > 1) return fail("Arguments-only decoding needs one function in the ABI, and this one has " + fns.length + ".");
+          args = bytes;
+        } else {
+          if (bytes.length < 4) return fail("Calldata starts with a 4-byte selector, and this has " + bytes.length + " bytes.");
+          var sel = abi.toHex(bytes.slice(0, 4));
+          var m = fns.filter(function (f) { return f.selector === sel; });
+          if (!m.length) return fail("The calldata starts with " + sel + ", and none of the " + fns.length + " function" + (fns.length === 1 ? "" : "s") + " in the ABI has that selector. Check the signature's types and spelling, or tick “no selector” if you pasted only the arguments.");
+          fn = m[0]; args = bytes.slice(4);
+        }
+        var vals = abi.decodeArgs(fn.inputs, args);
+        track();
+        var obj = vals.map(function (v, i) { return fmt(fn.inputs[i], v); });
+        var head = '<p class="fn"><b>' + esc(fn.name || "(arguments)") + '</b> <code>' + esc(fn.selector) + "</code> " + esc(fn.sig) + "</p>";
+        show(head + (vals.length ? vals.map(function (v, i) { return render(fn.inputs[i], v, fn.inputs[i].name || "arg" + i); }).join("") : '<p class="muted">This function takes no arguments.</p>'), jsonOf(obj));
+      } else {
+        var f = fns[parseInt($("fn").value || "0", 10)] || fns[0];
+        var txt = $("args").value.trim(), a = txt ? JSON.parse(txt) : [];
+        if (!Array.isArray(a)) throw new Error("Arguments must be a JSON list, like [\"0x…\", \"1000\"].");
+        var out = abi.toHex(abi.encodeCall(f, a));
+        track();
+        show('<p class="fn"><b>' + esc(f.name) + '</b> <code>' + esc(f.selector) + "</code> " + esc(f.sig) + '</p><div class="item"><div class="k">calldata <span>' + ((out.length - 2) / 2) + ' bytes</span></div><div class="v">' + esc(out) + "</div></div>", out);
+      }
+    } catch (e) { fail((e instanceof SyntaxError ? "Arguments are not valid JSON: " : "") + e.message); }
+  }
+  document.querySelectorAll("[data-mode]").forEach(function (b) { b.addEventListener("click", function () { setMode(b.dataset.mode); }); });
+  ["abi", "data", "args", "fn", "nosel"].forEach(function (id) { $(id).addEventListener("input", run); });
+  document.querySelectorAll("[data-example]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var ex = EXAMPLES[b.dataset.example];
+      $("abi").value = ex.abi; $("data").value = ex.data; $("args").value = ex.args; $("nosel").checked = false;
+      setMode(ex.mode);
+    });
+  });
+  $("copy").addEventListener("click", function () {
+    var b = $("copy");
+    navigator.clipboard.writeText(b.dataset.copy).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500); }).catch(function () {});
+  });
+  var EXAMPLES = {
+    transfer: { mode: "decode", abi: "function transfer(address to, uint256 amount) returns (bool)",
+      data: "0xa9059cbb0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+      args: '["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "1000000000000000000"]' },
+    dynamic: { mode: "encode", abi: "function f(uint256 a, uint32[] b, bytes10 c, bytes d)", data: "",
+      args: '[291, [1110, 1929], "0x31323334353637383930", "0x48656c6c6f2c20776f726c6421"]' },
+    tuple: { mode: "encode", abi: "function swap((address token, uint256 amount)[] legs, string memo)", data: "",
+      args: '[[["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "5"], ["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "7"]], "hello"]' }
+  };
+  document.querySelector('[data-example="transfer"]').click();
+  used = false;
+})();
+
+</script>
+</body>
+</html>
